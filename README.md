@@ -1,54 +1,99 @@
 # EV
 
-个人语音助手。**Always-on,本地部署,不上云**。北极星:像电影里那样的贴身 AI 伙伴——听得清、记得住、插得上话、知道什么时候该闭嘴。
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Package manager: uv](https://img.shields.io/badge/package%20manager-uv-DE5FE9)](https://docs.astral.sh/uv/)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-orange)](#project-status)
 
-## 硬件
+[Quick start](#quick-start) | [Commands](#commands) | [Configuration](#configuration) | [Project status](#project-status)
 
-| 设备 | 角色 |
-|---|---|
-| MacBook Pro M4 16GB | 常开前端:拾音、VAD、ASR、交互界面 |
-| Win 台式机(5060Ti 16GB / 32GB RAM) | 推理后端:本地 LLM、后期 TTS |
-| DJI Mic Mini | 近场拾音,机内降噪(接收器 USB-C 连接) |
-| iPhone 16 Pro Max | (后期)Phase 1c 移动采集前端:采集+回传,不做计算 |
-| 智能眼镜 | (后期)Phase 2 视觉采集,到时复用成熟产品 |
-| 可穿戴(Apple Watch / Garmin / Oura / 肌电) | (后期)Phase 3 生物信号:心率/HRV/血氧/体温 |
+EV is an experimental, local-first personal voice assistant. The project currently
+focuses on building a reliable audio input layer for real-time speech processing.
 
-## 分层架构
+Audio and runtime data stay on the local machine. Cloud services are not required.
 
-| 层 | 职责 | 现状 |
-|---|---|---|
-| 硬件层 | 全天候麦克风(领夹)→ 智能眼镜 CV → 可穿戴生物信号 | DJI Mic Mini(暂用内置麦开发) |
-| 感知层 | 声音(VAD/ASR/标点/声纹/环境音)、视觉、生物信号 | Phase 1a:声音感知开发中 |
-| 认知层 | 对话状态机(级联→半级联→端到端)、记忆(工作/情景/语义)、推理(演绎/归纳/溯因)、情绪模型(多模态) | NLP 本地双档排期中 |
-| 行为层 | 响应生成、流式 TTS、主动行为(预警/静默) | Phase 1b 起 |
+## Current capabilities
 
-层间只传流式事件(事件总线),与前端/后端分离一致:任何一层可独立替换 —— 研究消融的地基。
+- Discover available audio input devices.
+- Select an input device by name.
+- Capture audio as asynchronous, fixed-size frames.
+- Capture 16 kHz mono audio for downstream speech processing.
+- Run a short microphone diagnostic with a live level meter.
+- Save diagnostic recordings as WAV files for playback and inspection.
+- Load default, local, and environment-based configuration.
 
-## 路线图
+## Quick start
 
-- **Phase 1a(当前)**:ASR 转写 + 用户声纹门控(NLP 本地双档后置)→ [docs/phase1a-plan.md](docs/phase1a-plan.md)
-- Phase 1b:TTS 播报(CosyVoice2 流式,克隆 EV 声线)
-- Phase 1c:全天候(KWS 唤醒)+ barge-in 打断
-- Phase 2:环境感知(环境音 + CV,智能眼镜/麦克风阵列/人在传感器)
-- Phase 3:身体感知(可穿戴生物信号 + 多模态情绪)
+EV requires Python 3.11 or newer and uses
+[`uv`](https://docs.astral.sh/uv/) for dependency management.
 
-## 原则
-
-1. 工程尽量外包给成熟方案:sherpa-onnx(VAD/ASR/标点/声纹)、Ollama(本地 LLM)、CosyVoice2(TTS,后期)。
-2. 全链路延迟从第一天起可测量,先测量后优化。
-3. 原始数据(VAD 门控的语音段音频 + 逐字稿)append-only 留存,模型升级后可重挖。
-4. 数据与推理全本地,不上云;备份走本地/自托管(NAS 等)。
-
-## 开发
-
-uv + Python 3.11(src 布局)。
-
-```sh
-uv sync                            # 建环境
-uv run pytest                      # 测试
-uv run python -m ev info           # 配置/路径
-uv run python -m ev audio devices  # 输入设备枚举
-uv run python -m ev audio test     # 采集自检(保存 wav 供回听)
+```bash
+git clone git@github.com:hilithqiyuanlu/mylyra.git
+cd mylyra
+uv sync
+uv run pytest
 ```
 
-任务清单与进度见 [docs/phase1a-plan.md](docs/phase1a-plan.md);研究定位见 [docs/research.md](docs/research.md)。
+## Commands
+
+Show the active configuration and local data paths:
+
+```bash
+uv run python -m ev info
+```
+
+List audio input devices:
+
+```bash
+uv run python -m ev audio devices
+```
+
+Record a five-second microphone diagnostic:
+
+```bash
+uv run python -m ev audio test
+```
+
+Select a device by a case-insensitive name fragment or change the duration:
+
+```bash
+uv run python -m ev audio test --device "MacBook" --seconds 10
+```
+
+Diagnostic recordings are written to `data/audio-test/`. The entire `data/`
+directory is excluded from Git.
+
+## Configuration
+
+Defaults live in [`ev.toml`](ev.toml). Create an ignored `ev.local.toml` file for
+machine-specific overrides.
+
+```toml
+log_level = "INFO"
+
+[audio]
+sample_rate = 16000
+channels = 1
+
+[paths]
+data_dir = "data"
+```
+
+The following environment variables are also supported:
+
+- `EV_DATA_DIR` changes the runtime data directory.
+- `EV_LOG_LEVEL` changes the logging level.
+
+## Repository layout
+
+```text
+src/ev/       Application package and CLI
+tests/        Automated tests
+docs/         Internal design and research notes
+ev.toml       Default configuration
+```
+
+## Project status
+
+EV is in early development. The audio capture foundation is available, while the
+end-to-end voice assistant is not yet complete. Interfaces and data formats may
+change as the project evolves.
