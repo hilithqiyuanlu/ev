@@ -1,0 +1,9 @@
+# EV 默认配置。本地覆盖:复制为 ev.local.toml(已 gitignore)修改。
+log_level = "INFO"
+
+[audio]
+sample_rate = 16000   # ASR/声纹统一 16kHz mono
+channels = 1
+
+[paths]
+data_dir = "data"     # 相对项目根目录;存模型权重、语音存档、SQLite、日志

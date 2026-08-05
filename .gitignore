@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+
+# 项目数据(模型权重、语音存档、SQLite、日志)
+data/
+
+# 本地配置覆盖
+ev.local.toml
+
+# macOS
+.DS_Store
