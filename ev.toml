@@ -7,3 +7,17 @@ channels = 1
 
 [paths]
 data_dir = "data"     # 相对项目根目录;存模型权重、语音存档、SQLite、日志
+
+[models]
+root = "data/models"
+vad = "ev-fsmn-vad-zh-16k"
+asr_streaming = "ev-paraformer-zh-streaming-16k"
+asr_final = "ev-sensevoice-small"
+speaker = "ev-eres2netv2-zh-16k"
+
+[speaker]
+user_threshold = 0.72
+non_user_threshold = 0.45
+
+[vui]
+wake_words = ["EV"]

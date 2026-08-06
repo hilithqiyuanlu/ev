@@ -1,1 +1,1 @@
-"""声纹 embedding 与三区门控(T6,CAM++)。"""
+"""ERes2NetV2 声纹 embedding、profile 与三区门控。"""

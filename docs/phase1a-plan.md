@@ -1,113 +1,106 @@
-# Phase 1a 计划:ASR 转写 + 用户声纹门控
+# EV Phase 1a:VUI-ASR 输入闭环
 
-> 状态:已对齐,待开发(节奏:每个 T 完成停下汇报)
-> 已锁定:计算设备 = MacBook(iPhone 后期做移动采集前端);耳机优先;中英混说 → 中英双语 Paraformer;先用内置麦注册声纹,DJI 到货后重录;存档 = 只存语音段;拾音 = 先用内置麦;NLP 后置(本地双档,不上云);全天候/双工仅选型对齐
+## 范围
 
-## 目标与非目标
+Phase 1a 只完成稳定、可回放、可测量的语音输入链路。暂不实现 NLP、LLM、
+TTS、GUI、独立 KWS、多轮激活和多说话人聚类。GUI 与 LLM 通过事件接口接入。
 
-**目标**:Mac 收音 → VAD → 流式转写 → 每段打说话人标签(用户/非用户/未知)→ 全量落库(音频 + 逐字稿 + 标签 + 延迟追踪)。
-
-**非目标**(本阶段不做,仅保证选型不堵死):
-- NLP/命令路由(下一阶段:本地双档 LLM —— 9B 快档 + 强档,均跑 5060Ti;已锁定不上云)
-- TTS 播报(Phase 1b)
-- 全天候 KWS 唤醒、双工/barge-in(Phase 1c)
-- 在线多说话人精准区分(在线只判"是不是用户",精细区分放离线聚类)
-
-## 设备决策(已锁定)
-
-- **现在:MacBook Pro M4**。决策变量是工程效率不是算力(两台设备都够跑 VAD+ASR+声纹):sherpa-onnx 现成 Python wheel,模型随换随跑;iPhone 路线 = Swift + CoreML 转换 + 签名调试,迭代成本陡增而收益为零。
-- **iPhone 16 Pro Max = Phase 1c 的移动采集前端**(采集 + 回传,不当计算节点),与 DJI Mic Mini 天然搭配,契合前端/后端分离架构。现在不写 iOS。
-
-## 架构
-
-```
-(现阶段)MacBook 内置麦 ──────┐
-                             ├─ 设备抽象层,即插切换
-(到货后)DJI Mic Mini ────────┘   (接收器 USB-C,16kHz mono)
-        │
-        ▼
-声卡采集(sounddevice)
-        │
-        ├─► VAD/端点检测(Silero, sherpa-onnx)
-        │         │ 语音段
-        │         ├─► 流式 ASR(Paraformer) → 标点(CT-Transformer) ─► 逐字稿
-        │         └─► 声纹 embedding(CAM++) → 比对用户注册向量 ─► 标签
-        │                                        (与 ASR 并行,不进关键路径)
-        ▼
-CLI 实时显示(partial 转写 + 说话人标签)
-        ▼
-落库:SQLite(段级元数据)+ opus 音频 + JSONL 逐字稿
+```text
+麦克风 -> FSMN-VAD -> 所有人声段 WAV -> Paraformer Streaming partial
+       -> ERes2NetV2 用户声纹 -> SenseVoiceSmall final -> SQLite
+       -> EV 句首匹配 -> EV + user 标记 query_candidate
 ```
 
-## 声纹门控设计(flow1/flow2 的工程实现)
+所有 VAD 人声段都归档。声纹只决定标签和是否可形成 query，不决定是否保存。
 
-核心共识:**一条转写管道 + 可变说话人标签**,不分两条硬管道。
+## 模型与运行时
 
-- **三区门控,不做二分类**:score > τ_high → 用户(未来 flow1:命令+录入);< τ_low → 非用户(flow2:仅录入);中间 → `unknown`,暂按 flow2 处理,继续累积证据。
-- **滑动窗口平滑**:短段(<~1.5s)声纹分数噪声大;对同一语音轨最近 ~3s 取平均 embedding 再比对;证据攒够后**回溯改标**——标签是可变元数据,反正音频全留。
-- **在线只做 1-vs-用户验证**;真正的多说话人区分放离线:每晚对当天存档做 embedding 聚类,细化标签(又吃一次"原始音频必留"的红利)。
-- **注册与麦克风绑定**:已锁定先用内置麦注册,DJI 到货后重录。CLI 命令录 5 段 × 3–5s(近/远场各来几遍);声纹对信道敏感,**换麦必重录**(信道失配会导致分数漂移)。
-- **安全边界**:声纹是便利门控不是认证。未来命令执行 = 唤醒词 + 声纹双门控,敏感操作另加确认。
-- **先验差异**:DJI 领夹近场 → 收到的语音大概率全是用户,门控只是确认;内置麦房间场景 → 人声混合,门控才真正干活。
+首版使用 FunASR Python 和本地 ModelScope 模型目录，不执行在线下载，也暂不转换
+ONNX。MacBook Pro M4 以 CPU 可运行作为基线，MPS 后续单独验证。
 
-## 选型与理由
-
-| 环节 | 方案 | 理由 |
+| 环节 | ModelScope 模型 | 本地目录 |
 |---|---|---|
-| 拾音 | 现阶段 MacBook 内置麦;DJI 到货后经设备抽象层切换 | T2 暂缓,接口预留 |
-| VAD/端点 | Silero VAD(sherpa-onnx) | CPU 实时,10–30ms 帧 |
-| ASR | Paraformer-streaming **中英双语版**(sherpa-onnx,ModelScope 权重) | 已锁定中英混说;FunASR 系流式,支持 SeACo 热词(后期喂个人词典) |
-| ASR 备选 | SenseVoice-Small | 非流式但极快,自带情绪+声音事件标签,为情绪识别铺路 |
-| 标点 | CT-Transformer(sherpa-onnx) | ~10ms,同库解决 |
-| 声纹 | 3D-Speaker CAM++(sherpa-onnx speaker embedding,zh 16k) | 中文场景验证充分,轻量,CPU 可跑 |
-| 编排框架 | 自研 asyncio 事件总线 | 阶段间只传流式事件(partial/final);TTS/双工阶段可平移 Pipecat,不锁死 |
-| 存储 | SQLite(段级元数据,预留 FTS5/sqlite-vec)+ opus + JSONL | 单文件无服务;已锁定**只存语音段**(VAD 门控),append-only 留存 |
-| 延迟追踪 | 自研,逐段落 SQLite | 先测量后优化 |
+| VAD | `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | `ev-fsmn-vad-zh-16k` |
+| 流式 ASR | `iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online` | `ev-paraformer-zh-streaming-16k` |
+| 终稿 ASR | `iic/SenseVoiceSmall` | `ev-sensevoice-small` |
+| 用户声纹 | `iic/speech_eres2netv2_sv_zh-cn_16k-common` | `ev-eres2netv2-zh-16k` |
 
-## 延迟预算(转写场景,无 LLM)
+FSMN-VAD、Paraformer 和 ERes2NetV2 在进程启动时加载并常驻。SenseVoiceSmall
+首次生成终稿时懒加载，之后保持常驻。只有实际内存超限时才增加卸载策略。
 
-| 段 | p50 预算 | 说明 |
-|---|---|---|
-| 首 partial 转写显示 | ≤300ms | 边说边出字 |
-| VAD 端点判定 | 300–600ms | 最大头,可调激进 |
-| 端点后终稿 + 标点 | ≤200ms | |
-| 声纹 embedding | ~30–50ms/段 | 与 ASR 并行,不进关键路径 |
-| **端到端(说完→带标签终稿)** | **≤1.0s** | |
+模型包发布于 [models-v0.1.0](https://github.com/hilithqiyuanlu/mylyra/releases/tag/models-v0.1.0)：
 
-## 任务清单
+```text
+ev-fsmn-vad-zh-16k.tar.gz
+ev-paraformer-zh-streaming-16k.tar.gz
+ev-sensevoice-small.tar.gz
+ev-eres2netv2-zh-16k.tar.gz
+SHA256SUMS.txt
+```
 
-- [x] T1 uv 工程脚手架(src 布局、配置、日志)
-- [ ] T2' 音频采集 + 设备抽象层(先用内置麦;DJI 到货后接入并验证采样率/通道)【原 T2 暂缓】
-- [ ] T3 VAD 分段(Silero)
-- [ ] T4 流式 ASR(Paraformer;附 ModelScope 权重下载脚本)
-- [ ] T5 标点(CT-Transformer)
-- [ ] T6 声纹:embedding 提取 + 注册 CLI + 三区门控 + 滑动窗口 + 回溯改标
-- [ ] T7 落库:SQLite schema(段级:音频路径/起止/逐字/标签/分数/延迟)+ opus 存档 + JSONL
-- [ ] T8 延迟追踪 + p50/p95 报表
-- [ ] T9 CLI 主循环:实时 partial 转写 + 标签显示
-- [ ] T10 评测:20 句中文口语;字错率 + 声纹分数分布(用户/非用户)+ τ 标定
-- (推迟到下一阶段)NLP 本地双档:9B 快档(清洗/意图/路由/快答/滚动摘要)+ 强档(复杂交互,MoE 30B 级或 14B,均跑 5060Ti);不上云
+下载后在 Release 文件所在目录执行 `shasum -a 256 -c SHA256SUMS.txt`。由于 tar 包
+内部没有顶层目录，请分别解压到对应目录：
 
-## 全天候/双工的前置对齐(本阶段只保证不堵死)
+```bash
+mkdir -p data/models/ev-fsmn-vad-zh-16k data/models/ev-paraformer-zh-streaming-16k \
+  data/models/ev-sensevoice-small data/models/ev-eres2netv2-zh-16k
+tar -xzf ev-fsmn-vad-zh-16k.tar.gz -C data/models/ev-fsmn-vad-zh-16k
+tar -xzf ev-paraformer-zh-streaming-16k.tar.gz -C data/models/ev-paraformer-zh-streaming-16k
+tar -xzf ev-sensevoice-small.tar.gz -C data/models/ev-sensevoice-small
+tar -xzf ev-eres2netv2-zh-16k.tar.gz -C data/models/ev-eres2netv2-zh-16k
+```
 
-- 阶段间只传流式事件,不传整段结果 → 后续可加 barge-in。
-- AEC 路线预留:现阶段耳机;外放时接 macOS VoiceProcessingIO 或 ReSpeaker 硬件 AEC 阵列。
-- KWS 唤醒("EV")接口预留,Phase 1c 实现。
-- 真全双工留给后期端到端语音模型(GLM-4-Voice 档),模块化管线不承诺 250ms。
+`ev models verify` 会检查配置、非空权重、词表和必要配套文件。
 
-## 研究基座对齐(不改 T1–T10 范围,只约束设计)
+## 处理规则
 
-- **确定性回放**:存档自包含(原始 opus + 元数据),任意策略/模型可对历史语音段重跑 → 反事实实验与复现。
-- **配置化消融**:门控 τ、VAD 参数、检索策略等一律进 ev.toml,不写死代码;一次实验 = 一份配置 + 一次回放。
-- **体验采样(ESM)预留**:数据模型为用户主观评分留位,后续加每日轻量日记,与客观延迟/打断日志对齐。
+1. `AudioCapture` 持续输出 16 kHz mono 定长帧。
+2. VAD 使用 pre-roll 和 hangover，避免切掉语音首尾。
+3. `SpeechStarted` 后帧立即送入 Paraformer；partial 只用于显示和早期 EV 检测。
+4. `SpeechEnded` 后由 SenseVoiceSmall 开启 ITN 生成 final。
+5. ERes2NetV2 为完整语音段生成 embedding，并与已注册 profile 比较。
+6. 每段均生成 `segment_id`、WAV 文件和 SQLite 记录。
 
-详见 [research.md](research.md)。
+用户注册命令为 `ev voice enroll --device <selector> --segments 8`。注册只计算并
+合并 8-12 段、每段约 3-5 秒的归一化 embedding，不微调模型。profile 保存模型、
+设备、样本数和版本。在线分数采用可配置三区：
 
-## 风险与开放问题
+```text
+score >= user_threshold      user
+score <= non_user_threshold  non-user
+其他                         unknown
+```
 
-- 内置麦远场拾音质量差于 DJI → 字错率与声纹分数会偏差,T10 评测须注明信道条件。
-- 短命令声纹不稳 → 三区 + 滑窗缓解,靠 T10 的分数分布验证。
-- 换麦信道失配 → 注册流程与设备绑定,切换设备时强制重录。
-- 中文口语(吞字/语速/方言)字错率 → T10 验证。
-- 存档磁盘:已锁定只存语音段;按每天 1–2h 有效语音估算 ≈ 10–20MB/天,一年 <10GB。
-- 非用户评测样本来源(真人/外放视频)T10 前确定。
+VUI 对文本做大小写、空白和标点标准化，只检查语音段开头的 `EV` 或配置别名。
+同一段去除 EV 前缀后，只有 `wake_detected && speaker_label == user` 才设置
+`query_candidate=true`。本阶段不保持多轮激活状态。
+
+## 存储
+
+音频写入 `data/archive/YYYY-MM-DD/<segment_id>.wav`。SQLite 的 `segments` 保存
+时间、音频路径、原始/最终文本、声纹标签与分数、EV/query 状态及各模型标识；
+`speaker_profiles` 保存设备绑定的用户 profile embedding。音频不写入数据库 BLOB。
+
+## CLI
+
+```text
+ev models verify [--model-root PATH]
+ev voice enroll [--device SELECTOR] [--segments 8] [--model-root PATH]
+ev transcribe [--device SELECTOR] [--model-root PATH]
+```
+
+## 开发顺序与验收
+
+- [x] 工程脚手架与音频采集
+- [x] 模型配置、目录验证器和运行时适配层
+- [x] VAD 分段、pre-roll 和 hangover
+- [x] 流式/终稿 ASR 接口
+- [x] 声纹 enrollment、profile 与三区判断
+- [x] WAV + SQLite 持久化
+- [x] EV 句首匹配与 `QueryCandidate` 事件
+- [ ] 真机模型加载、麦克风闭环和阈值标定
+- [ ] 延迟、内存、字错率与误触发性能测试
+
+首个 partial p50 目标为 300 ms，端点后 final p50 目标为 800 ms。两秒以上用户
+语音漏检率初始目标 5%，非用户误判初始目标 1%，EV 联合误触发目标 0.1 次/小时。
+这些是测量目标，不在真实数据验证前承诺达到 GPT Live 或豆包体验。

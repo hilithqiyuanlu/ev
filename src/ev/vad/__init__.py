@@ -1,1 +1,1 @@
-"""VAD / 端点检测(T3,Silero via sherpa-onnx)。"""
+"""FSMN-VAD 与 pre-roll/hangover 端点检测。"""

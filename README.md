@@ -6,8 +6,10 @@
 
 [Quick start](#quick-start) | [Commands](#commands) | [Configuration](#configuration) | [Project status](#project-status)
 
-EV is an experimental, local-first personal voice assistant. The project currently
-focuses on building a reliable audio input layer for real-time speech processing.
+EV is an experimental, local-first personal voice assistant. Phase 1a focuses on a
+reliable, measurable speech input loop: VAD, streaming ASR partials, high-quality
+final transcription, user voice verification, EV wake-prefix matching, WAV archive,
+and SQLite metadata.
 
 Audio and runtime data stay on the local machine. Cloud services are not required.
 
@@ -20,6 +22,7 @@ Audio and runtime data stay on the local machine. Cloud services are not require
 - Run a short microphone diagnostic with a live level meter.
 - Save diagnostic recordings as WAV files for playback and inspection.
 - Load default, local, and environment-based configuration.
+- Archive every VAD speech segment and mark `EV + user` segments as query candidates.
 
 ## Quick start
 
@@ -31,6 +34,13 @@ git clone git@github.com:hilithqiyuanlu/mylyra.git
 cd mylyra
 uv sync
 uv run pytest
+```
+
+Install FunASR separately when the local model release is available (it is kept
+out of the base lockfile so audio-only development stays lightweight):
+
+```bash
+uv pip install funasr
 ```
 
 ## Commands
@@ -62,6 +72,27 @@ uv run python -m ev audio test --device "MacBook" --seconds 10
 Diagnostic recordings are written to `data/audio-test/`. The entire `data/`
 directory is excluded from Git.
 
+Verify a manually downloaded model release before starting the pipeline:
+
+```bash
+uv run python -m ev models verify --model-root data/models
+```
+
+Run enrollment and continuous transcription:
+
+```bash
+uv run python -m ev voice enroll --device "MacBook" --segments 8
+uv run python -m ev transcribe --device "MacBook" --model-root data/models
+```
+
+Models are downloaded manually from the
+[models-v0.1.0 release](https://github.com/hilithqiyuanlu/mylyra/releases/tag/models-v0.1.0).
+Each archive must be extracted into its matching directory under `data/models`
+(the archives do not contain a top-level directory). The application never
+downloads models automatically. See
+[`docs/phase1a-plan.md`](docs/phase1a-plan.md) for the required archive names and
+SHA256 check.
+
 ## Configuration
 
 Defaults live in [`ev.toml`](ev.toml). Create an ignored `ev.local.toml` file for
@@ -76,6 +107,13 @@ channels = 1
 
 [paths]
 data_dir = "data"
+
+[models]
+root = "data/models"
+vad = "ev-fsmn-vad-zh-16k"
+asr_streaming = "ev-paraformer-zh-streaming-16k"
+asr_final = "ev-sensevoice-small"
+speaker = "ev-eres2netv2-zh-16k"
 ```
 
 The following environment variables are also supported:

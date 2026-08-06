@@ -19,14 +19,37 @@ class AudioSettings:
 
 
 @dataclass(frozen=True)
+class ModelSettings:
+    root: Path
+    vad: str
+    asr_streaming: str
+    asr_final: str
+    speaker: str
+
+
+@dataclass(frozen=True)
+class SpeakerSettings:
+    user_threshold: float = 0.72
+    non_user_threshold: float = 0.45
+
+
+@dataclass(frozen=True)
+class VuiSettings:
+    wake_words: tuple[str, ...] = ("EV",)
+
+
+@dataclass(frozen=True)
 class Settings:
     log_level: str
     audio: AudioSettings
     data_dir: Path
+    models: ModelSettings
+    speaker: SpeakerSettings
+    vui: VuiSettings
 
     @property
     def models_dir(self) -> Path:
-        return self.data_dir / "models"
+        return self.models.root
 
     @property
     def archive_dir(self) -> Path:
@@ -62,12 +85,18 @@ def load_settings(config_path: Path | None = None) -> Settings:
             raw = _deep_merge(raw, tomllib.loads(path.read_text(encoding="utf-8")))
 
     audio_raw = raw.get("audio", {})
+    models_raw = raw.get("models", {})
+    speaker_raw = raw.get("speaker", {})
+    vui_raw = raw.get("vui", {})
     data_dir = Path(
         os.environ.get("EV_DATA_DIR", raw.get("paths", {}).get("data_dir", "data"))
     )
     if not data_dir.is_absolute():
         data_dir = PROJECT_ROOT / data_dir
 
+    model_root = Path(models_raw.get("root", "data/models"))
+    if not model_root.is_absolute():
+        model_root = PROJECT_ROOT / model_root
     return Settings(
         log_level=os.environ.get("EV_LOG_LEVEL", raw.get("log_level", "INFO")).upper(),
         audio=AudioSettings(
@@ -75,4 +104,16 @@ def load_settings(config_path: Path | None = None) -> Settings:
             channels=int(audio_raw.get("channels", 1)),
         ),
         data_dir=data_dir,
+        models=ModelSettings(
+            root=model_root,
+            vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
+            asr_streaming=str(models_raw.get("asr_streaming", "ev-paraformer-zh-streaming-16k")),
+            asr_final=str(models_raw.get("asr_final", "ev-sensevoice-small")),
+            speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
+        ),
+        speaker=SpeakerSettings(
+            user_threshold=float(speaker_raw.get("user_threshold", 0.72)),
+            non_user_threshold=float(speaker_raw.get("non_user_threshold", 0.45)),
+        ),
+        vui=VuiSettings(tuple(str(x) for x in vui_raw.get("wake_words", ["EV"]))),
     )
