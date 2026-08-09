@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     models_sub = models.add_subparsers(dest="models_command")
     verify = models_sub.add_parser("verify", help="校验本地模型 Release 解压结果")
     verify.add_argument("--model-root", default=None)
+    download = models_sub.add_parser("download", help="下载并校验固定版本模型 Release")
+    download.add_argument("--model-root", default=None)
 
     voice = sub.add_parser("voice", help="用户声纹")
     voice_sub = voice.add_subparsers(dest="voice_command")
@@ -42,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe = sub.add_parser("transcribe", help="持续 VAD/ASR/声纹/归档")
     transcribe.add_argument("--device", default=None)
     transcribe.add_argument("--model-root", default=None)
+
+    engine = sub.add_parser("engine", help="GUI JSONL engine")
+    engine_sub = engine.add_subparsers(dest="engine_command")
+    engine_sub.add_parser("serve", help="通过 stdin/stdout 提供版本化 JSONL 协议")
 
     return parser
 
@@ -100,6 +106,31 @@ def _cmd_models_verify(settings: Settings, model_root: str | None) -> int:
         else:
             print(f"FAIL {check.key}: {check.path} ({'; '.join(check.errors)})")
     return 0 if all(check.ok for check in checks) else 1
+
+
+def _cmd_models_download(settings: Settings, model_root: str | None) -> int:
+    from .model_download import ModelDownloader
+
+    settings = _settings_with_model_root(settings, model_root)
+
+    last_percent = -1
+
+    def report(kind: str, payload: dict) -> None:
+        nonlocal last_percent
+        if kind == "model_status":
+            key = payload.get("key", "all")
+            print(f"{key}: {payload.get('status')}")
+        elif kind == "download_progress":
+            size = max(int(payload.get("total_size", 1)), 1)
+            current = int(payload.get("total_downloaded", 0))
+            percent = int(current * 100 / size)
+            if percent != last_percent:
+                last_percent = percent
+                print(f"\r下载进度 {percent}%", end="", flush=True)
+
+    ModelDownloader(settings.models, report).download_all()
+    print()
+    return 0
 
 
 def _cmd_voice_enroll(settings: Settings, device: str | None, segments: int, model_root: str | None) -> int:
@@ -180,7 +211,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "models":
         if args.models_command == "verify":
             return _cmd_models_verify(settings, args.model_root)
-        print("用法: ev models verify")
+        if args.models_command == "download":
+            return _cmd_models_download(settings, args.model_root)
+        print("用法: ev models {verify,download}")
         return 1
     if args.command == "voice":
         if args.voice_command == "enroll":
@@ -189,6 +222,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "transcribe":
         return _cmd_transcribe(settings, args.device, args.model_root)
+    if args.command == "engine":
+        if args.engine_command == "serve":
+            from .engine.service import EngineService
+
+            return EngineService(settings).serve()
+        print("用法: ev engine serve")
+        return 1
 
     build_parser().print_help()
     return 0

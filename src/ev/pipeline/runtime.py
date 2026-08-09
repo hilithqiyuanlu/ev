@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import threading
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -14,7 +16,7 @@ import numpy as np
 from ..asr.adapters import FinalASRAdapter, SpeakerEmbeddingAdapter, StreamingASRAdapter
 from ..audio.capture import AudioCapture
 from ..config import Settings
-from ..speaker.verification import build_profile, verify_speaker
+from ..speaker.verification import verify_speaker
 from ..store.audio import archive_wav
 from ..store.db import SegmentRecord, Store
 from ..vui import decide_query
@@ -48,8 +50,9 @@ class SegmentProcessor:
         started_at: datetime,
         ended_at: datetime,
         partial: str = "",
+        segment_id: str | None = None,
     ) -> SegmentRecord:
-        segment_id = uuid.uuid4().hex
+        segment_id = segment_id or uuid.uuid4().hex
         final = self._final(audio)
         embedding = self.speaker.embed(audio, self.settings.audio.sample_rate)
         if self.profile is None:
@@ -99,6 +102,8 @@ async def transcribe_forever(
     device: int | None = None,
     model_root: Path | None = None,
     output: Callable[[str], None] = print,
+    stop_event: threading.Event | None = None,
+    emit: Callable[[str, dict], None] | None = None,
 ) -> None:
     from ..models import require_models
 
@@ -117,16 +122,25 @@ async def transcribe_forever(
         recent_frames: list[np.ndarray] = []
         started_at: datetime | None = None
         partial = ""
-        stop_requested = asyncio.Event()
+        local_stop = asyncio.Event()
+        current_segment_id: str | None = None
+
+        def send(event_type: str, payload: dict) -> None:
+            if emit is not None:
+                emit(event_type, payload)
 
         def request_stop(*_args) -> None:
-            stop_requested.set()
+            local_stop.set()
 
-        previous = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, request_stop)
+        can_install_signal = threading.current_thread() is threading.main_thread()
+        previous = signal.getsignal(signal.SIGINT) if can_install_signal else None
+        if can_install_signal:
+            signal.signal(signal.SIGINT, request_stop)
         capture.start()
         try:
             async for frame in capture.frames():
+                rms = float(np.sqrt(np.mean(frame**2)))
+                send("audio_level", {"rms": rms})
                 recent_frames.append(frame)
                 if len(recent_frames) > endpoints.pre_roll_frames + 1:
                     recent_frames.pop(0)
@@ -137,6 +151,11 @@ async def transcribe_forever(
                     frames = recent_frames[:-1][-endpoints.pre_roll_frames :]
                     frames.append(frame)
                     started_at = datetime.now(timezone.utc)
+                    current_segment_id = uuid.uuid4().hex
+                    send(
+                        "speech_started",
+                        {"segment_id": current_segment_id, "started_at": started_at.isoformat()},
+                    )
                     vad.reset()
                     stream.reset()
                     partial = ""
@@ -145,6 +164,7 @@ async def transcribe_forever(
                         if candidate:
                             partial = candidate
                             output(f"partial: {partial}")
+                            send("transcript_partial", {"segment_id": current_segment_id, "text": partial})
                 if (endpoints.active or state.ended) and not state.started:
                     frames.append(frame)
                 if endpoints.active and not state.ended and not state.started:
@@ -152,19 +172,49 @@ async def transcribe_forever(
                     if candidate:
                         partial = candidate
                         output(f"partial: {partial}")
+                        send("transcript_partial", {"segment_id": current_segment_id, "text": partial})
                 if state.ended and started_at is not None:
+                    ended_at = datetime.now(timezone.utc)
+                    send("speech_ended", {"segment_id": current_segment_id, "ended_at": ended_at.isoformat()})
                     if final is None:
                         final = FinalASRAdapter(str(paths["asr_final"]))
                         processor.final_asr = final
-                    processor.process(np.concatenate(frames), started_at, datetime.now(timezone.utc), partial)
-                    frames, started_at, partial = [], None, ""
-                if stop_requested.is_set():
+                    record = processor.process(
+                        np.concatenate(frames), started_at, ended_at, partial, current_segment_id
+                    )
+                    _emit_record(send, record)
+                    frames, started_at, partial, current_segment_id = [], None, "", None
+                if local_stop.is_set() or (stop_event is not None and stop_event.is_set()):
                     break
         finally:
             if endpoints.active and started_at is not None and frames:
                 if final is None:
                     final = FinalASRAdapter(str(paths["asr_final"]))
                     processor.final_asr = final
-                processor.process(np.concatenate(frames), started_at, datetime.now(timezone.utc), partial)
+                ended_at = datetime.now(timezone.utc)
+                send("speech_ended", {"segment_id": current_segment_id, "ended_at": ended_at.isoformat()})
+                record = processor.process(
+                    np.concatenate(frames), started_at, ended_at, partial, current_segment_id
+                )
+                _emit_record(send, record)
             capture.stop()
-            signal.signal(signal.SIGINT, previous)
+            if can_install_signal and previous is not None:
+                signal.signal(signal.SIGINT, previous)
+
+
+def _emit_record(send: Callable[[str, dict], None], record: SegmentRecord) -> None:
+    send(
+        "speaker_result",
+        {
+            "segment_id": record.id,
+            "label": record.speaker_label,
+            "score": record.speaker_score,
+        },
+    )
+    payload = asdict(record)
+    send("segment_committed", payload)
+    if record.query_candidate and record.query_text:
+        send(
+            "query_candidate",
+            {"segment_id": record.id, "source": "voice", "text": record.query_text},
+        )

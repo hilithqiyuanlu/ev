@@ -49,6 +49,7 @@ def test_sqlite_segment_and_profile(tmp_path):
         store.save_profile("user-v1", "user", "mic", "speaker", profile, 2)
         assert store.load_profile().tolist() == [1.0, 0.0]
         assert store.connection.execute("select count(*) from segments").fetchone()[0] == 1
+        assert store.connection.execute("pragma user_version").fetchone()[0] == 2
 
 
 def test_model_verify_is_offline_and_reports_missing(tmp_path):
@@ -89,3 +90,25 @@ def test_segment_processor_archives_every_segment_and_gates_query(tmp_path, monk
         assert record.query_candidate is True
         assert record.audio_path.endswith(".wav")
         assert (tmp_path / "data" / "archive").exists()
+        assert store.connection.execute("select source from queries").fetchone()[0] == "voice"
+
+
+def test_manual_query_history_and_atomic_segment_delete(tmp_path):
+    audio = tmp_path / "segment.wav"
+    audio.write_bytes(b"wav")
+    now = datetime.now(timezone.utc).isoformat()
+    with Store(tmp_path / "ev.db") as store:
+        store.insert_segment(
+            SegmentRecord(
+                "delete-me", now, now, 100, str(audio), 16000, 1, "hello", "hello",
+                "unknown", None, False, False, None, "vad", "stream", "final", "speaker", now,
+            )
+        )
+        manual = store.submit_manual_query("  test query  ")
+        assert manual.text == "test query"
+        assert store.list_segments()[0]["id"] == "delete-me"
+        assert store.delete_segment("delete-me") is True
+        assert not audio.exists()
+        assert store.list_queries()[0]["source"] == "manual"
+        assert store.delete_query(manual.id) is True
+        assert store.list_queries() == []

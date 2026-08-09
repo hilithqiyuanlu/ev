@@ -94,7 +94,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if not data_dir.is_absolute():
         data_dir = PROJECT_ROOT / data_dir
 
-    model_root = Path(models_raw.get("root", "data/models"))
+    model_root = Path(os.environ.get("EV_MODEL_ROOT", models_raw.get("root", "data/models")))
     if not model_root.is_absolute():
         model_root = PROJECT_ROOT / model_root
     return Settings(

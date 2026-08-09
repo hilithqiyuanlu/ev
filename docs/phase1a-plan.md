@@ -15,8 +15,9 @@ TTS、GUI、独立 KWS、多轮激活和多说话人聚类。GUI 与 LLM 通过�
 
 ## 模型与运行时
 
-首版使用 FunASR Python 和本地 ModelScope 模型目录，不执行在线下载，也暂不转换
-ONNX。MacBook Pro M4 以 CPU 可运行作为基线，MPS 后续单独验证。
+首版使用 FunASR Python 和本地模型目录，运行时不会让 FunASR 静默联网，也暂不转换
+ONNX。模型由显式的 `ev models download` 或 macOS 客户端从固定 Release 下载并校验；
+MacBook Pro M4 以 CPU 可运行作为基线，MPS 后续单独验证。
 
 | 环节 | ModelScope 模型 | 本地目录 |
 |---|---|---|
@@ -84,9 +85,11 @@ VUI 对文本做大小写、空白和标点标准化，只检查语音段开头�
 ## CLI
 
 ```text
+ev models download [--model-root PATH]
 ev models verify [--model-root PATH]
 ev voice enroll [--device SELECTOR] [--segments 8] [--model-root PATH]
 ev transcribe [--device SELECTOR] [--model-root PATH]
+ev engine serve
 ```
 
 ## 开发顺序与验收

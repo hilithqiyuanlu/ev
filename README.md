@@ -23,6 +23,8 @@ Audio and runtime data stay on the local machine. Cloud services are not require
 - Save diagnostic recordings as WAV files for playback and inspection.
 - Load default, local, and environment-based configuration.
 - Archive every VAD speech segment and mark `EV + user` segments as query candidates.
+- Run a native macOS SwiftUI client with menu bar controls, live transcription,
+  history, voice enrollment, model management, and a manual query queue.
 
 ## Quick start
 
@@ -40,7 +42,7 @@ Install FunASR separately when the local model release is available (it is kept
 out of the base lockfile so audio-only development stays lightweight):
 
 ```bash
-uv pip install funasr
+uv pip install funasr torch torchaudio
 ```
 
 ## Commands
@@ -72,10 +74,17 @@ uv run python -m ev audio test --device "MacBook" --seconds 10
 Diagnostic recordings are written to `data/audio-test/`. The entire `data/`
 directory is excluded from Git.
 
-Verify a manually downloaded model release before starting the pipeline:
+Verify the local model release before starting the pipeline:
 
 ```bash
 uv run python -m ev models verify --model-root data/models
+```
+
+Download the fixed `models-v0.1.0` release with checksum verification and atomic
+installation. Existing valid models are kept and skipped:
+
+```bash
+uv run python -m ev models download --model-root data/models
 ```
 
 Run enrollment and continuous transcription:
@@ -85,13 +94,39 @@ uv run python -m ev voice enroll --device "MacBook" --segments 8
 uv run python -m ev transcribe --device "MacBook" --model-root data/models
 ```
 
-Models are downloaded manually from the
+Start the versioned JSONL engine used by the macOS app:
+
+```bash
+uv run python -m ev engine serve
+```
+
+Build the development macOS app:
+
+```bash
+xcodebuild -project apps/macos/EV.xcodeproj -scheme EV \
+  -configuration Debug -derivedDataPath /tmp/ev-derived CODE_SIGNING_ALLOWED=NO build
+open /tmp/ev-derived/Build/Products/Debug/EV.app
+```
+
+See [`docs/phase1b-gui.md`](docs/phase1b-gui.md) for the engine protocol and
+development-client boundaries.
+
+Models are versioned in the
 [models-v0.1.0 release](https://github.com/hilithqiyuanlu/mylyra/releases/tag/models-v0.1.0).
-Each archive must be extracted into its matching directory under `data/models`
-(the archives do not contain a top-level directory). The application never
-downloads models automatically. See
+The CLI and macOS client download each fixed asset to a temporary file, verify
+SHA256, validate the extracted structure, and atomically install it under the
+configured model root. A failed or cancelled download does not replace an
+existing valid model. See
 [`docs/phase1a-plan.md`](docs/phase1a-plan.md) for the required archive names and
-SHA256 check.
+SHA256 values.
+
+The engine also exposes history and query operations for the macOS client. The
+following commands are available through the JSONL protocol:
+
+```text
+list_segments, delete_segment, delete_all_segments
+submit_manual_query, delete_query, delete_all_queries
+```
 
 ## Configuration
 
@@ -125,6 +160,7 @@ The following environment variables are also supported:
 
 ```text
 src/ev/       Application package and CLI
+apps/macos/   Native SwiftUI development client
 tests/        Automated tests
 docs/         Internal design and research notes
 ev.toml       Default configuration
