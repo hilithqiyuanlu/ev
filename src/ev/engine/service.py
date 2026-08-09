@@ -46,6 +46,8 @@ class EngineService:
         self._download_cancel = threading.Event()
         self._voice_auto_learn = settings.voice_learning.auto_learn_enabled
         self._segment_worker = None  # type: ignore[assignment]
+        # Remember last start_listening params for restart-on-device-change
+        self._last_listen_params: dict | None = None
 
     def serve(self, input_stream: TextIO = sys.stdin) -> int:
         self.settings.ensure_dirs()
@@ -75,6 +77,7 @@ class EngineService:
             "cancel_download": self._cancel_download,
             "start_listening": self._start_listening,
             "stop_listening": self._stop_listening,
+            "set_device": self._set_device,
             "set_thresholds": self._set_thresholds,
             "list_voice_samples": self._list_voice_samples,
             "delete_voice_sample": self._delete_voice_sample,
@@ -176,6 +179,12 @@ class EngineService:
         auto_learn = bool(request.payload.get("auto_learn", self._voice_auto_learn))
         if not (0.1 <= threshold <= 0.9):
             raise ValueError("阈值必须在0.1到0.9之间")
+        # Remember params for potential restart (e.g. device change)
+        self._last_listen_params = {
+            "device": self.device_selector,
+            "threshold": threshold,
+            "auto_learn": auto_learn,
+        }
         session_settings = replace(
             self.settings,
             speaker=replace(
@@ -247,6 +256,40 @@ class EngineService:
                 self.settings,
                 speaker=replace(self.settings.speaker, threshold=t),
             )
+        self._ack(request)
+
+    def _set_device(self, request: EngineRequest) -> None:
+        new_device = request.payload.get("device") or None
+        # Validate device exists if specified
+        if new_device is not None:
+            resolved = resolve_device(new_device)
+            if resolved is None:
+                raise ValueError(f"未找到匹配的输入设备: {new_device}")
+        # Update selector
+        self.device_selector = new_device
+        # Update saved params
+        if self._last_listen_params is not None:
+            self._last_listen_params["device"] = new_device
+        was_listening = self._listen_thread is not None and self._listen_thread.is_alive()
+        if was_listening:
+            # Restart listening with new device
+            self._listen_stop.set()
+            self._listen_thread.join(timeout=3.0)
+            self._listen_thread = None
+            self._segment_worker = None
+            self._listen_stop = threading.Event()
+            self.state = "loading"
+            self._emit_state()
+            # Reuse last params to restart
+            params = self._last_listen_params or {}
+            params["device"] = new_device
+            # Build a synthetic request for restart
+            restart_request = EngineRequest(
+                request_id=str(uuid.uuid4()),
+                command="start_listening",
+                payload=params,
+            )
+            self._start_listening(restart_request)
         self._ack(request)
 
     def _on_runtime_event(self, event_type: str, payload: dict) -> None:

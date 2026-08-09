@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import Foundation
 import ServiceManagement
 
@@ -105,6 +106,7 @@ final class AppModel: ObservableObject {
     private let permissionProvider: MicrophonePermissionProviding
     private var didInitialRefresh = false
     private var deviceRefreshTimer: Timer?
+    private var cancellables = Set<AnyCancellable>()
 
     var onboardingChecks: (models: Bool, permission: Bool) {
         (
@@ -220,6 +222,16 @@ final class AppModel: ObservableObject {
             deviceRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.refreshDevices() }
             }
+            // Listen for device changes: when user selects different device, notify engine immediately
+            $selectedDevice
+                .dropFirst()  // Skip initial value
+                .removeDuplicates()
+                .sink { [weak self] newDevice in
+                    guard let self, !newDevice.isEmpty else { return }
+                    // Send set_device command - engine will restart listening if active
+                    self.engine.send("set_device", payload: ["device": newDevice])
+                }
+                .store(in: &cancellables)
         } catch {
             engineState = .error
             errorMessage = error.localizedDescription
