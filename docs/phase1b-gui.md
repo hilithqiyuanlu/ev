@@ -1,5 +1,18 @@
 # EV Phase 1b：macOS GUI 客户端
 
+## 当前状态
+
+仓库开发版已经实现并通过自动测试：
+
+- `ev engine serve` JSONL v1 协议和进程状态机；
+- 菜单栏，以及实时、历史、Query 队列、声纹、模型和设置界面；
+- 固定 Release 模型下载、SHA256 校验、安全解压和原子安装；
+- SQLite v2、voice/manual query、WAV 回放与一致性删除；
+- FunASR 四模型本地加载和 macOS Debug 构建。
+
+尚未完成真实麦克风端到端验收、声纹阈值标定、延迟/内存测量，以及脱离仓库
+`.venv` 的独立 arm64 `.app` 打包。签名和公证继续后置。
+
 ## 架构
 
 EV macOS 客户端使用 SwiftUI。Python engine 继续拥有麦克风、FunASR、模型、WAV
@@ -82,10 +95,13 @@ logs/     engine stderr 日志
 
 ## 验证顺序
 
-```text
-uv run pytest
-swift test --disable-sandbox --package-path apps/macos
-xcodebuild ... build
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -p no:cacheprovider -q
+CLANG_MODULE_CACHE_PATH=/tmp/ev-clang-module-cache \
+  SWIFT_MODULE_CACHE_PATH=/tmp/ev-swift-module-cache \
+  swift test --disable-sandbox --package-path apps/macos
+xcodebuild -project apps/macos/EV.xcodeproj -scheme EV \
+  -configuration Debug -derivedDataPath /tmp/ev-derived CODE_SIGNING_ALLOWED=NO build
 ```
 
 自动测试覆盖协议、SQLite migration、query 写入与删除、模型 SHA256/安全解压和原子

@@ -20,18 +20,32 @@
 仍保存 WAV 与 SQLite，只是不产生 `QueryCandidate`。当前 query 仅限同一 VAD 段，
 不维持多轮激活状态。
 
+## Phase 1b 客户端链路
+
+```text
+SwiftUI 主窗口 / 菜单栏
+  -> Process 启动仓库 .venv/bin/python
+  -> stdin JSONL command -> ev engine serve
+  -> Phase 1a 音频管线
+  -> stdout JSONL event -> 实时状态、partial、历史和 Query 队列
+  -> Python 统一写入 WAV + SQLite
+```
+
+客户端不直接调用 FunASR，也不直接读写 SQLite。语音 `query_candidate` 和 GUI 手动
+输入都写入 `queries` 表，当前状态统一为 `pending`，留给后续 LLM 消费。关闭主窗口
+不停止 engine；退出应用时发送 `shutdown`，停止采集并 flush 已结束语音段。
+
 最小事件集合：
 
 | 事件 | 作用 |
 |---|---|
-| `AudioFrame` | 定长音频帧与采集时间 |
-| `SpeechStarted` | 创建段并启动流式 ASR |
-| `TranscriptPartial` | 实时文本和 EV 候选检测 |
-| `SpeechEnded` | 触发终稿、声纹和持久化 |
-| `TranscriptFinal` | 最终文本 |
-| `SpeakerScore` | 分数及三区标签 |
-| `SegmentCommitted` | WAV 与 SQLite 已提交 |
-| `QueryCandidate` | 预留给 GUI/LLM 的 query 接口 |
+| `audio_level` | GUI 实时输入电平 |
+| `speech_started` | 创建段并启动流式 ASR |
+| `transcript_partial` | 实时文本和 EV 候选检测 |
+| `speech_ended` | 触发终稿、声纹和持久化 |
+| `speaker_result` | 分数及三区标签 |
+| `segment_committed` | WAV 与 SQLite 已提交 |
+| `query_candidate` | 预留给 GUI/LLM 的 query 接口 |
 
 ## 最终全天候双工链路
 
