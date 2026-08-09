@@ -69,9 +69,8 @@ struct HistoryView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
 
-                Toggle("", isOn: $queryOnly)
+                Toggle("待处理输入", isOn: $queryOnly)
                     .toggleStyle(.checkbox)
-                    .labelsHidden()
                     .help("仅显示 Query 候选")
                     .onChange(of: queryOnly) { _ in scheduleFilter() }
 

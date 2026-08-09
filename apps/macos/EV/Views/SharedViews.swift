@@ -196,7 +196,8 @@ struct SegmentRow: View {
                         Button {
                             onDelete?()
                         } label: {
-                            Image(systemName: "trash")
+                            Image(systemName: "xmark")
+                                .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.borderless)
                         .help("删除此记录")
@@ -272,7 +273,8 @@ struct HistoryRow: View {
                 Button {
                     onDelete?()
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "xmark")
+                        .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
                 .help("删除此记录")
@@ -306,7 +308,8 @@ struct HistoryRow: View {
             Button {
                 onDelete?()
             } label: {
-                Image(systemName: "trash")
+                Image(systemName: "xmark")
+                    .foregroundStyle(.secondary)
             }
             .buttonStyle(.borderless)
             .help("删除此记录")
@@ -342,7 +345,7 @@ struct QueryRow: View {
             Button {
                 model.deleteQuery(query.id)
             } label: {
-                Image(systemName: "trash")
+                Image(systemName: "xmark")
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.borderless)
