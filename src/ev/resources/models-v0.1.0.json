@@ -5,7 +5,7 @@
       "key": "vad",
       "directory": "ev-fsmn-vad-zh-16k",
       "filename": "ev-fsmn-vad-zh-16k.tar.gz",
-      "url": "https://github.com/hilithqiyuanlu/mylyra/releases/download/models-v0.1.0/ev-fsmn-vad-zh-16k.tar.gz",
+      "url": "https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-fsmn-vad-zh-16k.tar.gz",
       "size": 3369430,
       "sha256": "fa7e286bc04dd5fd886836e54e64ecbac37fd5dc1c991ca362096166545b0736"
     },
@@ -13,7 +13,7 @@
       "key": "asr_streaming",
       "directory": "ev-paraformer-zh-streaming-16k",
       "filename": "ev-paraformer-zh-streaming-16k.tar.gz",
-      "url": "https://github.com/hilithqiyuanlu/mylyra/releases/download/models-v0.1.0/ev-paraformer-zh-streaming-16k.tar.gz",
+      "url": "https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-paraformer-zh-streaming-16k.tar.gz",
       "size": 820157164,
       "sha256": "4ff1d661db592f59dc869940fb1bec6db10f61f595cbcec0fd1a20d2cb4aebcb"
     },
@@ -21,7 +21,7 @@
       "key": "asr_final",
       "directory": "ev-sensevoice-small",
       "filename": "ev-sensevoice-small.tar.gz",
-      "url": "https://github.com/hilithqiyuanlu/mylyra/releases/download/models-v0.1.0/ev-sensevoice-small.tar.gz",
+      "url": "https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-sensevoice-small.tar.gz",
       "size": 870507697,
       "sha256": "f61dcfc2fd855e25c1990eda841113e45d6521bfbd115a9bdd559106554c03cb"
     },
@@ -29,7 +29,7 @@
       "key": "speaker",
       "directory": "ev-eres2netv2-zh-16k",
       "filename": "ev-eres2netv2-zh-16k.tar.gz",
-      "url": "https://github.com/hilithqiyuanlu/mylyra/releases/download/models-v0.1.0/ev-eres2netv2-zh-16k.tar.gz",
+      "url": "https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-eres2netv2-zh-16k.tar.gz",
       "size": 68820465,
       "sha256": "a921151bb77ff72221a1b39759f12ec8ee891e167d5cc43932d350eb80dc5d3c"
     }

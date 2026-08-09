@@ -29,7 +29,7 @@ MacBook Pro M4 以 CPU 可运行作为基线，MPS 后续单独验证。
 FSMN-VAD、Paraformer 和 ERes2NetV2 在进程启动时加载并常驻。SenseVoiceSmall
 首次生成终稿时懒加载，之后保持常驻。只有实际内存超限时才增加卸载策略。
 
-模型包发布于 [models-v0.1.0](https://github.com/hilithqiyuanlu/mylyra/releases/tag/models-v0.1.0)：
+模型包发布于 [models-v0.1.0](https://github.com/hilithqiyuanlu/ev/releases/tag/models-v0.1.0)：
 
 ```text
 ev-fsmn-vad-zh-16k.tar.gz

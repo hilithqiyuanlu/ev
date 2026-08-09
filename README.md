@@ -32,8 +32,8 @@ EV requires Python 3.11 or newer and uses
 [`uv`](https://docs.astral.sh/uv/) for dependency management.
 
 ```bash
-git clone git@github.com:hilithqiyuanlu/mylyra.git
-cd mylyra
+git clone git@github.com:hilithqiyuanlu/ev.git
+cd ev
 uv sync
 uv run pytest
 ```
@@ -115,7 +115,7 @@ See [`docs/phase1b-gui.md`](docs/phase1b-gui.md) for the engine protocol and
 development-client boundaries.
 
 Models are versioned in the
-[models-v0.1.0 release](https://github.com/hilithqiyuanlu/mylyra/releases/tag/models-v0.1.0).
+[models-v0.1.0 release](https://github.com/hilithqiyuanlu/ev/releases/tag/models-v0.1.0).
 The CLI and macOS client download each fixed asset to a temporary file, verify
 SHA256, validate the extracted structure, and atomically install it under the
 configured model root. A failed or cancelled download does not replace an
