@@ -12,6 +12,12 @@ struct EVApp: App {
         }
         .defaultSize(width: 1080, height: 720)
         .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button("退出 EV") {
+                    model.quitApplication()
+                }
+                .keyboardShortcut("q")
+            }
             CommandGroup(after: .appInfo) {
                 Button(model.isListening ? "停止监听" : "开始监听") {
                     model.toggleListening()
@@ -20,7 +26,7 @@ struct EVApp: App {
             }
         }
 
-        MenuBarExtra("EV", systemImage: model.engineState.symbol) {
+        MenuBarExtra("EV", systemImage: model.activitySymbol) {
             MenuBarView()
                 .environmentObject(model)
         }

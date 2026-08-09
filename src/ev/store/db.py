@@ -73,6 +73,18 @@ class Store:
               embedding_dim INTEGER NOT NULL, embedding_dtype TEXT NOT NULL,
               sample_count INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS speaker_samples (
+              id TEXT PRIMARY KEY,
+              segment_id TEXT REFERENCES segments(id) ON DELETE CASCADE,
+              audio_path TEXT NOT NULL,
+              duration_ms INTEGER NOT NULL,
+              embedding_blob BLOB NOT NULL,
+              embedding_dim INTEGER NOT NULL,
+              score REAL NOT NULL,
+              tier TEXT NOT NULL DEFAULT 'core' CHECK(tier IN ('core','cache')),
+              is_manual INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS queries (
               id TEXT PRIMARY KEY,
               source TEXT NOT NULL CHECK(source IN ('voice','manual')),
@@ -84,10 +96,62 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_segments_started_at ON segments(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_segments_speaker ON segments(speaker_label);
             CREATE INDEX IF NOT EXISTS idx_queries_created_at ON queries(created_at DESC);
-            PRAGMA user_version=2;
+            CREATE INDEX IF NOT EXISTS idx_speaker_samples_created ON speaker_samples(created_at DESC);
             """
         )
+        self._migrate_samples_v4()
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_speaker_samples_tier ON speaker_samples(tier)")
+        self._migrate_binary_classification_v5()
+        self._migrate_remove_unknown_v6()
+        self.connection.execute("PRAGMA user_version=6")
+        self._migrate_legacy_profile()
         self.connection.commit()
+
+    def _migrate_samples_v4(self) -> None:
+        """Add tier/is_manual columns to existing speaker_samples table (v3->v4)."""
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(speaker_samples)").fetchall()}
+        if "tier" not in cols:
+            self.connection.execute("ALTER TABLE speaker_samples ADD COLUMN tier TEXT NOT NULL DEFAULT 'core'")
+        if "is_manual" not in cols:
+            self.connection.execute("ALTER TABLE speaker_samples ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0")
+        # Ensure check constraint by updating any invalid values
+        self.connection.execute("UPDATE speaker_samples SET tier='core' WHERE tier NOT IN ('core','cache')")
+
+    def _migrate_binary_classification_v5(self) -> None:
+        """Migrate from three-class (user/uncertain/non-user) to binary (user/non-user).
+        - Existing 'uncertain' segments are reclassified as 'non-user' (safe default: better to reject than falsely accept)
+        """
+        self.connection.execute("UPDATE segments SET speaker_label='non-user' WHERE speaker_label='uncertain'")
+
+    def _migrate_remove_unknown_v6(self) -> None:
+        """Remove 'unknown' label - cold-start segments are treated as 'user'."""
+        self.connection.execute("UPDATE segments SET speaker_label='user' WHERE speaker_label='unknown'")
+
+    def _migrate_legacy_profile(self) -> None:
+        """Migrate legacy single-embedding profile to a sample entry if samples table is empty."""
+        sample_count = self.connection.execute(
+            "SELECT COUNT(*) as c FROM speaker_samples"
+        ).fetchone()["c"]
+        if sample_count > 0:
+            return
+        legacy = self.connection.execute(
+            "SELECT embedding_blob, embedding_dim FROM speaker_profiles WHERE id='user-v1'"
+        ).fetchone()
+        if legacy is None:
+            return
+        embedding = np.frombuffer(
+            legacy["embedding_blob"], dtype="<f4", count=legacy["embedding_dim"]
+        ).copy()
+        sample_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        self.connection.execute(
+            """
+            INSERT INTO speaker_samples
+              (id, segment_id, audio_path, duration_ms, embedding_blob, embedding_dim, score, tier, is_manual, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'core', 1, ?)
+            """,
+            (sample_id, None, "", 0, embedding.tobytes(), embedding.size, 1.0, now),
+        )
 
     def insert_segment(self, record: SegmentRecord) -> None:
         data = asdict(record)
@@ -248,13 +312,162 @@ class Store:
             )
 
     def load_profile(self, profile_id: str = "user-v1") -> np.ndarray | None:
-        row = self.connection.execute(
-            "SELECT embedding_blob, embedding_dim FROM speaker_profiles WHERE id=?",
-            (profile_id,),
-        ).fetchone()
-        if row is None:
+        embeddings = self.load_voice_sample_embeddings()
+        if not embeddings:
             return None
-        return np.frombuffer(row["embedding_blob"], dtype="<f4", count=row["embedding_dim"]).copy()
+        from ..speaker.verification import build_profile
+        return build_profile(embeddings)
+
+    def profile_status(self, profile_id: str = "user-v1") -> dict:
+        core_count = self.count_voice_samples(tier="core")
+        cache_count = self.count_voice_samples(tier="cache")
+        sample_count = core_count + cache_count
+        updated_row = self.connection.execute(
+            "SELECT MAX(created_at) as updated FROM speaker_samples"
+        ).fetchone()
+        updated_at = updated_row["updated"] if updated_row else None
+        from ..speaker.verification import choose_k
+        centroid_count = choose_k(core_count, 3) if core_count > 0 else 0
+        if sample_count == 0:
+            return {
+                "exists": False,
+                "is_ready": False,
+                "sample_count": 0,
+                "core_count": 0,
+                "cache_count": 0,
+                "centroid_count": 0,
+                "updated_at": None,
+                "last_updated": None,
+            }
+        return {
+            "exists": core_count >= 3,
+            "is_ready": core_count >= 3,
+            "sample_count": sample_count,
+            "core_count": core_count,
+            "cache_count": cache_count,
+            "centroid_count": centroid_count,
+            "updated_at": updated_at,
+            "last_updated": updated_at,
+        }
+
+    def add_voice_sample(
+        self,
+        *,
+        segment_id: str | None,
+        audio_path: str,
+        duration_ms: int,
+        embedding: np.ndarray,
+        score: float,
+        tier: str = "core",
+        is_manual: bool = False,
+    ) -> str:
+        vector = np.asarray(embedding, dtype="<f4").reshape(-1)
+        sample_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO speaker_samples
+                  (id, segment_id, audio_path, duration_ms, embedding_blob, embedding_dim, score, tier, is_manual, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (sample_id, segment_id, audio_path, duration_ms, vector.tobytes(),
+                 vector.size, score, tier, 1 if is_manual else 0, now),
+            )
+        return sample_id
+
+    def list_voice_samples(self, tier: str | None = None, limit: int = 100) -> list[dict]:
+        if tier not in (None, "core", "cache"):
+            raise ValueError(f"invalid tier: {tier}")
+        sql = """
+            SELECT id, segment_id, audio_path, duration_ms, score, tier, is_manual, created_at
+            FROM speaker_samples
+        """
+        params: list = []
+        if tier:
+            sql += " WHERE tier = ?"
+            params.append(tier)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(min(max(int(limit), 1), 200))
+        rows = self.connection.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_voice_samples(self, tier: str | None = None) -> int:
+        if tier:
+            row = self.connection.execute(
+                "SELECT COUNT(*) as c FROM speaker_samples WHERE tier=?", (tier,)
+            ).fetchone()
+        else:
+            row = self.connection.execute("SELECT COUNT(*) as c FROM speaker_samples").fetchone()
+        return int(row["c"])
+
+    def load_voice_sample_embeddings(self, tier: str = "core") -> list[tuple[str, np.ndarray, float]]:
+        """Return list of (sample_id, embedding, score) for samples in given tier."""
+        if tier not in ("core", "cache", None):
+            raise ValueError(f"invalid tier: {tier}")
+        if tier:
+            rows = self.connection.execute(
+                "SELECT id, embedding_blob, embedding_dim, score FROM speaker_samples WHERE tier=? ORDER BY created_at ASC",
+                (tier,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT id, embedding_blob, embedding_dim, score FROM speaker_samples ORDER BY created_at ASC"
+            ).fetchall()
+        return [
+            (
+                row["id"],
+                np.frombuffer(row["embedding_blob"], dtype="<f4", count=row["embedding_dim"]).copy(),
+                float(row["score"]),
+            )
+            for row in rows
+        ]
+
+    def get_voice_sample(self, sample_id: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT * FROM speaker_samples WHERE id=?", (sample_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_voice_sample_tier(self, sample_id: str, tier: str) -> bool:
+        if tier not in ("core", "cache"):
+            raise ValueError(f"invalid tier: {tier}")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE speaker_samples SET tier=? WHERE id=?", (tier, sample_id)
+            )
+            return cursor.rowcount > 0
+
+    def delete_voice_sample(self, sample_id: str) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM speaker_samples WHERE id=?", (sample_id,)
+            )
+            return cursor.rowcount > 0
+
+    def evict_oldest_cache(self, max_cache: int) -> int:
+        """Evict oldest cache samples to keep total cache count <= max_cache. Returns deleted count."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                DELETE FROM speaker_samples
+                WHERE tier='cache' AND id IN (
+                    SELECT id FROM speaker_samples
+                    WHERE tier='cache'
+                    ORDER BY created_at ASC
+                    LIMIT MAX(0, (SELECT COUNT(*) FROM speaker_samples WHERE tier='cache') - ?)
+                )
+                """,
+                (max_cache,),
+            )
+            return cursor.rowcount
+
+    def delete_all_voice_samples(self) -> int:
+        with self.connection:
+            cursor = self.connection.execute("DELETE FROM speaker_samples")
+            deleted = cursor.rowcount
+            self.connection.execute("DELETE FROM speaker_profiles WHERE id='user-v1'")
+        return deleted
 
     def close(self) -> None:
         self.connection.close()

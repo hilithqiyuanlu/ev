@@ -155,6 +155,19 @@ class ModelDownloader:
                 if member.issym() or member.islnk():
                     raise RuntimeError("模型压缩包不得包含链接")
             tar.extractall(target)
+        # Flatten single-level nested directory (common when tarring from inside dir)
+        # e.g. if target/ev-paraformer-zh-16k/model.pt exists but target/model.pt doesn't,
+        # move all contents up one level.
+        entries = list(target.iterdir())
+        dirs = [p for p in entries if p.is_dir() and not p.name.startswith(".")]
+        files = [p for p in entries if p.is_file() and not p.name.startswith("._")]
+        if len(dirs) == 1 and len(files) == 0:
+            nested = dirs[0]
+            has_config = (nested / "configuration.json").exists()
+            if has_config:
+                for item in nested.iterdir():
+                    shutil.move(str(item), str(target / item.name))
+                nested.rmdir()
 
     def _check_cancelled(self) -> None:
         if self.cancel_event.is_set():

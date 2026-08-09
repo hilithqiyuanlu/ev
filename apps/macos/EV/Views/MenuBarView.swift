@@ -7,8 +7,11 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(model.engineState.title, systemImage: model.engineState.symbol)
+            Label(model.activityTitle, systemImage: model.activitySymbol)
                 .font(.headline)
+            Text(model.activityDetail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             ProgressView(value: model.audioLevel)
                 .progressViewStyle(.linear)
             Button {
@@ -16,15 +19,17 @@ struct MenuBarView: View {
             } label: {
                 Label(model.isListening ? "停止监听" : "开始监听", systemImage: model.isListening ? "stop.fill" : "mic.fill")
             }
-            .disabled(model.engineState == .loading || model.engineState == .stopping)
+            .disabled(
+                model.engineState == .loading || model.engineState == .stopping ||
+                (!model.isListening && !model.canStartListening)
+            )
             Divider()
             Button("打开 EV") {
                 openWindow(id: "main")
                 NSApp.activate(ignoringOtherApps: true)
             }
             Button("退出") {
-                model.shutdown()
-                NSApp.terminate(nil)
+                model.quitApplication()
             }
         }
         .padding(14)

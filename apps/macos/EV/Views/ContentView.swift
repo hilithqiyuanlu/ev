@@ -1,19 +1,15 @@
 import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable {
-    case live = "实时"
+    case home = "首页"
     case history = "历史"
-    case voice = "声纹"
-    case models = "模型"
     case settings = "设置"
     var id: String { rawValue }
 
     var symbol: String {
         switch self {
-        case .live: "waveform"
+        case .home: "house"
         case .history: "clock.arrow.circlepath"
-        case .voice: "person.wave.2"
-        case .models: "shippingbox"
         case .settings: "gearshape"
         }
     }
@@ -21,7 +17,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var section: AppSection? = .live
+    @State private var section: AppSection?
 
     var body: some View {
         NavigationSplitView {
@@ -30,11 +26,9 @@ struct ContentView: View {
             }
             .navigationSplitViewColumnWidth(min: 150, ideal: 180, max: 220)
         } detail: {
-            switch section ?? .live {
-            case .live: LiveView()
+            switch section ?? (model.hasCompletedOnboarding ? .home : .settings) {
+            case .home: HomeView()
             case .history: HistoryView()
-            case .voice: VoiceProfileView()
-            case .models: ModelsView()
             case .settings: SettingsView()
             }
         }
@@ -45,6 +39,19 @@ struct ContentView: View {
             Button("好") { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .onAppear {
+            if section == nil {
+                section = model.hasCompletedOnboarding ? .home : .settings
+            }
+        }
+        .onChange(of: model.hasCompletedOnboarding) { completed in
+            if completed && section == .settings {
+                section = .home
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("goHome"))) { _ in
+            section = .home
         }
     }
 }

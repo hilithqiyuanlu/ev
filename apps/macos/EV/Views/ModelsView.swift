@@ -6,76 +6,97 @@ struct ModelsView: View {
     private let names = [
         "vad": "FSMN-VAD",
         "asr_streaming": "Paraformer Streaming",
-        "asr_final": "SenseVoiceSmall",
+        "asr_final": "Paraformer Large",
         "speaker": "ERes2NetV2",
     ]
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.allModelsReady ? "模型已就绪" : "需要准备模型")
-                        .font(.headline)
-                    Text("固定版本 models-v0.1.0，总下载约 1.76 GB")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button {
-                    if model.allModelsReady { model.verifyModels() }
-                    else { model.downloadModels() }
-                } label: {
-                    Label(model.allModelsReady ? "重新校验" : "下载模型", systemImage: "arrow.down.circle")
-                }
-                if model.downloadProgress > 0 && model.downloadProgress < 1 {
-                    Button("取消", role: .cancel) { model.cancelDownload() }
-                }
-            }
-            .padding(16)
-
-            if model.downloadProgress > 0 && model.downloadProgress < 1 {
-                VStack(alignment: .leading, spacing: 5) {
-                    ProgressView(value: model.downloadProgress)
-                    Text("\(model.downloadLabel) · \(Int(model.downloadProgress * 100))%")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 12)
-            }
-
-            Divider()
-
-            HStack(spacing: 12) {
-                Image(systemName: model.runtimeReady ? "checkmark.circle.fill" : "exclamationmark.triangle")
-                    .foregroundStyle(model.runtimeReady ? .green : .orange)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Python 运行时").font(.headline)
-                    Text(model.runtimeLabel).font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(16)
-
-            Divider()
-
-            List(model.models) { item in
-                HStack(spacing: 12) {
-                    Image(systemName: item.ready ? "checkmark.circle.fill" : "xmark.circle")
-                        .foregroundStyle(item.ready ? .green : .red)
+        CenteredPage(maxWidth: 760) {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 16) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(names[item.key] ?? item.key).font(.headline)
-                        Text(item.path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        if !item.errors.isEmpty {
-                            Text(item.errors.joined(separator: "，")).font(.caption).foregroundStyle(.red)
-                        }
+                        Text(model.allModelsReady ? "模型已就绪" : "需要准备模型")
+                            .font(.title2.bold())
+                        Text("固定版本 models-v0.1.0 · 约 1.82 GB")
+                            .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button {
+                        if model.allModelsReady { model.verifyModels() }
+                        else { model.downloadModels() }
+                    } label: {
+                        Label(
+                            model.allModelsReady ? "重新校验" : "下载模型",
+                            systemImage: model.allModelsReady ? "checkmark.arrow.trianglehead.counterclockwise" : "arrow.down.circle"
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .padding(.vertical, 5)
+
+                if model.downloadProgress > 0 && model.downloadProgress < 1 {
+                    VStack(alignment: .leading, spacing: 7) {
+                        ProgressView(value: model.downloadProgress)
+                        HStack {
+                            Text("\(model.downloadLabel) · \(Int(model.downloadProgress * 100))%")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("取消", role: .cancel) { model.cancelDownload() }
+                        }
+                    }
+                }
+
+                Divider()
+
+                StatusRow(
+                    title: "Python 运行时",
+                    detail: model.runtimeLabel,
+                    ready: model.runtimeReady
+                )
+
+                Divider()
+
+                if model.models.isEmpty {
+                    ContentUnavailableView("尚未检查模型", systemImage: "shippingbox")
+                        .frame(maxWidth: .infinity, minHeight: 260, alignment: .center)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(model.models) { item in
+                            StatusRow(
+                                title: names[item.key] ?? item.key,
+                                detail: item.errors.isEmpty ? item.path : item.errors.joined(separator: "，"),
+                                ready: item.ready
+                            )
+                            if item.id != model.models.last?.id { Divider() }
+                        }
+                    }
+                }
             }
-            .listStyle(.inset)
         }
         .navigationTitle("模型")
+    }
+}
+
+private struct StatusRow: View {
+    let title: String
+    let detail: String
+    let ready: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(ready ? .green : .orange)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 10)
     }
 }

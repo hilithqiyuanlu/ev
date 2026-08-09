@@ -11,34 +11,83 @@ import numpy as np
 class VADAdapter:
     model_id = ""
 
-    def __init__(self, model_path: str, model: Any | None = None):
+    def __init__(self, model_path: str, model: Any | None = None, chunk_ms: int = 200):
         self.model_id = model_path
         self.model = model
         self.cache: dict[str, Any] = {}
+        self.chunk_ms = chunk_ms
+        self._buffer = np.empty(0, dtype=np.float32)
         if model is None:
             try:
                 from funasr import AutoModel
             except ImportError as exc:
                 raise RuntimeError("VAD 需要安装 FunASR，请先安装运行时依赖") from exc
-            self.model = AutoModel(model=model_path, disable_update=True)
+            self.model = AutoModel(model=model_path, disable_update=True, disable_pbar=True)
 
-    def is_speech(self, frame: np.ndarray, sample_rate: int = 16000) -> bool:
-        result = self.model.generate(
-            input=frame, sampling_rate=sample_rate, cache=self.cache, is_final=False
+    def accept(
+        self, frame: np.ndarray, sample_rate: int = 16000, is_final: bool = False
+    ) -> tuple["VADBoundary", ...]:
+        """缓冲原始帧并输出 FSMN-VAD 的开始/结束边界。"""
+        self._buffer = np.concatenate(
+            [self._buffer, np.asarray(frame, dtype=np.float32).reshape(-1)]
         )
-        # FunASR VAD 返回格式跨版本不同，统一取最后一个时间区间/状态。
-        if not result:
-            return False
-        item = result[0] if isinstance(result, list) else result
-        if isinstance(item, dict):
-            value = item.get("value", item.get("text", item.get("vad", False)))
-            if isinstance(value, list) and value:
-                return value[-1][-1] != -1
-            return bool(value)
-        return bool(item)
+        chunk_samples = sample_rate * self.chunk_ms // 1000
+        boundaries: list[VADBoundary] = []
+        while self._buffer.size >= chunk_samples:
+            chunk = self._buffer[:chunk_samples]
+            self._buffer = self._buffer[chunk_samples:]
+            boundaries.extend(self._generate(chunk, sample_rate, False))
+        if is_final:
+            chunk = self._buffer
+            self._buffer = np.empty(0, dtype=np.float32)
+            if chunk.size == 0:
+                chunk = np.zeros(chunk_samples, dtype=np.float32)
+            boundaries.extend(self._generate(chunk, sample_rate, True))
+        return tuple(boundaries)
+
+    def _generate(
+        self, chunk: np.ndarray, sample_rate: int, is_final: bool
+    ) -> list["VADBoundary"]:
+        result = self.model.generate(
+            input=chunk,
+            sampling_rate=sample_rate,
+            cache=self.cache,
+            is_final=is_final,
+            chunk_size=self.chunk_ms,
+            disable_pbar=True,
+        )
+        item = result[0] if isinstance(result, list) and result else result
+        if not isinstance(item, dict):
+            return []
+        value = item.get("value", [])
+        if not isinstance(value, list):
+            return []
+        boundaries: list[VADBoundary] = []
+        for pair in value:
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            start_ms, end_ms = int(pair[0]), int(pair[1])
+            boundaries.append(
+                VADBoundary(
+                    started=start_ms >= 0,
+                    ended=end_ms >= 0,
+                    start_ms=start_ms if start_ms >= 0 else None,
+                    end_ms=end_ms if end_ms >= 0 else None,
+                )
+            )
+        return boundaries
 
     def reset(self) -> None:
         self.cache.clear()
+        self._buffer = np.empty(0, dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class VADBoundary:
+    started: bool = False
+    ended: bool = False
+    start_ms: int | None = None
+    end_ms: int | None = None
 
 
 @dataclass(frozen=True)

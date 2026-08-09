@@ -4,7 +4,7 @@
 [![Package manager: uv](https://img.shields.io/badge/package%20manager-uv-DE5FE9)](https://docs.astral.sh/uv/)
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange)](#project-status)
 
-[Quick start](#quick-start) | [Commands](#commands) | [Configuration](#configuration) | [Project status](#project-status)
+[Quick start](#quick-start) | [Using the app](#using-the-app) | [Commands](#commands) | [Project status](#project-status)
 
 EV is an experimental, local-first personal voice assistant. The current development
 version combines a measurable speech input pipeline with a native macOS client. Python
@@ -15,16 +15,20 @@ Audio and runtime data stay on the local machine. Cloud services are not require
 
 ## Current capabilities
 
-- Discover available audio input devices.
-- Select an input device by name.
-- Capture audio as asynchronous, fixed-size frames.
-- Capture 16 kHz mono audio for downstream speech processing.
-- Run a short microphone diagnostic with a live level meter.
-- Save diagnostic recordings as WAV files for playback and inspection.
-- Load default, local, and environment-based configuration.
-- Archive every VAD speech segment and mark `EV + user` segments as query candidates.
-- Run a native macOS SwiftUI client with menu bar controls, live transcription,
-  history, voice enrollment, model management, and a manual query queue.
+- Native macOS menu bar app and SwiftUI control window.
+- Streaming microphone transcription with FSMN-VAD and Paraformer.
+- High-quality final transcription with Paraformer Large (SeACo Paraformer v2).
+- RMS loudness normalization to reduce volume/distance impact on recognition.
+- ERes2NetV2 speaker embedding with K-means multi-centroid templates (1-3 centroids auto-selected).
+- Binary speaker verification (user / non-user) with adjustable threshold (default 0.50).
+- Automatic continuous voiceprint learning during normal usage: no explicit enrollment needed.
+- Hierarchical sample library: 20 core samples (modeling) + 50 cache samples (FIFO recording).
+- Local WAV archive and SQLite history for every detected speech segment.
+- Wake word "小E" detection (with homophone tolerance for ASR misrecognition); only verified user
+  speech becomes a voice query candidate.
+- Ctrl+T global shortcut to toggle listening on/off.
+- Model verification and fixed-release downloads with SHA256 and atomic install.
+- Manual query queue for the future LLM integration.
 
 ## Quick start
 
@@ -32,14 +36,14 @@ EV requires Python 3.11 or newer and uses
 [`uv`](https://docs.astral.sh/uv/) for dependency management.
 
 ```bash
-git clone git@github.com:hilithqiyuanlu/ev.git
+git clone git@github.com:hilithqiyuanlu/mylyra.git
 cd ev
 uv sync
 uv run pytest
 ```
 
-Install FunASR separately when the local model release is available (it is kept
-out of the base lockfile so audio-only development stays lightweight):
+Install the local inference runtime (kept out of the base lockfile so lightweight
+development does not install PyTorch):
 
 ```bash
 uv pip install funasr torch torchaudio
@@ -90,13 +94,6 @@ installation. Existing valid models are kept and skipped:
 uv run python -m ev models download --model-root data/models
 ```
 
-Run enrollment and continuous transcription:
-
-```bash
-uv run python -m ev voice enroll --device "MacBook" --segments 8
-uv run python -m ev transcribe --device "MacBook" --model-root data/models
-```
-
 Start the versioned JSONL engine used by the macOS app:
 
 ```bash
@@ -111,11 +108,31 @@ xcodebuild -project apps/macos/EV.xcodeproj -scheme EV \
 open /tmp/ev-derived/Build/Products/Debug/EV.app
 ```
 
+## Using the app
+
+1. Open **Models** and verify that all four models are ready. Download them from
+   the app if they are missing.
+2. Allow microphone access and select the input device on **Live**.
+3. Voice profile builds automatically as you use the app (starts at "未建立" with 0 core samples;
+   transitions to "学习中" at 1-2 samples; "已就绪" at 3+ samples when speaker gating activates).
+   You can also manually add samples from Voice Profile settings.
+4. Return to **Live** and start listening (or press Ctrl+T to toggle). Partial text appears while
+   speaking; the final text and speaker score appear after the endpoint.
+5. Say "小E" (or "嗨小易"/"喂小艺" - common ASR variants are handled) followed by your query.
+   Only your own voice triggers commands.
+6. Use **History** to filter ("我"/"他人"/"全部"), play, reveal in Finder, or delete recordings
+   with one click (no confirmation dialog).
+7. Adjust the voiceprint threshold in **Settings** if you encounter false accepts/rejects.
+
+Closing the main window leaves the menu bar engine running. Stop listening from
+the menu bar or press Ctrl+T before privacy-sensitive situations. See the
+[Chinese user guide](docs/user-guide.md) for complete operation and troubleshooting.
+
 See [`docs/phase1b-gui.md`](docs/phase1b-gui.md) for the engine protocol and
 development-client boundaries.
 
 Models are versioned in the
-[models-v0.1.0 release](https://github.com/hilithqiyuanlu/ev/releases/tag/models-v0.1.0).
+[models-v0.1.0 release](https://github.com/hilithqiyuanlu/mylyra/releases/tag/models-v0.1.0).
 The CLI and macOS client download each fixed asset to a temporary file, verify
 SHA256, validate the extracted structure, and atomically install it under the
 configured model root. A failed or cancelled download does not replace an
@@ -123,12 +140,14 @@ existing valid model. See
 [`docs/phase1a-plan.md`](docs/phase1a-plan.md) for the required archive names and
 SHA256 values.
 
-The engine also exposes history and query operations for the macOS client. The
+The engine exposes history, query, threshold, and profile operations for the macOS client. The
 following commands are available through the JSONL protocol:
 
 ```text
 list_segments, delete_segment, delete_all_segments
 submit_manual_query, delete_query, delete_all_queries
+set_thresholds, get_profile_status, list_speaker_samples
+delete_speaker_sample, promote_speaker_sample
 ```
 
 ## Configuration
@@ -152,6 +171,13 @@ vad = "ev-fsmn-vad-zh-16k"
 asr_streaming = "ev-paraformer-zh-streaming-16k"
 asr_final = "ev-sensevoice-small"
 speaker = "ev-eres2netv2-zh-16k"
+
+[speaker]
+threshold = 0.50
+max_core_samples = 20
+max_cache_samples = 50
+max_centroids = 3
+loudness_normalize = true
 ```
 
 The following environment variables are also supported:
@@ -163,6 +189,10 @@ The following environment variables are also supported:
 The macOS development client defaults to `~/Library/Application Support/EV/` for
 models, archives, SQLite, and logs. CLI commands use the paths from `ev.toml` unless
 an environment variable or command option overrides them.
+
+## Keyboard shortcuts
+
+- **Ctrl+T**: Toggle listening on/off (can be disabled in Settings)
 
 ## Repository layout
 
@@ -176,16 +206,21 @@ ev.toml       Default configuration
 
 ## Project status
 
-Phase 1a and the repository-based Phase 1b client are implemented. Automated Python
-and Swift tests pass, the four release models load locally, and the Debug macOS app
-builds on Apple Silicon. Real microphone calibration, latency and accuracy benchmarks,
-and packaging a standalone `.app` without the repository `.venv` remain in progress.
-LLM, NLP, TTS, independent KWS, and multi-speaker modeling are not part of the current
-runtime.
+Phase 1a core pipeline and Phase 1b macOS GUI client are implemented with automated tests.
+Current runtime features: streaming ASR with VAD, final large-model transcription,
+binary speaker gating with multi-centroid templates, automatic continuous voiceprint learning,
+hierarchical sample management, wake word detection with homophone tolerance, loudness normalization,
+history timeline with instant filtering, one-click deletion, and global Ctrl+T shortcut.
+
+Remaining in progress: latency/accuracy benchmarks, standalone `.app` packaging without repository
+`.venv`, and hotword customization. LLM, NLP, TTS, environmental awareness, computer vision,
+biosignal integration, cognitive/behavior layers, and non-user speaker diarization are planned
+for future phases.
 
 Design and implementation notes:
 
 - [`docs/audio-flows.md`](docs/audio-flows.md)
 - [`docs/phase1a-plan.md`](docs/phase1a-plan.md)
 - [`docs/phase1b-gui.md`](docs/phase1b-gui.md)
+- [`docs/user-guide.md`](docs/user-guide.md)
 - [`docs/research.md`](docs/research.md)

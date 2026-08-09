@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import ServiceManagement
 
@@ -27,6 +28,40 @@ enum EngineState: String {
     }
 }
 
+enum MicrophonePermissionState: String {
+    case notDetermined, authorized, denied, restricted
+
+    var title: String {
+        switch self {
+        case .notDetermined: "尚未请求"
+        case .authorized: "已允许"
+        case .denied: "已拒绝"
+        case .restricted: "受系统限制"
+        }
+    }
+}
+
+protocol MicrophonePermissionProviding {
+    var state: MicrophonePermissionState { get }
+    func request(_ completion: @escaping @Sendable (Bool) -> Void)
+}
+
+struct SystemMicrophonePermission: MicrophonePermissionProviding {
+    var state: MicrophonePermissionState {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: .authorized
+        case .denied: .denied
+        case .restricted: .restricted
+        case .notDetermined: .notDetermined
+        @unknown default: .restricted
+        }
+    }
+
+    func request(_ completion: @escaping @Sendable (Bool) -> Void) {
+        AVCaptureDevice.requestAccess(for: .audio, completionHandler: completion)
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var engineState: EngineState = .stopped
@@ -34,27 +69,54 @@ final class AppModel: ObservableObject {
     @Published var selectedDevice = ""
     @Published var audioLevel = 0.0
     @Published var partialText = ""
+    @Published var lastFinalText = ""
+    @Published var captureReady = false
+    @Published var processingSegmentIDs: Set<String> = []
     @Published var segments: [Segment] = []
     @Published var queries: [QueryItem] = []
+    @Published var historyItems: [HistoryItem] = []
     @Published var models: [ModelStatus] = []
     @Published var runtimeReady = false
     @Published var runtimeLabel = "检查中"
     @Published var downloadProgress = 0.0
     @Published var downloadLabel = ""
-    @Published var enrollmentCompleted = 0
-    @Published var enrollmentTotal = 8
-    @Published var enrollmentStatus = "尚未开始"
+    @Published var voiceProfile = VoiceProfileState.empty
+    @Published var voiceSamples: [VoiceSample] = []
+    @Published var manualEnrollStatus = "idle" // idle, recording, processing, done, failed
+    @Published var manualEnrollError: String?
+    @Published var manualEnrollDuration: Double = 3.0
     @Published var errorMessage: String?
     @Published var lastEngineLog = ""
     @Published var speakerFilter = ""
     @Published var queryOnly = false
     @Published var dateFilter = ""
-    @Published var userThreshold = UserDefaults.standard.object(forKey: "userThreshold") as? Double ?? 0.72
-    @Published var nonUserThreshold = UserDefaults.standard.object(forKey: "nonUserThreshold") as? Double ?? 0.45
+    @Published var speakerThreshold: Double
+    @Published var autoLearnEnabled = UserDefaults.standard.object(forKey: "autoLearnEnabled") as? Bool ?? true
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var ctrlTToggleListening = UserDefaults.standard.object(forKey: "ctrlTToggleListening") as? Bool ?? true
+    @Published var microphonePermission: MicrophonePermissionState
+    @Published var hasCompletedOnboarding: Bool
+    @Published var isVerifyingModels = false
+    @Published var isLoadingHistory = false
+    @Published var showVerificationDone = false
 
     let audioPlayer = AudioPlayer()
-    private let engine = EngineClient()
+    private let engine: EngineTransport
+    private let permissionProvider: MicrophonePermissionProviding
+    private var didInitialRefresh = false
+    private var deviceRefreshTimer: Timer?
+
+    var onboardingChecks: (models: Bool, permission: Bool) {
+        (
+            allModelsReady,
+            microphonePermission == .authorized
+        )
+    }
+
+    var isOnboardingComplete: Bool {
+        let checks = onboardingChecks
+        return checks.models && checks.permission
+    }
 
     var isListening: Bool {
         [.loading, .listening, .speech, .stopping].contains(engineState)
@@ -62,6 +124,42 @@ final class AppModel: ObservableObject {
 
     var allModelsReady: Bool {
         models.count == 4 && models.allSatisfy(\.ready)
+    }
+
+    var isProcessing: Bool { !processingSegmentIDs.isEmpty }
+
+    var canStartListening: Bool {
+        allModelsReady && runtimeReady && !devices.isEmpty &&
+            microphonePermission != .denied && microphonePermission != .restricted
+    }
+
+    var activityTitle: String {
+        if engineState == .error { return "语音引擎出错" }
+        if engineState == .loading { return "正在加载语音模型" }
+        if engineState == .stopping { return "正在停止监听" }
+        if engineState == .speech { return "检测到语音" }
+        if isProcessing { return "正在生成转写" }
+        if engineState == .listening { return captureReady ? "正在监听" : "正在连接麦克风" }
+        return "尚未监听"
+    }
+
+    var activityDetail: String {
+        if engineState == .speech { return "继续说话，停顿后会自动生成终稿" }
+        if isProcessing { return "正在完成终稿、声纹判断和保存" }
+        if engineState == .listening { return "所有检测到的人声都会保存在本机" }
+        if engineState == .loading { return "首次加载可能需要几秒" }
+        return "选择麦克风后开始监听"
+    }
+
+    var activitySymbol: String {
+        if isProcessing && engineState != .speech { return "text.bubble.fill" }
+        return engineState.symbol
+    }
+
+    var displayTranscript: String {
+        if !partialText.isEmpty { return partialText }
+        if !lastFinalText.isEmpty { return lastFinalText }
+        return "等待语音"
     }
 
     var applicationSupportPath: String {
@@ -72,24 +170,55 @@ final class AppModel: ObservableObject {
         return base?.appendingPathComponent("EV").path ?? ""
     }
 
-    init() {
+    init(
+        engine: EngineTransport = EngineClient(),
+        permissionProvider: MicrophonePermissionProviding = SystemMicrophonePermission()
+    ) {
+        self.engine = engine
+        self.permissionProvider = permissionProvider
+        self.microphonePermission = permissionProvider.state
+        self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+        // Migrate threshold: prefer new key, fallback to old userThreshold key, default 0.50
+        let defaults = UserDefaults.standard
+        if let saved = defaults.object(forKey: "speakerThreshold") as? Double {
+            self.speakerThreshold = saved
+        } else if let oldUser = defaults.object(forKey: "userThreshold") as? Double {
+            self.speakerThreshold = oldUser
+        } else {
+            self.speakerThreshold = 0.50
+        }
         engine.onEvent = { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
         engine.onTermination = { [weak self] code in
             Task { @MainActor in
+                if let self {
+                    self.deviceRefreshTimer?.invalidate()
+                    self.deviceRefreshTimer = nil
+                    self.lastEngineLog = String(
+                        (self.lastEngineLog + "Engine exited with code \(code)\n").suffix(8_192)
+                    )
+                }
                 self?.engineState = code == 0 ? .stopped : .error
                 if code != 0 { self?.errorMessage = "语音引擎已退出（\(code)）" }
             }
         }
         engine.onStderr = { [weak self] message in
-            Task { @MainActor in self?.lastEngineLog = message }
+            Task { @MainActor in
+                guard let self else { return }
+                self.lastEngineLog = String((self.lastEngineLog + message).suffix(8_192))
+            }
         }
         do {
             try engine.start()
-            // 等待 Python engine 完成 stdin/stdout 初始化，再发首批请求。
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            refreshAll()
+            if ctrlTToggleListening { registerGlobalHotkey() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.refreshAll()
+            }
+            // 每2秒刷新一次设备列表，检测设备连接/断开
+            deviceRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.refreshDevices() }
             }
         } catch {
             engineState = .error
@@ -97,29 +226,65 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func refreshDevices() {
+        engine.send("list_devices")
+    }
+
     func refreshAll() {
         engine.send("get_status")
         engine.send("list_devices")
         engine.send("verify_models")
         loadHistory()
+        loadVoiceSamples()
     }
 
     func toggleListening() {
         if isListening {
+            engineState = .stopping
             engine.send("stop_listening")
         } else {
-            engine.send(
-                "start_listening",
-                payload: [
-                    "device": selectedDevice,
-                    "user_threshold": userThreshold,
-                    "non_user_threshold": nonUserThreshold,
-                ]
-            )
+            requestPermissionAndStart()
         }
     }
 
+    private func requestPermissionAndStart() {
+        microphonePermission = permissionProvider.state
+        switch microphonePermission {
+        case .authorized:
+            startListening()
+        case .notDetermined:
+            permissionProvider.request { [weak self] granted in
+                Task { @MainActor in
+                    self?.microphonePermission = granted ? .authorized : .denied
+                    if granted { self?.startListening() }
+                    else { self?.errorMessage = "未获得麦克风权限，请在系统设置中允许 EV 使用麦克风。" }
+                }
+            }
+        case .denied, .restricted:
+            errorMessage = "麦克风权限不可用，请在系统设置中检查隐私与安全性。"
+        }
+    }
+
+    private func startListening() {
+        guard canStartListening else {
+            errorMessage = devices.isEmpty ? "未发现输入设备。" : "模型或 Python 运行时尚未就绪。"
+            return
+        }
+        captureReady = false
+        partialText = ""
+        engineState = .loading
+        engine.send(
+            "start_listening",
+            payload: [
+                "device": selectedDevice,
+                "threshold": speakerThreshold,
+                "auto_learn": autoLearnEnabled,
+            ]
+        )
+    }
+
     func loadHistory() {
+        isLoadingHistory = true
         engine.send(
             "list_segments",
             payload: [
@@ -158,6 +323,8 @@ final class AppModel: ObservableObject {
     }
 
     func verifyModels() {
+        isVerifyingModels = true
+        showVerificationDone = false
         engine.send("verify_models")
     }
 
@@ -165,26 +332,44 @@ final class AppModel: ObservableObject {
         engine.send("cancel_download")
     }
 
-    func beginEnrollment() {
-        enrollmentCompleted = 0
-        enrollmentTotal = 8
-        engine.send(
-            "begin_enrollment",
-            payload: ["segments": enrollmentTotal, "device": selectedDevice]
-        )
+    func loadVoiceSamples() {
+        engine.send("list_voice_samples", payload: ["limit": 50])
     }
 
-    func captureEnrollmentSample() {
-        engine.send("capture_enrollment_sample")
+    func deleteVoiceSample(_ id: String) {
+        engine.send("delete_voice_sample", payload: ["sample_id": id])
     }
 
-    func cancelEnrollment() {
-        engine.send("cancel_enrollment")
+    func promoteVoiceSample(_ id: String) {
+        engine.send("promote_voice_sample", payload: ["sample_id": id])
+    }
+
+    func resetVoiceProfile() {
+        engine.send("reset_voice_profile")
+    }
+
+    func setAutoLearn(_ enabled: Bool) {
+        autoLearnEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "autoLearnEnabled")
+        engine.send("set_voice_learning", payload: ["enabled": enabled])
+    }
+
+    func captureManualSample() {
+        guard manualEnrollStatus != "recording" && manualEnrollStatus != "processing" else { return }
+        manualEnrollStatus = "recording"
+        manualEnrollError = nil
+        engine.send("capture_manual_sample", payload: ["duration_sec": manualEnrollDuration])
     }
 
     func saveThresholds() {
-        UserDefaults.standard.set(userThreshold, forKey: "userThreshold")
-        UserDefaults.standard.set(nonUserThreshold, forKey: "nonUserThreshold")
+        UserDefaults.standard.set(speakerThreshold, forKey: "speakerThreshold")
+        // Send to engine immediately - takes effect without restarting listening
+        engine.send(
+            "set_thresholds",
+            payload: [
+                "threshold": speakerThreshold,
+            ]
+        )
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -198,6 +383,39 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func setCtrlTToggleListening(_ enabled: Bool) {
+        ctrlTToggleListening = enabled
+        UserDefaults.standard.set(enabled, forKey: "ctrlTToggleListening")
+        if enabled { registerGlobalHotkey() } else { unregisterGlobalHotkey() }
+    }
+
+    private var localMonitor: Any?
+    private var globalMonitor: Any?
+
+    private func registerGlobalHotkey() {
+        unregisterGlobalHotkey()
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleHotkey(event)
+            return event
+        }
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleHotkey(event)
+        }
+    }
+
+    private func unregisterGlobalHotkey() {
+        if let localMonitor { NSEvent.removeMonitor(localMonitor); self.localMonitor = nil }
+        if let globalMonitor { NSEvent.removeMonitor(globalMonitor); self.globalMonitor = nil }
+    }
+
+    private func handleHotkey(_ event: NSEvent) {
+        guard ctrlTToggleListening else { return }
+        let modifiers = event.modifierFlags.intersection([.control, .command, .option, .shift])
+        if modifiers == .control && event.keyCode == 17 {
+            toggleListening()
+        }
+    }
+
     func openApplicationSupport() {
         NSWorkspace.shared.open(URL(fileURLWithPath: applicationSupportPath, isDirectory: true))
     }
@@ -205,6 +423,13 @@ final class AppModel: ObservableObject {
     func openLogs() {
         let path = URL(fileURLWithPath: applicationSupportPath).appendingPathComponent("logs")
         NSWorkspace.shared.open(path)
+    }
+
+    func openMicrophoneSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        ) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func openInFinder(_ path: String) {
@@ -215,32 +440,78 @@ final class AppModel: ObservableObject {
         engine.shutdown()
     }
 
-    private func handle(_ event: EngineEnvelope) {
+    func quitApplication() {
+        shutdown()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    func handle(_ event: EngineEnvelope) {
         switch event.type {
         case "engine_state":
             engineState = EngineState(rawValue: event.payload["state"]?.string ?? "stopped") ?? .error
+            if engineState == .stopped || engineState == .error { captureReady = false }
+            if event.requestID == nil && !didInitialRefresh {
+                didInitialRefresh = true
+                refreshAll()
+            }
         case "device_list":
             devices = event.payload["devices"]?.array?.compactMap(AudioDevice.init) ?? []
-            if selectedDevice.isEmpty { selectedDevice = devices.first(where: \.isDefault)?.name ?? devices.first?.name ?? "" }
+            let deviceNames = Set(devices.map(\.name))
+            let currentDeviceExists = !selectedDevice.isEmpty && deviceNames.contains(selectedDevice)
+            if !currentDeviceExists {
+                // 当前选中设备不在列表中（断开连接）或未选择，自动选择默认设备
+                selectedDevice = devices.first(where: \.isDefault)?.name ?? devices.first?.name ?? ""
+            } else if !isListening, let defaultDevice = devices.first(where: \.isDefault), defaultDevice.name != selectedDevice {
+                // 未监听时，如果系统默认设备变了，自动跟随系统默认
+                selectedDevice = defaultDevice.name
+            }
+            completeOnboardingIfNeeded()
         case "audio_level":
             audioLevel = min(max((event.payload["rms"]?.double ?? 0) * 10, 0), 1)
+        case "capture_started":
+            captureReady = true
+        case "speech_started":
+            partialText = ""
         case "transcript_partial":
             partialText = event.payload["text"]?.string ?? ""
+        case "segment_processing":
+            if let id = event.payload["segment_id"]?.string { processingSegmentIDs.insert(id) }
         case "segment_committed":
             if let segment = Segment(event.payload) {
                 segments.removeAll { $0.id == segment.id }
                 segments.insert(segment, at: 0)
+                processingSegmentIDs.remove(segment.id)
+                lastFinalText = segment.transcript
                 partialText = ""
+                rebuildHistoryItems()
             }
+        case "segment_failed":
+            if let id = event.payload["segment_id"]?.string { processingSegmentIDs.remove(id) }
+            errorMessage = event.payload["message"]?.string ?? "语音段处理失败"
         case "segment_list":
             segments = event.payload["segments"]?.array?.compactMap { $0.object.flatMap(Segment.init) } ?? []
             queries = event.payload["queries"]?.array?.compactMap(QueryItem.init) ?? []
+            rebuildHistoryItems()
+            isLoadingHistory = false
         case "segment_deleted", "segments_deleted", "query_deleted", "queries_deleted":
             loadHistory()
+            // Deleting segments may cascade-delete auto voice samples - refresh
+            loadVoiceSamples()
         case "query_candidate":
             loadHistory()
         case "model_status":
             handleModelStatus(event.payload)
+            if event.payload["models"] != nil {
+                isVerifyingModels = false
+                showVerificationDone = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    self.showVerificationDone = false
+                }
+                completeOnboardingIfNeeded()
+            }
         case "runtime_status":
             runtimeReady = event.payload["ready"]?.bool ?? false
             runtimeLabel = runtimeReady ? "FunASR 与 PyTorch 已安装" : "缺少 FunASR 或 PyTorch（开发版需在 .venv 安装）"
@@ -249,11 +520,36 @@ final class AppModel: ObservableObject {
             let total = event.payload["total_size"]?.double ?? 1
             downloadProgress = total > 0 ? downloaded / total : 0
             downloadLabel = event.payload["key"]?.string ?? ""
-        case "enrollment_progress":
-            enrollmentCompleted = Int(event.payload["completed"]?.double ?? 0)
-            enrollmentTotal = max(Int(event.payload["total"]?.double ?? 8), enrollmentCompleted)
-            enrollmentStatus = enrollmentTitle(event.payload["status"]?.string ?? "")
+        case "profile_status":
+            voiceProfile = VoiceProfileState(.object(event.payload))
+            if let autoLearn = event.payload["auto_learn"]?.bool {
+                autoLearnEnabled = autoLearn
+            } else if let autoLearn = event.payload["auto_learn"]?.double {
+                autoLearnEnabled = autoLearn != 0
+            }
+            loadVoiceSamples()
+        case "voice_samples":
+            voiceSamples = event.payload["samples"]?.array?.compactMap(VoiceSample.init) ?? []
+        case "voice_sample_added", "voice_sample_promoted", "voice_sample_deleted", "voice_profile_reset":
+            loadVoiceSamples()
+            // Also refresh profile status after sample changes
+            engine.send("get_status")
+        case "manual_sample_status":
+            let status = event.payload["status"]?.string ?? "failed"
+            manualEnrollStatus = status
+            manualEnrollError = event.payload["error"]?.string
+            if status == "done" || status == "failed" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    if self?.manualEnrollStatus == status {
+                        self?.manualEnrollStatus = "idle"
+                        self?.manualEnrollError = nil
+                    }
+                }
+            }
         case "error":
+            if engineState == .loading || engineState == .stopping {
+                engineState = .error
+            }
             errorMessage = event.payload["message"]?.string ?? "未知错误"
         default:
             break
@@ -276,14 +572,45 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func enrollmentTitle(_ status: String) -> String {
-        switch status {
-        case "ready": "准备录入"
-        case "recording": "正在录音 4 秒"
-        case "sample_complete": "本段完成"
-        case "complete": "声纹录入完成"
-        case "cancelled": "已取消"
-        default: status
+    func completeOnboardingIfNeeded() {
+        guard !hasCompletedOnboarding, isOnboardingComplete else { return }
+        hasCompletedOnboarding = true
+        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+    }
+
+    func resetOnboarding() {
+        hasCompletedOnboarding = false
+        UserDefaults.standard.set(false, forKey: "hasCompletedOnboarding")
+    }
+
+    private func rebuildHistoryItems() {
+        let segmentIDs = Set(segments.map { $0.id })
+
+        let filteredSegments = segments.filter { segment in
+            if !speakerFilter.isEmpty {
+                guard segment.speakerLabel == speakerFilter else { return false }
+            }
+            if !dateFilter.isEmpty {
+                guard segment.startedAt.hasPrefix(dateFilter) else { return false }
+            }
+            if queryOnly {
+                guard segment.queryCandidate else { return false }
+            }
+            return true
         }
+
+        let filteredQueries = queries.filter { query in
+            if query.source == "voice" && (query.segmentId.map { segmentIDs.contains($0) } ?? false) {
+                return false
+            }
+            if !dateFilter.isEmpty {
+                guard query.createdAt.hasPrefix(dateFilter) else { return false }
+            }
+            return true
+        }
+
+        let segmentItems = filteredSegments.map { HistoryItem.segment($0) }
+        let queryItems = filteredQueries.map { HistoryItem.query($0) }
+        historyItems = (segmentItems + queryItems).sorted { $0.sortDate > $1.sortDate }
     }
 }

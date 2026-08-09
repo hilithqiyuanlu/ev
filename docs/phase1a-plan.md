@@ -56,11 +56,13 @@ tar -xzf ev-eres2netv2-zh-16k.tar.gz -C data/models/ev-eres2netv2-zh-16k
 ## 处理规则
 
 1. `AudioCapture` 持续输出 16 kHz mono 定长帧。
-2. VAD 使用 pre-roll 和 hangover，避免切掉语音首尾。
-3. `SpeechStarted` 后帧立即送入 Paraformer；partial 只用于显示和早期 EV 检测。
-4. `SpeechEnded` 后由 SenseVoiceSmall 开启 ITN 生成 final。
-5. ERes2NetV2 为完整语音段生成 embedding，并与已注册 profile 比较。
-6. 每段均生成 `segment_id`、WAV 文件和 SQLite 记录。
+2. 30 ms 帧在 VAD 适配层缓冲为 200 ms chunk；保留约 600 ms pre-roll，避免切掉首字。
+3. `SpeechStarted` 后以 600 ms chunk 调用 Paraformer，固定使用 `[0,10,5]` 与 4/1
+   encoder/decoder look-back；partial 按 chunk 累积。
+4. VAD 结束或停止监听时以 `is_final=true` flush 流式 ASR。
+5. `SpeechEnded` 后将完整语音段交给串行后台 worker；采集和 VAD 继续运行。
+6. worker 由 SenseVoiceSmall 开启 ITN 生成 final，再运行 ERes2NetV2、保存 WAV 和 SQLite。
+7. 每段均生成 `segment_id`；任一后台阶段失败都发出 `segment_failed`。
 
 用户注册命令为 `ev voice enroll --device <selector> --segments 8`。注册只计算并
 合并 8-12 段、每段约 3-5 秒的归一化 embedding，不微调模型。profile 保存模型、
@@ -101,7 +103,10 @@ ev engine serve
 - [x] 声纹 enrollment、profile 与三区判断
 - [x] WAV + SQLite 持久化
 - [x] EV 句首匹配与 `QueryCandidate` 事件
-- [ ] 真机模型加载、麦克风闭环和阈值标定
+- [x] 四模型本地加载、真实麦克风 partial/final、停止 flush、WAV 和 SQLite
+- [x] 8 段声纹 profile 重启持久化
+- [ ] 现场完成 `EV + user` / `EV + non-user` query 门控验收
+- [ ] 声纹阈值标定
 - [ ] 延迟、内存、字错率与误触发性能测试
 
 首个 partial p50 目标为 300 ms，端点后 final p50 目标为 800 ms。两秒以上用户

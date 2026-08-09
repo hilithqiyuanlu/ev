@@ -2,16 +2,18 @@
 
 ## 当前状态
 
-仓库开发版已经实现并通过自动测试：
+仓库开发版已经实现并通过自动测试和首轮真实麦克风验收：
 
 - `ev engine serve` JSONL v1 协议和进程状态机；
 - 菜单栏，以及实时、历史、Query 队列、声纹、模型和设置界面；
 - 固定 Release 模型下载、SHA256 校验、安全解压和原子安装；
 - SQLite v2、voice/manual query、WAV 回放与一致性删除；
-- FunASR 四模型本地加载和 macOS Debug 构建。
+- FunASR 四模型本地加载、macOS Debug 构建和真实 partial/final；
+- 停止时当前段 flush、后台终稿/声纹/WAV/SQLite 处理；
+- 8 段用户 profile 重启持久化。
 
-尚未完成真实麦克风端到端验收、声纹阈值标定、延迟/内存测量，以及脱离仓库
-`.venv` 的独立 arm64 `.app` 打包。签名和公证继续后置。
+尚未完成用户/非用户分别说 `EV` 的联合门控验收、声纹阈值标定、延迟/内存测量，
+以及脱离仓库 `.venv` 的独立 arm64 `.app` 打包。签名和公证继续后置。
 
 ## 架构
 
@@ -41,7 +43,7 @@ SwiftUI App <- stdin/stdout JSONL v1 -> ev engine serve
 {"version":1,"request_id":"uuid","type":"engine_state","timestamp":"...","payload":{}}
 ```
 
-stdout 只允许 JSONL 协议，日志写 stderr。支持以下命令：
+stdout 只允许 JSONL 协议，日志写 stderr，并由开发客户端保存到应用日志目录。支持以下命令：
 
 ```text
 get_status, list_devices
@@ -53,8 +55,9 @@ submit_manual_query, delete_query, delete_all_queries
 shutdown
 ```
 
-实时事件包含音量、VAD 起止、partial、终稿落库、声纹结果、模型下载进度和 query
-candidate。段级事件都带 `segment_id`；所有事件都带 UTC `timestamp`。
+实时事件包括 `capture_started`、音量、VAD 起止、partial、`segment_processing`、
+`segment_failed`、终稿落库、声纹结果、模型下载进度和 query candidate。段级事件都带
+`segment_id`；所有事件都带 UTC `timestamp`。
 
 ## 开发运行
 
@@ -86,7 +89,7 @@ open /tmp/ev-derived/Build/Products/Debug/EV.app
 ```text
 models/   固定 Release 模型
 archive/  VAD 人声 WAV
-ev.sqlite SQLite 元数据和 query 队列
+ev.db     SQLite 元数据和 query 队列
 logs/     engine stderr 日志
 ```
 
@@ -104,6 +107,6 @@ xcodebuild -project apps/macos/EV.xcodeproj -scheme EV \
   -configuration Debug -derivedDataPath /tmp/ev-derived CODE_SIGNING_ALLOWED=NO build
 ```
 
-自动测试覆盖协议、SQLite migration、query 写入与删除、模型 SHA256/安全解压和原子
-安装。真实麦克风验收还需在存在可用输入设备的 Mac 上确认 partial/final、用户与非用户
-归档、`EV + user` query、声纹录入重启持久化和退出 flush。
+自动测试覆盖流式 VAD/ASR 参数与事件顺序、后台 worker、协议、SQLite migration、query
+写入与删除、模型 SHA256/安全解压和原子安装。真实麦克风已确认 partial/final、用户与
+非用户归档、声纹分数、profile 持久化和停止 flush；`EV + user` 与非用户对照仍需现场完成。

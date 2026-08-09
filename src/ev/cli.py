@@ -196,7 +196,10 @@ def _cmd_transcribe(settings: Settings, device: str | None, model_root: str | No
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = load_settings()
-    log_path = Path(args.log_path).expanduser().resolve() if args.log_path else settings.logs_dir / "ev.log"
+    if args.command == "engine" and args.engine_command == "serve" and not args.log_path:
+        log_path = None
+    else:
+        log_path = Path(args.log_path).expanduser().resolve() if args.log_path else settings.logs_dir / "ev.log"
     setup_logging(settings.log_level, log_path)
 
     if args.command == "info":

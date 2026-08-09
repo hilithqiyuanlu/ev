@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 import sys
 import threading
+import uuid
 from dataclasses import asdict
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
@@ -20,9 +23,14 @@ from ..config import Settings
 from ..model_download import DownloadCancelled, ModelDownloader
 from ..models import require_models, verify_models
 from ..pipeline.runtime import transcribe_forever
+from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import build_profile, normalize_embedding
+from ..store.audio import archive_wav
 from ..store.db import Store
 from .protocol import EngineRequest, ProtocolWriter
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class EngineService:
@@ -36,14 +44,12 @@ class EngineService:
         self._listen_stop = threading.Event()
         self._download_thread: threading.Thread | None = None
         self._download_cancel = threading.Event()
-        self._enrollment_lock = threading.Lock()
-        self._enrollment_embeddings: list[np.ndarray] = []
-        self._enrollment_expected = 0
-        self._enrollment_device: str | None = None
-        self._enrollment_adapter: SpeakerEmbeddingAdapter | None = None
+        self._voice_auto_learn = settings.voice_learning.auto_learn_enabled
+        self._segment_worker = None  # type: ignore[assignment]
 
     def serve(self, input_stream: TextIO = sys.stdin) -> int:
         self.settings.ensure_dirs()
+        LOGGER.info("engine service started")
         self._emit_state()
         for line in input_stream:
             if not self._running:
@@ -52,9 +58,11 @@ class EngineService:
                 continue
             try:
                 request = EngineRequest.parse(line)
+                LOGGER.info("engine command: %s", request.command)
                 self.handle(request)
             except Exception as exc:
                 self.writer.error(str(exc), code="invalid_request")
+        LOGGER.info("engine input closed")
         self.shutdown()
         return 0
 
@@ -67,9 +75,13 @@ class EngineService:
             "cancel_download": self._cancel_download,
             "start_listening": self._start_listening,
             "stop_listening": self._stop_listening,
-            "begin_enrollment": self._begin_enrollment,
-            "capture_enrollment_sample": self._capture_enrollment_sample,
-            "cancel_enrollment": self._cancel_enrollment,
+            "set_thresholds": self._set_thresholds,
+            "list_voice_samples": self._list_voice_samples,
+            "delete_voice_sample": self._delete_voice_sample,
+            "promote_voice_sample": self._promote_voice_sample,
+            "reset_voice_profile": self._reset_voice_profile,
+            "set_voice_learning": self._set_voice_learning,
+            "capture_manual_sample": self._capture_manual_sample,
             "list_segments": self._list_segments,
             "delete_segment": self._delete_segment,
             "delete_all_segments": self._delete_all_segments,
@@ -102,6 +114,10 @@ class EngineService:
             },
             request.request_id,
         )
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile, request.request_id)
 
     def _list_devices(self, request: EngineRequest) -> None:
         devices = [asdict(device) for device in list_input_devices()]
@@ -149,32 +165,40 @@ class EngineService:
         if self._listen_thread and self._listen_thread.is_alive():
             raise RuntimeError("监听已经启动")
         require_models(self.settings.models)
+        if not list_input_devices():
+            raise RuntimeError("未发现可用输入设备，请检查麦克风权限和系统输入设置")
         self.device_selector = request.payload.get("device") or None
-        user_threshold = float(
-            request.payload.get("user_threshold", self.settings.speaker.user_threshold)
+        threshold = float(
+            request.payload.get("threshold",
+                request.payload.get("user_threshold", self.settings.speaker.threshold)
+            )
         )
-        non_user_threshold = float(
-            request.payload.get("non_user_threshold", self.settings.speaker.non_user_threshold)
-        )
-        if non_user_threshold >= user_threshold:
-            raise ValueError("非用户阈值必须小于用户阈值")
+        auto_learn = bool(request.payload.get("auto_learn", self._voice_auto_learn))
+        if not (0.1 <= threshold <= 0.9):
+            raise ValueError("阈值必须在0.1到0.9之间")
         session_settings = replace(
             self.settings,
             speaker=replace(
                 self.settings.speaker,
-                user_threshold=user_threshold,
-                non_user_threshold=non_user_threshold,
+                threshold=threshold,
+            ),
+            voice_learning=replace(
+                self.settings.voice_learning,
+                auto_learn_enabled=auto_learn,
             ),
         )
+        self._voice_auto_learn = auto_learn
+        # Persist threshold for future sessions
+        self.settings = session_settings
         device = resolve_device(self.device_selector)
         self._listen_stop = threading.Event()
+        self._segment_worker = None
         self.state = "loading"
         self._emit_state(request.request_id)
+        worker_holder: dict = {}
 
         def run() -> None:
             try:
-                self.state = "listening"
-                self._emit_state()
                 asyncio.run(
                     transcribe_forever(
                         session_settings,
@@ -182,6 +206,7 @@ class EngineService:
                         output=lambda message: None,
                         stop_event=self._listen_stop,
                         emit=self._on_runtime_event,
+                        worker_holder=worker_holder,
                     )
                 )
                 self.state = "stopped"
@@ -190,9 +215,17 @@ class EngineService:
                 self.state = "error"
                 self.writer.error(str(exc), code="listening_failed")
                 self._emit_state()
+            finally:
+                self._segment_worker = None
 
         self._listen_thread = threading.Thread(target=run, name="ev-listening", daemon=True)
         self._listen_thread.start()
+        # Wait briefly for worker to be created
+        for _ in range(20):
+            if "worker" in worker_holder:
+                self._segment_worker = worker_holder["worker"]
+                break
+            self._listen_thread.join(0.05)
 
     def _stop_listening(self, request: EngineRequest) -> None:
         self._listen_stop.set()
@@ -200,106 +233,175 @@ class EngineService:
             self.state = "stopping"
         self._emit_state(request.request_id)
 
+    def _set_thresholds(self, request: EngineRequest) -> None:
+        threshold = request.payload.get("threshold", request.payload.get("user_threshold"))
+        t = float(threshold) if threshold is not None else None
+        if t is not None and not (0.1 <= t <= 0.9):
+            raise ValueError("阈值必须在0.1到0.9之间")
+        # Update running worker if listening
+        if self._segment_worker is not None:
+            self._segment_worker.update_thresholds(t)
+        # Persist to settings object for future sessions
+        if t is not None:
+            self.settings = replace(
+                self.settings,
+                speaker=replace(self.settings.speaker, threshold=t),
+            )
+        self._ack(request)
+
     def _on_runtime_event(self, event_type: str, payload: dict) -> None:
-        if event_type == "speech_started":
+        if event_type == "capture_started":
+            self.state = "listening"
+            self._emit_state()
+        elif event_type == "speech_started":
             self.state = "speech"
             self._emit_state()
         elif event_type == "speech_ended":
-            self.state = "listening"
+            if not self._listen_stop.is_set():
+                self.state = "listening"
             self._emit_state()
+        elif event_type == "voice_sample_added":
+            with Store(self.settings.db_path) as store:
+                profile = store.profile_status()
+            profile["auto_learn"] = self._voice_auto_learn
+            self.writer.emit("profile_status", profile)
         self.writer.emit(event_type, payload)
 
-    def _begin_enrollment(self, request: EngineRequest) -> None:
-        expected = int(request.payload.get("segments", 8))
-        if expected < 1 or expected > 12:
-            raise ValueError("segments 必须在 1 到 12 之间")
-        require_models(self.settings.models)
-        self._enrollment_embeddings = []
-        self._enrollment_expected = expected
-        self._enrollment_device = request.payload.get("device") or None
-        self._enrollment_adapter = None
+    def _list_voice_samples(self, request: EngineRequest) -> None:
+        limit = int(request.payload.get("limit", 50))
+        tier = request.payload.get("tier") or None
+        with Store(self.settings.db_path) as store:
+            samples = store.list_voice_samples(tier=tier, limit=limit)
+        self.writer.emit("voice_samples", {"samples": samples}, request.request_id)
+
+    def _promote_voice_sample(self, request: EngineRequest) -> None:
+        sample_id = str(request.payload.get("sample_id", ""))
+        if not sample_id:
+            raise ValueError("缺少 sample_id")
+        with Store(self.settings.db_path) as store:
+            vp = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+            promoted = vp.promote_sample(sample_id)
         self.writer.emit(
-            "enrollment_progress",
-            {"status": "ready", "completed": 0, "total": expected},
+            "voice_sample_promoted",
+            {"sample_id": sample_id, "promoted": promoted},
             request.request_id,
         )
-
-    def _capture_enrollment_sample(self, request: EngineRequest) -> None:
-        if not self._enrollment_expected:
-            raise RuntimeError("请先开始声纹录入")
-        if self._enrollment_lock.locked():
-            raise RuntimeError("当前录音尚未结束")
-
-        def run() -> None:
-            with self._enrollment_lock:
-                try:
-                    self.writer.emit(
-                        "enrollment_progress",
-                        {
-                            "status": "recording",
-                            "completed": len(self._enrollment_embeddings),
-                            "total": self._enrollment_expected,
-                        },
-                        request.request_id,
-                    )
-                    audio = asyncio.run(self._record_sample(4.0))
-                    if self._enrollment_adapter is None:
-                        paths = require_models(self.settings.models)
-                        self._enrollment_adapter = SpeakerEmbeddingAdapter(str(paths["speaker"]))
-                    embedding = normalize_embedding(
-                        self._enrollment_adapter.embed(audio, self.settings.audio.sample_rate)
-                    )
-                    self._enrollment_embeddings.append(embedding)
-                    completed = len(self._enrollment_embeddings)
-                    if completed >= self._enrollment_expected:
-                        profile = build_profile(self._enrollment_embeddings)
-                        with Store(self.settings.db_path) as store:
-                            store.save_profile(
-                                "user-v1",
-                                "user",
-                                self._enrollment_device,
-                                self.settings.models.speaker,
-                                profile,
-                                completed,
-                            )
-                        status = "complete"
-                        self._enrollment_expected = 0
-                    else:
-                        status = "sample_complete"
-                    self.writer.emit(
-                        "enrollment_progress",
-                        {"status": status, "completed": completed, "total": completed if status == "complete" else self._enrollment_expected},
-                        request.request_id,
-                    )
-                except Exception as exc:
-                    self.writer.error(str(exc), request.request_id, "enrollment_failed")
-
-        threading.Thread(target=run, name="ev-enrollment", daemon=True).start()
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
         self._ack(request)
 
-    async def _record_sample(self, seconds: float) -> np.ndarray:
-        capture = AudioCapture(
-            self.settings.audio, device=resolve_device(self._enrollment_device)
+    def _delete_voice_sample(self, request: EngineRequest) -> None:
+        sample_id = str(request.payload.get("sample_id", ""))
+        if not sample_id:
+            raise ValueError("缺少 sample_id")
+        with Store(self.settings.db_path) as store:
+            deleted = store.delete_voice_sample(sample_id)
+        self.writer.emit(
+            "voice_sample_deleted",
+            {"sample_id": sample_id, "deleted": deleted},
+            request.request_id,
         )
-        chunks: list[np.ndarray] = []
-        target = int(self.settings.audio.sample_rate * seconds)
-        capture.start()
-        try:
-            async for frame in capture.frames():
-                chunks.append(frame)
-                if sum(item.size for item in chunks) >= target:
-                    break
-        finally:
-            capture.stop()
-        return np.concatenate(chunks)[:target]
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
 
-    def _cancel_enrollment(self, request: EngineRequest) -> None:
-        if self._enrollment_lock.locked():
-            raise RuntimeError("录音进行中，请等待本段完成")
-        self._enrollment_embeddings = []
-        self._enrollment_expected = 0
-        self._enrollment_adapter = None
-        self.writer.emit("enrollment_progress", {"status": "cancelled", "completed": 0, "total": 0}, request.request_id)
+    def _reset_voice_profile(self, request: EngineRequest) -> None:
+        with Store(self.settings.db_path) as store:
+            count = store.delete_all_voice_samples()
+        self.writer.emit("voice_profile_reset", {"deleted": count}, request.request_id)
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
+
+    def _set_voice_learning(self, request: EngineRequest) -> None:
+        enabled = bool(request.payload.get("enabled", True))
+        self._voice_auto_learn = enabled
+        self._ack(request)
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
+
+    def _capture_manual_sample(self, request: EngineRequest) -> None:
+        duration_sec = float(request.payload.get("duration_sec", 3.0))
+        duration_sec = max(1.5, min(duration_sec, 10.0))
+        duration_ms = int(duration_sec * 1000)
+        device = resolve_device(self.device_selector)
+
+        def run():
+            try:
+                self.writer.emit("manual_sample_status", {
+                    "status": "recording",
+                    "duration_ms": duration_ms,
+                })
+                sample_rate = self.settings.audio.sample_rate
+                total_samples = int(sample_rate * duration_sec)
+                capture = AudioCapture(self.settings.audio, device=device, frame_ms=50)
+                frames = []
+                collected = 0
+                capture.start()
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        async def collect():
+                            nonlocal collected
+                            async for frame in capture.frames():
+                                frames.append(frame)
+                                collected += len(frame)
+                                if collected >= total_samples:
+                                    break
+                        loop.run_until_complete(collect())
+                    finally:
+                        loop.close()
+                finally:
+                    capture.stop()
+                if not frames:
+                    raise RuntimeError("未采集到音频")
+                audio = np.concatenate(frames)[:total_samples]
+                if len(audio) < total_samples * 0.5:
+                    raise RuntimeError("录制音频过短")
+                self.writer.emit("manual_sample_status", {"status": "processing"})
+                paths = require_models(self.settings.models, self.settings.models.root)
+                speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
+                embedding = speaker.embed(audio, sample_rate)
+                wav_path = archive_wav(
+                    self.settings.archive_dir,
+                    "manual-" + uuid.uuid4().hex[:12],
+                    audio,
+                    sample_rate,
+                    datetime.now(timezone.utc),
+                )
+                with Store(self.settings.db_path) as store:
+                    vp = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+                    added, added_tier = vp.add_sample(
+                        embedding=embedding,
+                        audio_path=str(wav_path),
+                        duration_ms=len(audio) * 1000 // sample_rate,
+                        score=0.95,
+                        segment_id=None,
+                        is_manual=True,
+                    )
+                self.writer.emit("manual_sample_status", {
+                    "status": "done" if added else "failed",
+                    "added": added,
+                    "tier": added_tier,
+                }, request.request_id)
+                with Store(self.settings.db_path) as store:
+                    profile = store.profile_status()
+                profile["auto_learn"] = self._voice_auto_learn
+                self.writer.emit("profile_status", profile)
+            except Exception as exc:
+                LOGGER.exception("manual sample capture failed")
+                self.writer.emit("manual_sample_status", {
+                    "status": "failed",
+                    "error": str(exc),
+                }, request.request_id)
+
+        threading.Thread(target=run, name="ev-manual-enroll", daemon=True).start()
 
     def _list_segments(self, request: EngineRequest) -> None:
         payload = request.payload
@@ -321,11 +423,21 @@ class EngineService:
         with Store(self.settings.db_path) as store:
             deleted = store.delete_segment(segment_id)
         self.writer.emit("segment_deleted", {"segment_id": segment_id, "deleted": deleted}, request.request_id)
+        # Cascade may have deleted voice samples - refresh profile
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
 
     def _delete_all_segments(self, request: EngineRequest) -> None:
         with Store(self.settings.db_path) as store:
             count = store.delete_all_segments()
         self.writer.emit("segments_deleted", {"count": count}, request.request_id)
+        # Deleting all segments removes non-manual voice samples - refresh profile
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
 
     def _submit_manual_query(self, request: EngineRequest) -> None:
         with Store(self.settings.db_path) as store:
@@ -347,6 +459,7 @@ class EngineService:
         self.writer.emit("queries_deleted", {"count": count}, request.request_id)
 
     def _shutdown_command(self, request: EngineRequest) -> None:
+        LOGGER.info("engine shutdown requested")
         self._ack(request)
         self._running = False
         self.shutdown()
@@ -355,7 +468,7 @@ class EngineService:
         self._listen_stop.set()
         self._download_cancel.set()
         if self._listen_thread and self._listen_thread.is_alive():
-            self._listen_thread.join(timeout=8)
+            self._listen_thread.join()
         self.state = "stopped"
 
     def _emit_state(self, request_id: str | None = None) -> None:

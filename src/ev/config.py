@@ -29,13 +29,34 @@ class ModelSettings:
 
 @dataclass(frozen=True)
 class SpeakerSettings:
-    user_threshold: float = 0.72
-    non_user_threshold: float = 0.45
+    threshold: float = 0.50
+    max_core_samples: int = 20
+    max_cache_samples: int = 50
+    max_centroids: int = 3
+    loudness_normalize: bool = True
 
 
 @dataclass(frozen=True)
 class VuiSettings:
-    wake_words: tuple[str, ...] = ("EV",)
+    wake_words: tuple[str, ...] = ("小E",)
+
+
+@dataclass(frozen=True)
+class SegmentSettings:
+    min_duration_ms: int = 500
+    discard_filler_only: bool = True
+
+
+@dataclass(frozen=True)
+class VoiceLearningSettings:
+    auto_learn_enabled: bool = True
+    max_samples: int = 20
+    ema_alpha: float = 0.05
+    collect_threshold_offset: float = 0.05
+    collect_min_score: float = 0.40
+    min_duration_ms: int = 1500
+    max_duration_ms: int = 10000
+    min_interval_sec: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -46,6 +67,8 @@ class Settings:
     models: ModelSettings
     speaker: SpeakerSettings
     vui: VuiSettings
+    segment: SegmentSettings
+    voice_learning: VoiceLearningSettings
 
     @property
     def models_dir(self) -> Path:
@@ -88,6 +111,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
     models_raw = raw.get("models", {})
     speaker_raw = raw.get("speaker", {})
     vui_raw = raw.get("vui", {})
+    segment_raw = raw.get("segment", {})
+    voice_learning_raw = raw.get("voice_learning", {})
     data_dir = Path(
         os.environ.get("EV_DATA_DIR", raw.get("paths", {}).get("data_dir", "data"))
     )
@@ -108,12 +133,33 @@ def load_settings(config_path: Path | None = None) -> Settings:
             root=model_root,
             vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
             asr_streaming=str(models_raw.get("asr_streaming", "ev-paraformer-zh-streaming-16k")),
-            asr_final=str(models_raw.get("asr_final", "ev-sensevoice-small")),
+            asr_final=str(models_raw.get("asr_final", "ev-paraformer-zh-16k")),
             speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
         ),
         speaker=SpeakerSettings(
-            user_threshold=float(speaker_raw.get("user_threshold", 0.72)),
-            non_user_threshold=float(speaker_raw.get("non_user_threshold", 0.45)),
+            threshold=float(
+                speaker_raw.get("threshold",
+                    speaker_raw.get("user_threshold", 0.50)
+                )
+            ),
+            max_core_samples=int(speaker_raw.get("max_core_samples", 20)),
+            max_cache_samples=int(speaker_raw.get("max_cache_samples", 50)),
+            max_centroids=int(speaker_raw.get("max_centroids", 3)),
+            loudness_normalize=bool(speaker_raw.get("loudness_normalize", True)),
         ),
-        vui=VuiSettings(tuple(str(x) for x in vui_raw.get("wake_words", ["EV"]))),
+        vui=VuiSettings(tuple(str(x) for x in vui_raw.get("wake_words", ["小E"]))),
+        segment=SegmentSettings(
+            min_duration_ms=int(segment_raw.get("min_duration_ms", 500)),
+            discard_filler_only=bool(segment_raw.get("discard_filler_only", True)),
+        ),
+        voice_learning=VoiceLearningSettings(
+            auto_learn_enabled=bool(voice_learning_raw.get("auto_learn_enabled", True)),
+            max_samples=int(voice_learning_raw.get("max_samples", 20)),
+            ema_alpha=float(voice_learning_raw.get("ema_alpha", 0.05)),
+            collect_threshold_offset=float(voice_learning_raw.get("collect_threshold_offset", 0.05)),
+            collect_min_score=float(voice_learning_raw.get("collect_min_score", 0.40)),
+            min_duration_ms=int(voice_learning_raw.get("min_duration_ms", 1500)),
+            max_duration_ms=int(voice_learning_raw.get("max_duration_ms", 10000)),
+            min_interval_sec=float(voice_learning_raw.get("min_interval_sec", 30.0)),
+        ),
     )

@@ -20,3 +20,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ev"]
+
+[tool.pytest.ini_options]
+markers = [
+    "models: requires the local models-v0.1.0 release and FunASR runtime",
+]

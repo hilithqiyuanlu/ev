@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct LiveView: View {
+struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @State private var queryText = ""
 
@@ -12,7 +12,7 @@ struct LiveView: View {
                         Text(device.name).tag(device.name)
                     }
                 }
-                .frame(width: 300)
+                .frame(width: 260)
 
                 if model.microphonePermission != .authorized {
                     HStack(spacing: 6) {
@@ -54,8 +54,13 @@ struct LiveView: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("最近语音").font(.headline)
+                    Text("待处理输入").font(.headline)
                     Spacer()
+                    if model.isProcessing {
+                        Label("处理中", systemImage: "hourglass")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Button {
                         model.loadHistory()
                     } label: {
@@ -65,11 +70,14 @@ struct LiveView: View {
                     .help("刷新")
                 }
 
-                if model.segments.isEmpty {
-                    EmptyStateView("暂无语音记录", systemImage: "waveform.slash")
+                if model.queries.isEmpty {
+                    EmptyStateView(
+                        model.isListening ? "正在监听，说 \"小E，...\" 产生输入" : "暂无待处理输入",
+                        systemImage: "text.bubble"
+                    )
                 } else {
-                    List(Array(model.segments.prefix(8))) { segment in
-                        SegmentRow(segment: segment)
+                    List(model.queries) { query in
+                        QueryRow(query: query)
                     }
                     .listStyle(.inset)
                 }
@@ -82,7 +90,7 @@ struct LiveView: View {
 
             HStack(spacing: 10) {
                 Image(systemName: "keyboard").foregroundStyle(.secondary)
-                TextField("手动输入（进入待处理队列）", text: $queryText)
+                TextField("手动输入...", text: $queryText)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(submit)
                 Button(action: submit) {
@@ -94,7 +102,8 @@ struct LiveView: View {
             }
             .padding(16)
         }
-        .navigationTitle("实时")
+        .navigationTitle("首页")
+        .onAppear { model.loadHistory() }
     }
 
     private func submit() {

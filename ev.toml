@@ -12,12 +12,28 @@ data_dir = "data"     # 相对项目根目录;存模型权重、语音存档、S
 root = "data/models"
 vad = "ev-fsmn-vad-zh-16k"
 asr_streaming = "ev-paraformer-zh-streaming-16k"
-asr_final = "ev-sensevoice-small"
+asr_final = "ev-paraformer-zh-16k"
 speaker = "ev-eres2netv2-zh-16k"
 
 [speaker]
-user_threshold = 0.72
-non_user_threshold = 0.45
+threshold = 0.50
+max_core_samples = 20
+max_cache_samples = 50
+max_centroids = 3
+loudness_normalize = true
+
+[segment]
+min_duration_ms = 500          # 短于此时长的段直接丢弃（咳嗽/敲击/噪声）
+discard_filler_only = true     # 终稿仅为语气词时丢弃
+
+[voice_learning]
+auto_learn_enabled = true       # 正常使用中自动学习声纹
+max_samples = 20               # 最多保留最近N个样本
+ema_alpha = 0.05               # 新样本在EMA中的权重（0.05=5%）
+collect_threshold_offset = 0.05 # 收录要求 score ≥ threshold + offset（高置信度）
+min_duration_ms = 1500         # 样本最小时长（1.5秒）
+max_duration_ms = 10000        # 样本最大时长（10秒）
+min_interval_sec = 30          # 两次收录最小间隔（秒）
 
 [vui]
-wake_words = ["EV"]
+wake_words = ["小E"]

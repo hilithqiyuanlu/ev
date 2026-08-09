@@ -1,6 +1,9 @@
 import io
 import json
 
+import asyncio
+import numpy as np
+
 from ev.config import load_settings
 from ev.engine.protocol import EngineRequest, ProtocolWriter
 from ev.engine.service import EngineService
