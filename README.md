@@ -21,6 +21,31 @@ EV is being built around a few core ideas:
 - **Private by design.** No accounts, no telemetry, no cloud API calls. The only person who hears
   your voice is you.
 
+## The Promise
+
+Imagine an assistant that doesn't beep or flash waiting for a command. It's just there —
+quiet, attentive, in the background of your digital life like Karen in Peter Parker's suit:
+
+- **Proactive, not reactive.** It notices patterns before you ask. If you always open your
+  calendar and Spotify when you sit down Monday morning, it has them ready. If a meeting
+  is running long and your next one starts in five minutes, it gently chimes in without
+  needing to be summoned.
+- **Knows when to stay silent.** When you're on a call, when it hears frustration or
+  concentration in your voice, when you're talking to someone else in the room — it listens
+  but never interrupts. It learns your rhythm.
+- **Reads the room.** Not just words — tone, pause, hesitation, laughter. It can tell
+  when you're stressed from the way you're speaking, or tired, or excited, and responds
+  accordingly. A flat robotic answer isn't always what you need.
+- **Abductive reasoning.** It connects dots you didn't explicitly state. When you say
+  "I'm cold" while you're in your home office, it knows to check the thermostat — not
+  pull up a dictionary definition. It remembers context across hours and days.
+- **Always on your side.** Because everything is local, it never phones home, never
+  sells your data, never optimizes for someone else's metrics. It works for you and
+  only you.
+
+That's the north star. Today's version is the ears — it can hear you, recognize you,
+remember what was said. The brain and the rest come next.
+
 ## Current Status
 
 This is an early development version. The speech input pipeline is working end-to-end today:
