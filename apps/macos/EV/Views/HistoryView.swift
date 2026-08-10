@@ -22,6 +22,7 @@ struct HistoryView: View {
     @State private var queryOnly = false
     @State private var editingSegment: Segment?
     @State private var editText = ""
+    @State private var showClearConfirm = false
 
     private static let dateDisplayFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -133,6 +134,16 @@ struct HistoryView: View {
                 }
             )
         }
+        .alert("清空历史记录", isPresented: $showClearConfirm) {
+            Button("取消", role: .cancel) { showClearConfirm = false }
+            Button("清空", role: .destructive) {
+                showClearConfirm = false
+                model.deleteAllSegments()
+                model.deleteAllQueries()
+            }
+        } message: {
+            Text("确定要删除全部历史记录和待处理输入吗？此操作不可撤销。")
+        }
     }
 
     // MARK: - Filter Header
@@ -178,28 +189,31 @@ struct HistoryView: View {
             }
             .buttonStyle(.plain)
 
-            // 具体日期 (yyyy/MM/dd) - overlay日历点击再次触发
-            ZStack {
-                Button {
-                    handleDateCapsuleTap()
-                } label: {
-                    Text(Self.dateDisplayFormatter.string(from: displayedDate))
-                        .font(.subheadline.weight(.medium))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .foregroundStyle(dateOption == .specific ? .primary : .secondary)
-                        .background(
-                            GeometryReader { _ in
-                                if dateOption == .specific {
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .fill(Color.primary.opacity(0.06))
-                                }
+            // 具体日期 (yyyy/MM/dd)
+            // 点击切换逻辑：
+            //   dateOption == .all 时：优先走 Button 切换到当天（allowsHitTesting=false 忽略 DatePicker）
+            //   dateOption == .specific 时：DatePicker 吸收点击，弹出下拉日历（allowsHitTesting=true）
+            Button {
+                handleDateCapsuleTap()
+            } label: {
+                Text(Self.dateDisplayFormatter.string(from: displayedDate))
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .foregroundStyle(dateOption == .specific ? .primary : .secondary)
+                    .background(
+                        GeometryReader { _ in
+                            if dateOption == .specific {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color.primary.opacity(0.06))
                             }
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
+                        }
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .overlay(
+                // overlay：不改变按钮布局尺寸，仅在上方叠一层可点击的 DatePicker
                 DatePicker(
                     "",
                     selection: Binding(
@@ -214,16 +228,18 @@ struct HistoryView: View {
                     displayedComponents: .date
                 )
                 .labelsHidden()
-                .opacity(0.02)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .controlSize(.mini)
+                .opacity(0.001)
                 .allowsHitTesting(dateOption == .specific)
-            }
+                .clipped()
+            )
         }
         .padding(4)
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color.secondary.opacity(0.06))
         )
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     private var speakerCapsule: some View {
@@ -290,8 +306,7 @@ struct HistoryView: View {
 
     private var clearCapsule: some View {
         Button(role: .destructive) {
-            model.deleteAllSegments()
-            model.deleteAllQueries()
+            showClearConfirm = true
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "xmark")

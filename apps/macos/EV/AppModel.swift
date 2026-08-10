@@ -65,10 +65,41 @@ struct SystemMicrophonePermission: MicrophonePermissionProviding {
 
 @MainActor
 final class AppModel: ObservableObject {
+    /// 空字符串表示「使用系统默认输入设备」，和后端 set_device 的约定保持一致
+    static let systemDefaultDeviceTag = ""
+    private static let selectedDeviceDefaultsKey = "selectedDevice"
+    private static let selectedDeviceLabelDefaultsKey = "selectedDeviceLabel"
+
     @Published var engineState: EngineState = .stopped
     @Published var devices: [AudioDevice] = []
-    @Published var selectedDevice = ""
+    /// 选中的设备名；空串 = 使用系统默认
+    @Published var selectedDevice = AppModel.systemDefaultDeviceTag
     @Published var audioLevel = 0.0
+
+    /// 设备选择 Picker 显示用: 「系统默认」 + 真实设备列表
+    var devicePickerItems: [(tag: String, label: String, isDefault: Bool)] {
+        typealias Item = (tag: String, label: String, isDefault: Bool)
+        var items: [Item] = []
+        // 1) 固定首位: 使用系统默认
+        let defaultDeviceName = devices.first(where: \.isDefault)?.name ?? "（无默认设备）"
+        let defaultItem: Item = (
+            tag: Self.systemDefaultDeviceTag,
+            label: "使用系统默认（当前：\(defaultDeviceName)）",
+            isDefault: true
+        )
+        items += [defaultItem]
+        // 2) 真实设备
+        for dev in devices {
+            let devItem: Item = (
+                tag: dev.name,
+                label: dev.isDefault ? "\(dev.name)（默认）" : dev.name,
+                isDefault: dev.isDefault
+            )
+            items += [devItem]
+        }
+        return items
+    }
+
     @Published var partialText = ""
     @Published var lastFinalText = ""
     @Published var captureReady = false
@@ -183,8 +214,8 @@ final class AppModel: ObservableObject {
         self.permissionProvider = permissionProvider
         self.microphonePermission = permissionProvider.state
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
-        // Migrate threshold: prefer new key, fallback to old userThreshold key, default 0.50
         let defaults = UserDefaults.standard
+        // Threshold
         if let saved = defaults.object(forKey: "speakerThreshold") as? Double {
             self.speakerThreshold = saved
         } else if let oldUser = defaults.object(forKey: "userThreshold") as? Double {
@@ -192,6 +223,10 @@ final class AppModel: ObservableObject {
         } else {
             self.speakerThreshold = 0.50
         }
+        // 选中设备: 从 UserDefaults 恢复, 默认是空串 = 系统默认
+        // 等第一次 device_list 到达后再校验: 如果保存的设备名不在当前列表里 → 回退到 系统默认
+        let persistedDevice = defaults.string(forKey: Self.selectedDeviceDefaultsKey) ?? ""
+        self.selectedDevice = persistedDevice
         engine.onEvent = { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
@@ -221,17 +256,19 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.refreshAll()
             }
-            // 每2秒刷新一次设备列表，检测设备连接/断开
-            deviceRefreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            // 每 5 秒刷新一次设备列表（2s 太急，且会与用户手动选择竞争，改为 5s）
+            deviceRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.refreshDevices() }
             }
-            // Listen for device changes: when user selects different device, notify engine immediately
+            // 用户改变选择: 立即持久化 + 通知后端（set_device 监听中会返回错误，由 error handler 提示）
             $selectedDevice
-                .dropFirst()  // Skip initial value
+                .dropFirst()
                 .removeDuplicates()
                 .sink { [weak self] newDevice in
-                    guard let self, !newDevice.isEmpty else { return }
-                    // Send set_device command - engine will restart listening if active
+                    guard let self else { return }
+                    // 持久化
+                    UserDefaults.standard.set(newDevice, forKey: Self.selectedDeviceDefaultsKey)
+                    // 通知后端: newDevice 可能是空串（系统默认），后端会归一化成 None
                     self.engine.send("set_device", payload: ["device": newDevice])
                 }
                 .store(in: &cancellables)
@@ -509,14 +546,21 @@ final class AppModel: ObservableObject {
         case "device_list":
             devices = event.payload["devices"]?.array?.compactMap(AudioDevice.init) ?? []
             let deviceNames = Set(devices.map(\.name))
-            let currentDeviceExists = !selectedDevice.isEmpty && deviceNames.contains(selectedDevice)
-            if !currentDeviceExists {
-                // 当前选中设备不在列表中（断开连接）或未选择，自动选择默认设备
-                selectedDevice = devices.first(where: \.isDefault)?.name ?? devices.first?.name ?? ""
-            } else if !isListening, let defaultDevice = devices.first(where: \.isDefault), defaultDevice.name != selectedDevice {
-                // 未监听时，如果系统默认设备变了，自动跟随系统默认
-                selectedDevice = defaultDevice.name
+            // 1) 系统默认哨兵值 (空串) —— 永远保留用户选择
+            if selectedDevice == Self.systemDefaultDeviceTag {
+                // no-op
             }
+            // 2) 用户选了具体设备 → 只有当设备真的不在列表中 (被拔出) 才回退到系统默认
+            else if !deviceNames.contains(selectedDevice) {
+                let removed = selectedDevice
+                selectedDevice = Self.systemDefaultDeviceTag
+                lastEngineLog = String(
+                    (lastEngineLog + "输入设备「\(removed)」已断开，已自动切换为使用系统默认\n")
+                        .suffix(8_192)
+                )
+            }
+            // 3) 其余情况 —— 不再强制覆盖 selectedDevice
+            //    (修复「未监听时系统默认设备变动会瞬间覆盖用户手动选择」导致的闪烁)
             completeOnboardingIfNeeded()
         case "audio_level":
             audioLevel = min(max((event.payload["rms"]?.double ?? 0) * 10, 0), 1)

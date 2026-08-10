@@ -268,36 +268,25 @@ class EngineService:
 
     def _set_device(self, request: EngineRequest) -> None:
         new_device = request.payload.get("device") or None
-        # Validate device exists if specified
-        if new_device is not None:
+        was_listening = self._listen_thread is not None and self._listen_thread.is_alive()
+        # 监听中禁止切设备,必须先停止监听:避免静默重启造成"监听中断闪烁"感
+        if was_listening:
+            raise RuntimeError(
+                "当前正在监听中，无法切换输入设备。请先停止监听，再切换麦克风。"
+            )
+        # Validate device exists if specified (空字符串表示使用系统默认)
+        if new_device is not None and new_device != "":
             resolved = resolve_device(new_device)
             if resolved is None:
                 raise ValueError(f"未找到匹配的输入设备: {new_device}")
-        # Update selector
-        self.device_selector = new_device
-        # Update saved params
+        # Normalize selector: 空字符串/None 都归为 None (即系统默认)
+        selector: str | None = None if (new_device is None or new_device == "") else new_device
+        self.device_selector = selector
+        # Update saved params for future start_listening
         if self._last_listen_params is not None:
-            self._last_listen_params["device"] = new_device
-        was_listening = self._listen_thread is not None and self._listen_thread.is_alive()
-        if was_listening:
-            # Restart listening with new device
-            self._listen_stop.set()
-            self._listen_thread.join(timeout=3.0)
-            self._listen_thread = None
-            self._segment_worker = None
-            self._listen_stop = threading.Event()
-            self.state = "loading"
-            self._emit_state()
-            # Reuse last params to restart
-            params = self._last_listen_params or {}
-            params["device"] = new_device
-            # Build a synthetic request for restart
-            restart_request = EngineRequest(
-                request_id=str(uuid.uuid4()),
-                command="start_listening",
-                payload=params,
-            )
-            self._start_listening(restart_request)
+            self._last_listen_params["device"] = selector
+        # Sync engine_state.device 字段, 让 UI 显示当前选择
+        self._emit_state(request.request_id)
         self._ack(request)
 
     def _on_runtime_event(self, event_type: str, payload: dict) -> None:

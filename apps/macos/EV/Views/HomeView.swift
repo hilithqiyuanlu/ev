@@ -8,11 +8,17 @@ struct HomeView: View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Picker("输入设备", selection: $model.selectedDevice) {
-                    ForEach(model.devices) { device in
-                        Text(device.name).tag(device.name)
+                    ForEach(model.devicePickerItems, id: \.tag) { item in
+                        Text(item.label).tag(item.tag)
                     }
                 }
-                .frame(width: 260)
+                .frame(width: 340)
+                .disabled(model.isListening)
+                .help(
+                    model.isListening
+                        ? "监听中无法切换设备，请先停止监听"
+                        : "选择麦克风输入源；默认跟随系统设置（插上 DJI Mic Mini 时会自动切换）"
+                )
 
                 if model.microphonePermission != .authorized {
                     HStack(spacing: 6) {
