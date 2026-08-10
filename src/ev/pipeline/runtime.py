@@ -276,11 +276,6 @@ class SegmentWorker:
         with Store(self.settings.db_path) as store:
             from ..speaker.profile import VoiceProfileManager
             voice_profile = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
-            # Initial hotword load and one-time correction learning on startup
-            try:
-                store.learn_from_corrections()
-            except Exception:
-                pass
             hotwords_str = store.get_hotwords_string()
             processor = SegmentProcessor(
                 self.settings,

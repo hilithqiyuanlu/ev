@@ -2,8 +2,7 @@ import SwiftUI
 
 private enum DateFilterOption: String, CaseIterable, Identifiable {
     case all = "全部日期"
-    case today = "今天"
-    case yesterday = "昨天"
+    case specific = "具体日期"
     var id: String { rawValue }
 }
 
@@ -23,6 +22,20 @@ struct HistoryView: View {
     @State private var queryOnly = false
     @State private var editingSegment: Segment?
     @State private var editText = ""
+
+    private static let dateDisplayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy/MM/dd"
+        return f
+    }()
+
+    private static let queryDisplayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private var displayedDate: Date { filterDate ?? Calendar.current.startOfDay(for: Date()) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -122,45 +135,18 @@ struct HistoryView: View {
         }
     }
 
-    // MARK: - Filter Header (two capsule bars on one row)
+    // MARK: - Filter Header
 
     private var filterHeader: some View {
-        HStack(alignment: .center, spacing: 14) {
+        HStack(alignment: .center, spacing: 12) {
             dateCapsule
             speakerCapsule
             queryToggleCapsule
-
+            clearCapsule
             Spacer()
-
-            if filterDate != nil {
-                DatePicker("", selection: Binding(
-                    get: { filterDate ?? Date() },
-                    set: {
-                        dateOption = .all
-                        filterDate = Calendar.current.startOfDay(for: $0)
-                        scheduleFilter()
-                    }
-                ), displayedComponents: .date)
-                .labelsHidden()
-                .frame(maxWidth: 130)
-            }
-
             if model.isLoadingHistory {
                 ProgressView().controlSize(.small)
             }
-
-            Button(role: .destructive) {
-                model.deleteAllSegments()
-                model.deleteAllQueries()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("清空")
-                    .font(.caption.weight(.medium))
-            }
-            .buttonStyle(.bordered)
-            .tint(.secondary)
-            .disabled(model.historyItems.isEmpty)
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
@@ -169,28 +155,42 @@ struct HistoryView: View {
 
     private var dateCapsule: some View {
         HStack(spacing: 0) {
-            ForEach(DateFilterOption.allCases) { opt in
+            // 全部日期
+            Button {
+                dateOption = .all
+                filterDate = nil
+                scheduleFilter()
+            } label: {
+                Text("全部日期")
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .foregroundStyle(dateOption == .all ? .primary : .secondary)
+                    .background(
+                        GeometryReader { _ in
+                            if dateOption == .all {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color.primary.opacity(0.06))
+                            }
+                        }
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            // 具体日期 (yyyy/MM/dd) - overlay日历点击再次触发
+            ZStack {
                 Button {
-                    dateOption = opt
-                    switch opt {
-                    case .all: filterDate = nil
-                    case .today: filterDate = Calendar.current.startOfDay(for: Date())
-                    case .yesterday:
-                        filterDate = Calendar.current.date(
-                            byAdding: .day, value: -1,
-                            to: Calendar.current.startOfDay(for: Date())
-                        )
-                    }
-                    scheduleFilter()
+                    handleDateCapsuleTap()
                 } label: {
-                    Text(opt.rawValue)
+                    Text(Self.dateDisplayFormatter.string(from: displayedDate))
                         .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 14)
                         .padding(.vertical, 8)
-                        .foregroundStyle(dateOption == opt ? .primary : .secondary)
+                        .foregroundStyle(dateOption == .specific ? .primary : .secondary)
                         .background(
                             GeometryReader { _ in
-                                if dateOption == opt {
+                                if dateOption == .specific {
                                     RoundedRectangle(cornerRadius: 10)
                                         .fill(Color.primary.opacity(0.06))
                                 }
@@ -199,6 +199,24 @@ struct HistoryView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+
+                DatePicker(
+                    "",
+                    selection: Binding(
+                        get: { filterDate ?? Calendar.current.startOfDay(for: Date()) },
+                        set: { newDate in
+                            let day = Calendar.current.startOfDay(for: newDate)
+                            filterDate = day
+                            dateOption = .specific
+                            scheduleFilter()
+                        }
+                    ),
+                    displayedComponents: .date
+                )
+                .labelsHidden()
+                .opacity(0.02)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(dateOption == .specific)
             }
         }
         .padding(4)
@@ -213,11 +231,6 @@ struct HistoryView: View {
             ForEach(SpeakerFilterOption.allCases) { opt in
                 Button {
                     speakerOption = opt
-                    switch opt {
-                    case .all: speakerOption = .all  // value drives applyFilters
-                    case .user: break
-                    case .nonUser: break
-                    }
                     scheduleFilter()
                 } label: {
                     Text(opt.rawValue)
@@ -275,6 +288,51 @@ struct HistoryView: View {
         )
     }
 
+    private var clearCapsule: some View {
+        Button(role: .destructive) {
+            model.deleteAllSegments()
+            model.deleteAllQueries()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("清空")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(model.historyItems.isEmpty ? .tertiary : .secondary)
+            .background(
+                GeometryReader { _ in
+                    EmptyView()
+                }
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.historyItems.isEmpty)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+        )
+    }
+
+    private func handleDateCapsuleTap() {
+        switch dateOption {
+        case .all:
+            // 第一次点击：默认选当天
+            let today = Calendar.current.startOfDay(for: Date())
+            filterDate = today
+            dateOption = .specific
+            scheduleFilter()
+        case .specific:
+            // 再次点击：触发日历选择（让 DatePicker 接收点击，
+            // 由 allowsHitTesting 控制，这里不需要额外处理）
+            break
+        }
+    }
+
     private func scheduleFilter() {
         filterTask?.cancel()
         filterTask = Task { @MainActor in
@@ -285,9 +343,7 @@ struct HistoryView: View {
 
     private func applyFilters() {
         if let date = filterDate {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
-            model.dateFilter = formatter.string(from: date)
+            model.dateFilter = Self.queryDisplayFormatter.string(from: date)
         } else {
             model.dateFilter = ""
         }

@@ -604,11 +604,7 @@ class EngineService:
                 speaker_score=original["speaker_score"],
                 audio_path=original["audio_path"],
             )
-            # Trigger learning from this correction (and any other unapplied)
-            learned_words = store.learn_from_corrections()
-        if learned_words:
-            self._broadcast_hotwords()
-            self.writer.emit("lexicon_updated", {"added": len(learned_words), "words": learned_words, "source": "correction"})
+            learned_words: list[str] = []
         self.writer.emit(
             "segment_corrected",
             {"segment_id": segment_id, "changed": True, "corrected_text": corrected_text, "learned_words": learned_words},
@@ -627,15 +623,11 @@ class EngineService:
         self.writer.emit("correction_list", {"corrections": corrections}, request.request_id)
 
     def _learn_corrections(self, request: EngineRequest) -> None:
-        """Manually trigger learning from all unapplied correction history."""
-        with Store(self.settings.db_path) as store:
-            learned_words = store.learn_from_corrections()
-        if learned_words:
-            self._broadcast_hotwords()
-            self.writer.emit("lexicon_updated", {"added": len(learned_words), "words": learned_words, "source": "manual_learn"})
+        """Auto-learning from corrections is disabled. Returns empty result."""
+        learned_words: list[str] = []
         self.writer.emit(
             "corrections_learned",
-            {"added": len(learned_words), "words": learned_words},
+            {"added": 0, "words": learned_words},
             request.request_id,
         )
         self._ack(request)

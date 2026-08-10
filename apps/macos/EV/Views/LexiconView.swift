@@ -35,74 +35,21 @@ struct LexiconView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .navigationTitle("词典")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showAddPanel.toggle()
-                    }
-                } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.primary)
-                }
-                .buttonStyle(.borderless)
-                .help("添加词语")
-            }
-        }
     }
 
-    // MARK: - Header Bar (Filter + Count + Learn / Add / Clear row)
+    // MARK: - Header Bar (Filter left, operations right)
 
     private var headerBar: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        HStack(alignment: .center, spacing: 12) {
             filterBar
-            HStack(alignment: .center, spacing: 10) {
-                Button {
-                    model.learnCorrections()
-                } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("从纠错学习")
-                        .font(.caption.weight(.medium))
-                }
-                .buttonStyle(.bordered)
-                .tint(.secondary)
-                .help("从历史纠错记录学习易错词，加入自动词典")
-
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showAddPanel.toggle()
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("添加词语")
-                        .font(.caption.weight(.medium))
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
-
-                Spacer()
-
-                Text("\(visibleWords.count) 词")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                let autoCount = model.lexiconWords.filter { $0.source == "auto" }.count
-                if autoCount > 0 {
-                    Button(role: .destructive) {
-                        model.clearAutoLexicon()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .semibold))
-                        Text("清空自动词")
-                            .font(.caption.weight(.medium))
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.secondary)
-                    .help("清除所有自动添加的词语，手动词保留")
-                }
+            addCapsule
+            Spacer()
+            Text("\(visibleWords.count) 词")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            let autoCount = model.lexiconWords.filter { $0.source == "auto" }.count
+            if autoCount > 0 {
+                clearAutoCapsule(autoCount: autoCount)
             }
         }
     }
@@ -148,6 +95,79 @@ struct LexiconView: View {
                 .fill(Color.secondary.opacity(0.06))
         )
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    // MARK: - Operation capsules (matching filter capsule visual style)
+
+    private var learnCapsule: some View {
+        Button {
+            model.learnCorrections()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("从纠错学习")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+        )
+    }
+
+    private var addCapsule: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showAddPanel.toggle()
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("添加词语")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+        )
+    }
+
+    private func clearAutoCapsule(autoCount: Int) -> some View {
+        Button(role: .destructive) {
+            model.clearAutoLexicon()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("清空自动词")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+        )
     }
 
     // MARK: - Add Panel
