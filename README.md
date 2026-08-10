@@ -24,7 +24,7 @@ EV is being built around a few core ideas:
 ## The Promise
 
 Imagine an assistant that doesn't beep or flash waiting for a command. It's just there —
-quiet, attentive, in the background of your digital life like Karen in Peter Parker's suit:
+quiet, attentive, in the background of your digital life:
 
 - **Proactive, not reactive.** It notices patterns before you ask. If you always open your
   calendar and Spotify when you sit down Monday morning, it has them ready. If a meeting
