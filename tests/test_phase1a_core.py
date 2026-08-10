@@ -12,7 +12,12 @@ from ev.speaker.profile import VoiceProfileManager
 from ev.speaker.verification import build_profile, classify_score, verify_speaker
 from ev.store.db import SegmentRecord, Store
 from ev.vad.adapters import EndpointState, VADAdapter
-from ev.vui import decide_query, match_wake_prefix, normalize_text
+from ev.vui import (
+    decide_query,
+    decide_query_from_utterances,
+    match_wake_prefix,
+    normalize_text,
+)
 
 
 class MockVoiceProfile:
@@ -127,6 +132,47 @@ def test_vui_only_sentence_prefix_and_user_gate():
     assert decide_query("你好 小E 打开灯", "user").wake_detected is False
 
 
+def test_vui_english_greeting_prefix_stripping():
+    # ASR often transcribes "嗨" as English "hi"/"hai" — must still trigger.
+    for phrase in (
+        "hi 小易帮我看一下今天天气怎么样",
+        "hi小易帮我看一下今天天气怎么样",
+        "Hi 小易 帮我看一下天气",
+        "HAY 小艺你现在在做什么",
+    ):
+        wake = match_wake_prefix(phrase)
+        assert wake.detected, f"should detect wake in {phrase!r}"
+        assert wake.query_text.strip()
+    # Boundary guard: must not clip ordinary words beginning with "hi".
+    assert not match_wake_prefix("history 很重要").detected
+    assert not match_wake_prefix("hi five").detected
+
+
+def test_vui_utterance_query_gated_on_segment_speaker():
+    # Wake word on a (noisy) "non-user" utterance must still be detected; the
+    # query_candidate gate uses the stable segment-level dominant_speaker.
+    utts = [{"speaker": "non-user", "text": "小易帮我看一下今天天气怎么样"}]
+    d = decide_query_from_utterances(utts, dominant_speaker="user")
+    assert d.wake_detected
+    assert d.query_candidate
+    assert d.query_text == "帮我看一下今天天气怎么样"
+
+    # Segment-level non-user → wake detected but no query candidate.
+    d2 = decide_query_from_utterances(utts, dominant_speaker="non-user")
+    assert d2.wake_detected
+    assert not d2.query_candidate
+
+    # Follow-up user utterances still get folded into the query.
+    utts3 = [
+        {"speaker": "non-user", "text": "嗨小易"},
+        {"speaker": "user", "text": "帮我看一下天气"},
+    ]
+    d3 = decide_query_from_utterances(utts3, dominant_speaker="user")
+    assert d3.wake_detected
+    assert d3.query_candidate
+    assert d3.query_text == "帮我看一下天气"
+
+
 def test_speaker_binary_classification():
     profile = build_profile([np.array([1.0, 0.0]), np.array([0.9, 0.1])])
     threshold = 0.50
@@ -147,12 +193,15 @@ def test_sqlite_segment_and_profile(tmp_path):
         now = datetime.now(timezone.utc).isoformat()
         store.insert_segment(
             SegmentRecord(
-                "seg", now, now, 100, "a.wav", 16000, 1, "EV hi", "EV hi", "non-user", 0.2,
-                True, False, None, "vad", "stream", "final", "speaker", now,
+                id="seg", started_at=now, ended_at=now, duration_ms=100, audio_path="a.wav",
+                sample_rate=16000, channels=1, transcript_raw="EV hi", transcript_final="EV hi",
+                speaker_label="non-user", wake_detected=True, query_candidate=False,
+                vad_model="vad", asr_stream_model="stream", asr_final_model="final",
+                speaker_model="speaker", created_at=now, speaker_score=0.2,
             )
         )
         assert store.connection.execute("select count(*) from segments").fetchone()[0] == 1
-        assert store.connection.execute("pragma user_version").fetchone()[0] == 9
+        assert store.connection.execute("pragma user_version").fetchone()[0] == 11
         assert store.connection.execute("select count(*) from speaker_samples").fetchone()[0] == 0
 
 
@@ -209,8 +258,11 @@ def test_manual_query_history_and_atomic_segment_delete(tmp_path):
     with Store(tmp_path / "ev.db") as store:
         store.insert_segment(
             SegmentRecord(
-                "delete-me", now, now, 100, str(audio), 16000, 1, "hello", "hello",
-                "unknown", None, False, False, None, "vad", "stream", "final", "speaker", now,
+                id="delete-me", started_at=now, ended_at=now, duration_ms=100, audio_path=str(audio),
+                sample_rate=16000, channels=1, transcript_raw="hello", transcript_final="hello",
+                speaker_label="unknown", wake_detected=False, query_candidate=False,
+                vad_model="vad", asr_stream_model="stream", asr_final_model="final",
+                speaker_model="speaker", created_at=now,
             )
         )
         manual = store.submit_manual_query("  test query  ")
@@ -244,6 +296,10 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
         model_id = "stream"
 
     monkeypatch.setattr(runtime_module, "FinalASRAdapter", Final)
+    # Create the final model directory so _create_final_asr_adapter doesn't fail
+    (tmp_path / "final").mkdir(parents=True, exist_ok=True)
+    # Add a dummy configuration.json (FunASR format) to trigger FinalASRAdapter path
+    (tmp_path / "final" / "configuration.json").write_text("{}")
     events = []
     now = datetime.now(timezone.utc)
     worker = SegmentWorker(
@@ -333,11 +389,24 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
             for _ in range(25):
                 yield np.zeros(480, dtype=np.float32)
 
+        async def frames_with_raw(self):
+            for _ in range(25):
+                f = np.zeros(480, dtype=np.float32)
+                yield f, f
+
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
     monkeypatch.setattr(runtime_module, "StreamingASRAdapter", Stream)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
     monkeypatch.setattr(runtime_module, "FinalASRAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
+    # Create model directories and monkeypatch _create_final_asr_adapter
+    for d in ["vad", "stream", "final", "speaker"]:
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "final" / "configuration.json").write_text("{}")
+    monkeypatch.setattr(
+        runtime_module, "_create_final_asr_adapter",
+        lambda path: Final(path),
+    )
     monkeypatch.setattr(
         "ev.models.require_models",
         lambda settings, root=None: {
@@ -528,6 +597,10 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
         async def frames(self):
             for _ in range(8):
                 yield np.zeros(480, dtype=np.float32)
+        async def frames_with_raw(self):
+            for _ in range(8):
+                f = np.zeros(480, dtype=np.float32)
+                yield f, f
 
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
     monkeypatch.setattr(runtime_module, "StreamingASRAdapter", Stream)
@@ -566,9 +639,12 @@ def test_correction_history_crud(tmp_path):
     with Store(db) as store:
         # Insert a segment first
         store.insert_segment(SegmentRecord(
-            "seg1", now, now, 1500, "/tmp/a.wav", 16000, 1,
-            "我想研究强化学", "我想研究强化学", "user", 0.82,
-            False, True, "我想研究强化学", "vad", "stream", "final", "speaker", now,
+            id="seg1", started_at=now, ended_at=now, duration_ms=1500, audio_path="/tmp/a.wav",
+            sample_rate=16000, channels=1,
+            transcript_raw="我想研究强化学", transcript_final="我想研究强化学", speaker_label="user",
+            wake_detected=False, query_candidate=True, query_text="我想研究强化学",
+            vad_model="vad", asr_stream_model="stream", asr_final_model="final",
+            speaker_model="speaker", created_at=now, speaker_score=0.82,
         ))
         # Record a correction
         corr = store.record_correction(

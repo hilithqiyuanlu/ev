@@ -26,7 +26,7 @@ _STOPWORDS = frozenset({
     "一下", "一点", "一些", "有些", "某个", "某种", "东西", "事情", "问题",
 })
 
-_PUNCT_RE = re.compile(r"[\s，。！？、；：""''（）【】…—\[\]().,!?;:+\-=~`@#$%^&*|\\/<>]+")
+_PUNCT_RE = re.compile(r"[][\s，。！？、；：""''（）【】…—().,!?;:+=~`@#$%^&*|\\/<>-]+")
 
 
 @dataclass(frozen=True)
@@ -41,15 +41,21 @@ class SegmentRecord:
     transcript_raw: str
     transcript_final: str
     speaker_label: str
-    speaker_score: float | None
     wake_detected: bool
     query_candidate: bool
-    query_text: str | None
     vad_model: str
     asr_stream_model: str
     asr_final_model: str
     speaker_model: str
     created_at: str
+    raw_audio_path: str | None = None
+    speaker_score: float | None = None
+    query_text: str | None = None
+    speaker_turns: str | None = None
+    utterances: str | None = None
+    source_type: str = "voice"
+    dominant_speaker: str | None = None
+    contains_user: bool = True
 
 
 @dataclass(frozen=True)
@@ -65,9 +71,10 @@ class QueryRecord:
 class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path)
+        self.connection = sqlite3.connect(path, timeout=5.0)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA busy_timeout=5000")
         self.initialize()
 
     def initialize(self) -> None:
@@ -77,13 +84,17 @@ class Store:
             CREATE TABLE IF NOT EXISTS segments (
               id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT NOT NULL,
               duration_ms INTEGER NOT NULL, audio_path TEXT NOT NULL,
+              raw_audio_path TEXT,
               sample_rate INTEGER NOT NULL, channels INTEGER NOT NULL,
               transcript_raw TEXT NOT NULL, transcript_final TEXT NOT NULL,
               speaker_label TEXT NOT NULL, speaker_score REAL,
               wake_detected INTEGER NOT NULL, query_candidate INTEGER NOT NULL,
               query_text TEXT, vad_model TEXT NOT NULL, asr_stream_model TEXT NOT NULL,
               asr_final_model TEXT NOT NULL, speaker_model TEXT NOT NULL,
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              speaker_turns TEXT, utterances TEXT,
+              source_type TEXT NOT NULL DEFAULT 'voice',
+              dominant_speaker TEXT, contains_user INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS speaker_profiles (
               id TEXT PRIMARY KEY, label TEXT NOT NULL, device_selector TEXT,
@@ -135,7 +146,9 @@ class Store:
         self._migrate_lexicon_v7()
         self._migrate_corrections_v8()
         self._migrate_cleanup_high_freq_v9()
-        self.connection.execute("PRAGMA user_version=9")
+        self._migrate_raw_audio_path_v10()
+        self._migrate_speaker_turns_v11()
+        self.connection.execute("PRAGMA user_version=11")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -207,6 +220,36 @@ class Store:
         Only keep auto words from correction learning (weight >= 2.0).
         """
         self.connection.execute("DELETE FROM lexicon WHERE source='auto' AND weight < 2.0")
+
+    def _migrate_raw_audio_path_v10(self) -> None:
+        """Add raw_audio_path column to segments table (v9->v10) for dual-wav archive."""
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        if "raw_audio_path" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN raw_audio_path TEXT")
+
+    def _migrate_speaker_turns_v11(self) -> None:
+        """Add speaker_turns/utterances/source_type/dominant_speaker/contains_user columns (v10->v11)
+        for multi-speaker diarization support ("second ear" feature)."""
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        if "speaker_turns" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN speaker_turns TEXT")
+        if "utterances" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN utterances TEXT")
+        if "source_type" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN source_type TEXT NOT NULL DEFAULT 'voice'")
+        else:
+            self.connection.execute("UPDATE segments SET source_type='voice' WHERE source_type IS NULL OR source_type=''")
+        if "dominant_speaker" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN dominant_speaker TEXT")
+        if "contains_user" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN contains_user INTEGER NOT NULL DEFAULT 1")
+        # Backfill: for existing segments, dominant_speaker = speaker_label, contains_user = 1
+        self.connection.execute(
+            "UPDATE segments SET dominant_speaker=speaker_label WHERE dominant_speaker IS NULL"
+        )
+        self.connection.execute(
+            "UPDATE segments SET contains_user=1 WHERE contains_user IS NULL"
+        )
 
     def _seed_system_words(self) -> None:
         """Seed built-in system words (wake words) that cannot be deleted."""
@@ -309,8 +352,16 @@ class Store:
             "offset": max(int(offset), 0),
         }
         if speaker_label:
-            clauses.append("speaker_label=:speaker_label")
-            params["speaker_label"] = speaker_label
+            # speaker_label filter uses new columns for multi-speaker segments, falls back for old data
+            if speaker_label == "user":
+                # Show segments that contain any user speech
+                clauses.append("(contains_user=1 OR (dominant_speaker IS NULL AND speaker_label='user'))")
+            elif speaker_label == "non-user":
+                # Show pure non-user segments (no user speech at all)
+                clauses.append("(contains_user=0 OR (dominant_speaker IS NULL AND speaker_label='non-user'))")
+            else:
+                clauses.append("(dominant_speaker=:speaker_label OR (dominant_speaker IS NULL AND speaker_label=:speaker_label))")
+                params["speaker_label"] = speaker_label
         if query_only:
             clauses.append("query_candidate=1")
         if date_prefix:
@@ -368,12 +419,14 @@ class Store:
 
     def delete_segment(self, segment_id: str) -> bool:
         row = self.connection.execute(
-            "SELECT audio_path FROM segments WHERE id=?", (segment_id,)
+            "SELECT audio_path, raw_audio_path FROM segments WHERE id=?", (segment_id,)
         ).fetchone()
         if row is None:
             return False
         audio_path = Path(row["audio_path"])
+        raw_path = Path(row["raw_audio_path"]) if row["raw_audio_path"] else None
         trash_path = self._move_to_trash(audio_path)
+        raw_trash_path = self._move_to_trash(raw_path) if raw_path is not None else None
         try:
             with self.connection:
                 self.connection.execute("DELETE FROM segments WHERE id=?", (segment_id,))
@@ -381,9 +434,14 @@ class Store:
             if trash_path is not None and trash_path.exists():
                 audio_path.parent.mkdir(parents=True, exist_ok=True)
                 trash_path.replace(audio_path)
+            if raw_trash_path is not None and raw_trash_path.exists() and raw_path is not None:
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_trash_path.replace(raw_path)
             raise
         if trash_path is not None:
             trash_path.unlink(missing_ok=True)
+        if raw_trash_path is not None:
+            raw_trash_path.unlink(missing_ok=True)
         return True
 
     def delete_all_segments(self) -> int:
@@ -672,8 +730,12 @@ class Store:
             return cursor.rowcount
 
     def get_hotwords_string(self, max_words: int = 80) -> str:
-        """Build hotwords string for FunASR: 'word1:weight word2:weight ...'
-        Prioritizes system > manual > auto, highest weight first.
+        """Build hotwords string for FunASR model-level boosting.
+
+        Returns space-separated word list WITHOUT weights, e.g. "word1 word2 word3".
+        Weight suffixes (":3.0") break FunASR's seg_tokenize, turning the whole
+        hotword into <unk> and defeating the boosting mechanism entirely.
+        Priority ordering (system > manual > auto, weight DESC) is preserved.
         """
         rows = self.connection.execute(
             """
@@ -687,10 +749,7 @@ class Store:
         for row in rows:
             w = str(row["word"]).strip()
             if w and _PUNCT_RE.sub("", w):
-                wt = float(row["weight"])
-                # Format: if weight is integer-ish, use one decimal; else two
-                wstr = f"{wt:.1f}" if wt == int(wt) else f"{wt:.2f}"
-                parts.append(f"{w}:{wstr}")
+                parts.append(w)
         return " ".join(parts)
 
     def learn_high_frequency_words(self, min_count: int = 2, max_auto_words: int = 100) -> int:

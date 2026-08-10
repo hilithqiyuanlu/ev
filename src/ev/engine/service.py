@@ -20,7 +20,9 @@ from ..asr.adapters import SpeakerEmbeddingAdapter
 from ..audio.capture import AudioCapture
 from ..audio.devices import list_input_devices, resolve_device
 from ..config import Settings
+from ..model_catalog import get_catalog, get_definition
 from ..model_download import DownloadCancelled, ModelDownloader
+from ..model_registry import ModelRegistry, migrate_from_legacy
 from ..models import require_models, verify_models
 from ..pipeline.runtime import transcribe_forever
 from ..speaker.profile import VoiceProfileManager
@@ -46,8 +48,19 @@ class EngineService:
         self._download_cancel = threading.Event()
         self._voice_auto_learn = settings.voice_learning.auto_learn_enabled
         self._segment_worker = None  # type: ignore[assignment]
-        # Remember last start_listening params for restart-on-device-change
         self._last_listen_params: dict | None = None
+
+        self._registry = ModelRegistry(
+            models_root=settings.models_dir,
+            emit=lambda kind, payload: self.writer.emit(kind, payload),
+        )
+        self._ensure_registry_populated()
+        # Voice enrollment mode (reuses main pipeline logic)
+        self._enroll_thread: threading.Thread | None = None
+        self._enroll_stop = threading.Event()
+        self._enroll_capture: AudioCapture | None = None
+        self._enroll_frames: list[np.ndarray] = []
+        self._enroll_device: str | None = None
 
     def serve(self, input_stream: TextIO = sys.stdin) -> int:
         self.settings.ensure_dirs()
@@ -75,6 +88,12 @@ class EngineService:
             "verify_models": self._verify_models,
             "download_models": self._download_models,
             "cancel_download": self._cancel_download,
+            "list_available_models": self._list_available_models,
+            "list_installed_models": self._list_installed_models,
+            "install_model": self._install_model,
+            "uninstall_model": self._uninstall_model,
+            "set_active_model": self._set_active_model,
+            "reload_registry": self._reload_registry,
             "start_listening": self._start_listening,
             "stop_listening": self._stop_listening,
             "set_device": self._set_device,
@@ -85,6 +104,8 @@ class EngineService:
             "reset_voice_profile": self._reset_voice_profile,
             "set_voice_learning": self._set_voice_learning,
             "capture_manual_sample": self._capture_manual_sample,
+            "start_voice_enrollment": self._start_voice_enrollment,
+            "stop_voice_enrollment": self._stop_voice_enrollment,
             "list_segments": self._list_segments,
             "delete_segment": self._delete_segment,
             "delete_all_segments": self._delete_all_segments,
@@ -135,18 +156,20 @@ class EngineService:
         self.writer.emit("device_list", {"devices": devices}, request.request_id)
 
     def _verify_models(self, request: EngineRequest) -> None:
-        checks = verify_models(self.settings.models)
-        models = [
-            {"key": item.key, "path": str(item.path), "ready": item.ok, "errors": list(item.errors)}
-            for item in checks
-        ]
+        """使用 Registry 校验所有模型状态。"""
+        statuses = self._registry.get_all_slot_status()
         self.writer.emit(
             "model_status",
-            {"status": "ready" if all(item.ok for item in checks) else "missing", "models": models},
+            {
+                "status": "ready" if self._registry.are_all_slots_ready() else "missing",
+                "models": statuses,
+                "all_ready": self._registry.are_all_slots_ready(),
+            },
             request.request_id,
         )
 
     def _download_models(self, request: EngineRequest) -> None:
+        """批量下载旧4个模型（向后兼容）。"""
         if self._download_thread and self._download_thread.is_alive():
             raise RuntimeError("模型下载已在进行")
         self._download_cancel = threading.Event()
@@ -170,6 +193,139 @@ class EngineService:
 
     def _cancel_download(self, request: EngineRequest) -> None:
         self._download_cancel.set()
+        self._registry.cancel_download()
+        self._ack(request)
+
+    # ── 新 Registry 管理端点 ──────────────────────────────────────
+
+    def _list_available_models(self, request: EngineRequest) -> None:
+        catalog = get_catalog()
+        models_list = []
+        for key, defn in catalog.items():
+            models_list.append({
+                "key": key,
+                "name": defn.name,
+                "type": defn.type.value,
+                "source": defn.source.value,
+                "description": defn.description,
+                "needs_tokens": defn.needs_tokens,
+                "needs_seg_dict": defn.needs_seg_dict,
+                "estimated_size_bytes": defn.estimated_size_bytes,
+                "min_memory_gb": defn.min_memory_gb,
+            })
+        self.writer.emit("available_models", {"models": models_list}, request.request_id)
+
+    def _list_installed_models(self, request: EngineRequest) -> None:
+        self._list_installed_models_impl(request.request_id)
+
+    def _list_installed_models_impl(self, request_id: str | None = None) -> None:
+        statuses = self._registry.get_all_slot_status()
+        installed = self._registry.list_installed()
+        installed_list = []
+        for key, mod in installed.items():
+            status = self._registry.get_slot_status(
+                next((s for s, a in self._registry.list_slot_assignments().items() if a.model_key == key), "")
+            ) if any(a.model_key == key for a in self._registry.list_slot_assignments().values()) else None
+            installed_list.append({
+                "key": key,
+                "local_path": mod.local_path,
+                "installed_at": mod.installed_at,
+                "size_bytes": mod.size_bytes,
+                "ready": status["ready"] if status else False,
+                "path": status["path"] if status else None,
+                "errors": status["errors"] if status else ["未知状态"],
+            })
+        assignments = self._registry.list_slot_assignments()
+        slot_list = [
+            {
+                "slot": slot,
+                "model_key": a.model_key,
+                "enabled": a.enabled,
+                "status": self._registry.get_slot_status(slot),
+            }
+            for slot, a in assignments.items()
+        ]
+        self.writer.emit("installed_models", {
+            "installed": installed_list,
+            "slots": slot_list,
+            "all_ready": self._registry.are_all_slots_ready(),
+        }, request_id)
+
+    def _install_model(self, request: EngineRequest) -> None:
+        model_key = request.payload.get("model_key")
+        if not model_key:
+            raise RuntimeError("缺少 model_key 参数")
+        if self._download_thread and self._download_thread.is_alive():
+            raise RuntimeError("已有下载任务在进行")
+        self._registry.cancel_download()
+
+        def run() -> None:
+            try:
+                self._registry.install_model(model_key)
+                self.writer.emit("model_install_status", {
+                    "key": model_key,
+                    "status": "ready",
+                })
+            except Exception as exc:
+                is_cancelled = "取消" in str(exc)
+                self.writer.emit("model_install_status", {
+                    "key": model_key,
+                    "status": "cancelled" if is_cancelled else "error",
+                    "error": str(exc),
+                })
+                if not is_cancelled:
+                    self.writer.error(str(exc), request.request_id, "model_install_failed")
+            finally:
+                # Refresh lists after install completes/fails
+                self._list_installed_models_impl()
+
+        self._download_thread = threading.Thread(target=run, name=f"ev-install-{model_key}", daemon=True)
+        self._download_thread.start()
+        self._ack(request)
+
+    def _cancel_download(self, request: EngineRequest) -> None:
+        self._download_cancel.set()
+        self._registry.cancel_download()
+        self._ack(request)
+
+    def _uninstall_model(self, request: EngineRequest) -> None:
+        model_key = request.payload.get("model_key")
+        if not model_key:
+            raise RuntimeError("缺少 model_key 参数")
+        self._registry.uninstall_model(model_key)
+        self._list_installed_models_impl()
+        # Trigger final ASR reload if the running worker exists
+        if self._segment_worker is not None:
+            self._segment_worker.reload_final_asr()
+        self._ack(request)
+
+    def _set_active_model(self, request: EngineRequest) -> None:
+        slot = request.payload.get("slot")
+        raw_key = request.payload.get("model_key")
+        if not slot:
+            raise RuntimeError("缺少 slot 参数")
+        # Normalize: empty string means unassign
+        model_key = raw_key if (raw_key and raw_key != "") else None
+        self._registry.set_active_model(slot, model_key)
+        self._list_installed_models_impl()
+        # Reload final ASR if slot affects asr_final and worker is running
+        if slot == "asr_final" and self._segment_worker is not None:
+            self._segment_worker.reload_final_asr()
+        self._ack(request)
+
+    def _reload_registry(self, request: EngineRequest) -> None:
+        """刷新注册表状态（从磁盘重新加载）。"""
+        self._registry._lock.acquire()
+        try:
+            self._registry.state = self._registry._load_state()
+        finally:
+            self._registry._lock.release()
+        statuses = self._registry.get_all_slot_status()
+        self.writer.emit("model_status", {
+            "status": "ready" if self._registry.are_all_slots_ready() else "missing",
+            "models": statuses,
+            "all_ready": self._registry.are_all_slots_ready(),
+        }, request.request_id)
         self._ack(request)
 
     def _start_listening(self, request: EngineRequest) -> None:
@@ -214,6 +370,15 @@ class EngineService:
         self._emit_state(request.request_id)
         worker_holder: dict = {}
 
+        def resolve_final_asr_path() -> Path:
+            model = self._registry.get_active_model("asr_final")
+            if model is None:
+                # Fallback: use old settings path
+                from ..models import require_models
+                paths = require_models(self.settings.models, None)
+                return paths["asr_final"]
+            return Path(model.local_path)
+
         def run() -> None:
             try:
                 asyncio.run(
@@ -224,6 +389,7 @@ class EngineService:
                         stop_event=self._listen_stop,
                         emit=self._on_runtime_event,
                         worker_holder=worker_holder,
+                        final_asr_resolver=resolve_final_asr_path,
                     )
                 )
                 self.state = "stopped"
@@ -443,6 +609,107 @@ class EngineService:
 
         threading.Thread(target=run, name="ev-manual-enroll", daemon=True).start()
 
+    def _start_voice_enrollment(self, request: EngineRequest) -> None:
+        if self._enroll_thread and self._enroll_thread.is_alive():
+            raise RuntimeError("声纹录入已在进行中")
+        if self.state in ("loading", "listening", "speech"):
+            self._stop_listening(request)
+            self._listen_thread.join(timeout=2.0)
+        require_models(self.settings.models)
+        device = resolve_device(self.device_selector)
+        self._enroll_device = request.payload.get("device") or self.device_selector
+        self._enroll_frames = []
+        self._enroll_stop = threading.Event()
+        self._enroll_capture = AudioCapture(self.settings.audio, device=device, frame_ms=50)
+        self.writer.emit("voice_enroll_status", {"status": "recording", "level": 0.0})
+
+        def run() -> None:
+            try:
+                capture = self._enroll_capture
+                capture.start()
+                loop = asyncio.new_event_loop()
+                try:
+                    async def collect() -> None:
+                        async for frame in capture.frames():
+                            if self._enroll_stop.is_set():
+                                break
+                            self._enroll_frames.append(frame)
+                            level = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+                            level_db = 20 * float(np.log10(max(level, 1e-8)))
+                            self.writer.emit("voice_enroll_status", {
+                                "status": "recording",
+                                "level": max(0.0, min(1.0, (level_db + 60) / 60)),
+                            })
+                    loop.run_until_complete(collect())
+                finally:
+                    loop.close()
+                    capture.stop()
+            except Exception as exc:
+                LOGGER.exception("voice enrollment capture failed")
+                self.writer.emit("voice_enroll_status", {
+                    "status": "failed",
+                    "error": str(exc),
+                })
+
+        self._enroll_thread = threading.Thread(target=run, name="ev-voice-enroll", daemon=True)
+        self._enroll_thread.start()
+
+    def _stop_voice_enrollment(self, request: EngineRequest) -> None:
+        if not self._enroll_thread or not self._enroll_thread.is_alive():
+            raise RuntimeError("没有进行中的声纹录入")
+        self._enroll_stop.set()
+        self.writer.emit("voice_enroll_status", {"status": "processing"})
+
+        def run() -> None:
+            try:
+                self._enroll_thread.join(timeout=5.0)
+                frames = self._enroll_frames
+                self._enroll_frames = []
+                self._enroll_thread = None
+                if not frames:
+                    raise RuntimeError("未采集到音频")
+                audio = np.concatenate(frames)
+                sample_rate = self.settings.audio.sample_rate
+                if len(audio) < int(sample_rate * 0.5):
+                    raise RuntimeError("录入音频过短（至少需要0.5秒）")
+                paths = require_models(self.settings.models, self.settings.models.root)
+                speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
+                embedding = speaker.embed(audio, sample_rate)
+                wav_path = archive_wav(
+                    self.settings.archive_dir,
+                    "enroll-" + uuid.uuid4().hex[:12],
+                    audio,
+                    sample_rate,
+                    datetime.now(timezone.utc),
+                )
+                with Store(self.settings.db_path) as store:
+                    vp = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+                    added, added_tier = vp.add_sample(
+                        embedding=embedding,
+                        audio_path=str(wav_path),
+                        duration_ms=len(audio) * 1000 // sample_rate,
+                        score=0.95,
+                        segment_id=None,
+                        is_manual=True,
+                    )
+                self.writer.emit("voice_enroll_status", {
+                    "status": "done" if added else "failed",
+                    "added": added,
+                    "tier": added_tier,
+                }, request.request_id)
+                with Store(self.settings.db_path) as store:
+                    profile = store.profile_status()
+                profile["auto_learn"] = self._voice_auto_learn
+                self.writer.emit("profile_status", profile)
+            except Exception as exc:
+                LOGGER.exception("voice enrollment processing failed")
+                self.writer.emit("voice_enroll_status", {
+                    "status": "failed",
+                    "error": str(exc),
+                }, request.request_id)
+
+        threading.Thread(target=run, name="ev-voice-enroll-process", daemon=True).start()
+
     def _list_segments(self, request: EngineRequest) -> None:
         payload = request.payload
         with Store(self.settings.db_path) as store:
@@ -502,6 +769,11 @@ class EngineService:
         """Rebuild hotwords string from store and push to the active segment worker."""
         with Store(self.settings.db_path) as store:
             hotwords = store.get_hotwords_string()
+        word_count = len(hotwords.split()) if hotwords else 0
+        if word_count > 0:
+            logging.getLogger(__name__).info(
+                "Broadcasting %d hotwords: %s", word_count, hotwords[:200]
+            )
         if self._segment_worker is not None:
             self._segment_worker.update_hotwords(hotwords)
 
@@ -645,6 +917,24 @@ class EngineService:
             },
             request_id,
         )
+
+    def _ensure_registry_populated(self) -> None:
+        """确保注册表已从旧配置迁移/填充。"""
+        if not self._registry.list_installed():
+            # 尝试从旧配置迁移
+            try:
+                migrate_from_legacy(
+                    self._registry,
+                    old_slots={
+                        "vad": self.settings.models.vad,
+                        "asr_streaming": self.settings.models.asr_streaming,
+                        "asr_final": self.settings.models.asr_final,
+                        "speaker": self.settings.models.speaker,
+                    },
+                    old_root=self.settings.models.root,
+                )
+            except Exception:
+                LOGGER.debug("旧配置迁移失败（可能无需迁移）", exc_info=True)
 
     def _ack(self, request: EngineRequest) -> None:
         self.writer.emit("command_result", {"command": request.command, "ok": True}, request.request_id)

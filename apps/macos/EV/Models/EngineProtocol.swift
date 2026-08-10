@@ -66,6 +66,40 @@ struct AudioDevice: Identifiable, Hashable {
     }
 }
 
+struct Utterance: Identifiable, Hashable {
+    let speaker: String
+    let text: String
+    let startMs: Int
+    let endMs: Int
+
+    var id: String { "\(startMs)-\(endMs)" }
+
+    var speakerPrefix: String {
+        switch speaker {
+        case "user": return "（你）："
+        case "non-user": return "（他人）："
+        default: return ""
+        }
+    }
+
+    init?(_ value: JSONValue) {
+        guard let obj = value.object,
+              let speaker = obj["speaker"]?.string,
+              let text = obj["text"]?.string else { return nil }
+        self.speaker = speaker
+        self.text = text
+        self.startMs = Int(obj["start_ms"]?.double ?? 0)
+        self.endMs = Int(obj["end_ms"]?.double ?? 0)
+    }
+
+    init(speaker: String, text: String, startMs: Int = 0, endMs: Int = 0) {
+        self.speaker = speaker
+        self.text = text
+        self.startMs = startMs
+        self.endMs = endMs
+    }
+}
+
 struct Segment: Identifiable, Hashable {
     let id: String
     let startedAt: String
@@ -78,13 +112,38 @@ struct Segment: Identifiable, Hashable {
     let queryCandidate: Bool
     let queryText: String
     let wasCorrected: Bool
+    let utterances: [Utterance]
+    let dominantSpeaker: String
+    let containsUser: Bool
+    let sourceType: String
+
+    var isDialogue: Bool {
+        // Mixed dialogue if there are utterances from both speakers
+        let speakers = Set(utterances.map(\.speaker))
+        return speakers.count > 1
+    }
 
     var speakerDisplayLabel: String {
+        if isDialogue { return "对话" }
+        // speakerLabel is the final fused decision from full-segment embedding
+        // (more reliable than dominantSpeaker which is from noisy 600ms turns)
         switch speakerLabel {
         case "user": return "我"
         case "non-user": return "他人"
-        default: return speakerLabel
+        default:
+            switch dominantSpeaker {
+            case "user": return "我"
+            case "non-user": return "他人"
+            default: return speakerLabel
+            }
         }
+    }
+
+    var displayText: String {
+        if !utterances.isEmpty {
+            return utterances.map { "\($0.speakerPrefix)\($0.text)" }.joined(separator: "\n")
+        }
+        return transcript
     }
 
     var sortDate: String { startedAt }
@@ -104,6 +163,32 @@ struct Segment: Identifiable, Hashable {
         self.queryCandidate = object["query_candidate"]?.bool ?? (object["query_candidate"]?.double == 1)
         self.queryText = object["query_text"]?.string ?? ""
         self.wasCorrected = object["was_corrected"]?.bool ?? (object["was_corrected"]?.double == 1)
+        // Parse utterances JSON
+        if let uttsStr = object["utterances"]?.string,
+           let data = uttsStr.data(using: .utf8),
+           let jsonArr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            self.utterances = jsonArr.compactMap { dict in
+                guard let speaker = dict["speaker"] as? String,
+                      let text = dict["text"] as? String else { return nil }
+                return Utterance(
+                    speaker: speaker,
+                    text: text,
+                    startMs: dict["start_ms"] as? Int ?? 0,
+                    endMs: dict["end_ms"] as? Int ?? 0
+                )
+            }
+        } else {
+            self.utterances = []
+        }
+        self.dominantSpeaker = object["dominant_speaker"]?.string ?? self.speakerLabel
+        if let cu = object["contains_user"]?.bool {
+            self.containsUser = cu
+        } else if let cuInt = object["contains_user"]?.double {
+            self.containsUser = cuInt == 1
+        } else {
+            self.containsUser = self.speakerLabel == "user"
+        }
+        self.sourceType = object["source_type"]?.string ?? "voice"
     }
 }
 
@@ -163,6 +248,95 @@ struct ModelStatus: Identifiable, Hashable {
         self.path = object["path"]?.string ?? ""
         self.errors = object["errors"]?.array?.compactMap(\.string) ?? []
     }
+}
+
+// MARK: - Registry-based model management
+
+struct AvailableModel: Identifiable, Hashable {
+    let key: String
+    let name: String
+    let type: String
+    let source: String
+    let description: String
+    let needsTokens: Bool
+    let needsSegDict: Bool
+    let estimatedSizeBytes: Int
+    let minMemoryGb: Double
+    var id: String { key }
+
+    init?(_ value: JSONValue) {
+        guard let object = value.object, let key = object["key"]?.string else { return nil }
+        self.key = key
+        self.name = object["name"]?.string ?? key
+        self.type = object["type"]?.string ?? ""
+        self.source = object["source"]?.string ?? ""
+        self.description = object["description"]?.string ?? ""
+        self.needsTokens = object["needs_tokens"]?.bool ?? false
+        self.needsSegDict = object["needs_seg_dict"]?.bool ?? false
+        self.estimatedSizeBytes = Int(object["estimated_size_bytes"]?.double ?? 0)
+        self.minMemoryGb = object["min_memory_gb"]?.double ?? 0
+    }
+}
+
+struct InstalledModel: Identifiable, Hashable {
+    let key: String
+    let localPath: String
+    let installedAt: String
+    let sizeBytes: Int
+    let ready: Bool
+    let path: String?
+    let errors: [String]
+    var id: String { key }
+
+    init?(_ value: JSONValue) {
+        guard let object = value.object, let key = object["key"]?.string else { return nil }
+        self.key = key
+        self.localPath = object["local_path"]?.string ?? ""
+        self.installedAt = object["installed_at"]?.string ?? ""
+        self.sizeBytes = Int(object["size_bytes"]?.double ?? 0)
+        self.ready = object["ready"]?.bool ?? false
+        self.path = object["path"]?.string
+        self.errors = object["errors"]?.array?.compactMap(\.string) ?? []
+    }
+}
+
+struct SlotAssignment: Identifiable, Hashable {
+    let slot: String
+    var modelKey: String?
+    var enabled: Bool
+    var status: SlotStatus
+    var id: String { slot }
+
+    init?(_ value: JSONValue) {
+        guard let object = value.object, let slot = object["slot"]?.string else { return nil }
+        self.slot = slot
+        self.modelKey = object["model_key"]?.string
+        self.enabled = object["enabled"]?.bool ?? true
+        self.status = SlotStatus(object["status"] ?? .null)
+    }
+}
+
+struct SlotStatus: Hashable {
+    var ready: Bool
+    var path: String?
+    var errors: [String]
+    var modelName: String?
+
+    init(_ value: JSONValue) {
+        guard let object = value.object else {
+            self.ready = false
+            self.path = nil
+            self.errors = ["未配置模型"]
+            self.modelName = nil
+            return
+        }
+        self.ready = object["ready"]?.bool ?? false
+        self.path = object["path"]?.string
+        self.errors = object["errors"]?.array?.compactMap(\.string) ?? []
+        self.modelName = object["model_name"]?.string
+    }
+
+    static let empty = SlotStatus(.null)
 }
 
 struct VoiceSample: Identifiable, Hashable {

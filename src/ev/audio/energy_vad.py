@@ -87,6 +87,13 @@ class EnergyVAD:
     def last_snr_linear(self) -> float:
         return self._last_snr_linear
 
+    @property
+    def silence_ms(self) -> float:
+        """How many ms of consecutive silence while active (0 if not active or still speaking)."""
+        if not self._active:
+            return 0.0
+        return self._silence_streak * self._frame_ms
+
     # --- 核心处理 ---
 
     def _update_floor(self, rms: float) -> None:

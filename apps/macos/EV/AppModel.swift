@@ -75,6 +75,8 @@ final class AppModel: ObservableObject {
     /// 选中的设备名；空串 = 使用系统默认
     @Published var selectedDevice = AppModel.systemDefaultDeviceTag
     @Published var audioLevel = 0.0
+    @Published var rawRmsDb: Double = -100.0   // 原始(预处理前) RMS dBFS, 调试远场用
+    @Published var agcGain: Double = 1.0       // 当前 AGC 增益倍数
 
     /// 设备选择 Picker 显示用: 「系统默认」 + 真实设备列表
     var devicePickerItems: [(tag: String, label: String, isDefault: Bool)] {
@@ -108,16 +110,29 @@ final class AppModel: ObservableObject {
     @Published var queries: [QueryItem] = []
     @Published var historyItems: [HistoryItem] = []
     @Published var models: [ModelStatus] = []
+    @Published var availableModels: [AvailableModel] = []
+    @Published var installedModels: [InstalledModel] = []
+    @Published var slotAssignments: [SlotAssignment] = []
     @Published var runtimeReady = false
     @Published var runtimeLabel = "检查中"
     @Published var downloadProgress = 0.0
     @Published var downloadLabel = ""
+    @Published var downloadingKey: String?
+    @Published var downloadProgressByKey: [String: Double] = [:]
+    @Published var downloadStageByKey: [String: String] = [:]
+    @Published var downloadMessageByKey: [String: String] = [:]
+    @Published var downloadSizeByKey: [String: Int64] = [:]
+    @Published var downloadSpeedByKey: [String: Double] = [:]
+    @Published var downloadIndeterminateByKey: [String: Bool] = [:]
+    @Published var downloadSourceByKey: [String: String] = [:]
     @Published var voiceProfile = VoiceProfileState.empty
     @Published var voiceSamples: [VoiceSample] = []
     @Published var lexiconWords: [LexiconItem] = []
     @Published var manualEnrollStatus = "idle" // idle, recording, processing, done, failed
     @Published var manualEnrollError: String?
     @Published var manualEnrollDuration: Double = 3.0
+    @Published var enrollStatus = "idle" // idle, recording, processing, done, failed
+    @Published var enrollLevel: Double = 0.0
     @Published var errorMessage: String?
     @Published var lastEngineLog = ""
     @Published var speakerFilter = ""
@@ -159,7 +174,9 @@ final class AppModel: ObservableObject {
     }
 
     var allModelsReady: Bool {
-        models.count == 4 && models.allSatisfy(\.ready)
+        let activeAssignments = slotAssignments.filter(\.enabled)
+        guard !activeAssignments.isEmpty else { return false }
+        return activeAssignments.allSatisfy(\.status.ready)
     }
 
     var isProcessing: Bool { !processingSegmentIDs.isEmpty }
@@ -286,6 +303,8 @@ final class AppModel: ObservableObject {
         engine.send("get_status")
         engine.send("list_devices")
         engine.send("verify_models")
+        engine.send("list_available_models")
+        engine.send("list_installed_models")
         loadHistory()
         loadVoiceSamples()
         loadLexicon()
@@ -389,6 +408,42 @@ final class AppModel: ObservableObject {
         engine.send("cancel_download")
     }
 
+    func refreshModelCatalog() {
+        engine.send("list_available_models")
+        engine.send("list_installed_models")
+    }
+
+    func installModel(key: String) {
+        downloadingKey = key
+        downloadProgressByKey[key] = 0
+        downloadStageByKey[key] = "listing"
+        downloadMessageByKey[key] = "正在连接..."
+        downloadSizeByKey[key] = 0
+        downloadSpeedByKey[key] = 0
+        downloadIndeterminateByKey[key] = true
+        downloadSourceByKey[key] = ""
+        engine.send("install_model", payload: ["model_key": key])
+    }
+
+    func uninstallModel(key: String) {
+        engine.send("uninstall_model", payload: ["model_key": key])
+    }
+
+    func setActiveModel(slot: String, modelKey: String?) {
+        engine.send("set_active_model", payload: [
+            "slot": slot,
+            "model_key": modelKey ?? ""
+        ])
+    }
+
+    func reloadRegistry() {
+        engine.send("reload_registry")
+    }
+
+    func goToModels() {
+        NotificationCenter.default.post(name: NSNotification.Name("goModels"), object: nil)
+    }
+
     func loadVoiceSamples() {
         engine.send("list_voice_samples", payload: ["limit": 50])
     }
@@ -446,6 +501,22 @@ final class AppModel: ObservableObject {
         manualEnrollStatus = "recording"
         manualEnrollError = nil
         engine.send("capture_manual_sample", payload: ["duration_sec": manualEnrollDuration])
+    }
+
+    var isEnrolling: Bool {
+        enrollStatus == "recording" || enrollStatus == "processing"
+    }
+
+    func startVoiceEnrollment() {
+        guard !isEnrolling else { return }
+        enrollStatus = "recording"
+        enrollLevel = 0.0
+        engine.send("start_voice_enrollment")
+    }
+
+    func stopVoiceEnrollment() {
+        guard enrollStatus == "recording" else { return }
+        engine.send("stop_voice_enrollment")
     }
 
     func saveThresholds() {
@@ -538,7 +609,12 @@ final class AppModel: ObservableObject {
         switch event.type {
         case "engine_state":
             engineState = EngineState(rawValue: event.payload["state"]?.string ?? "stopped") ?? .error
-            if engineState == .stopped || engineState == .error { captureReady = false }
+            if engineState == .stopped || engineState == .error {
+                captureReady = false
+                audioLevel = 0
+                rawRmsDb = -100
+                agcGain = 1.0
+            }
             if event.requestID == nil && !didInitialRefresh {
                 didInitialRefresh = true
                 refreshAll()
@@ -564,6 +640,12 @@ final class AppModel: ObservableObject {
             completeOnboardingIfNeeded()
         case "audio_level":
             audioLevel = min(max((event.payload["rms"]?.double ?? 0) * 10, 0), 1)
+            if let rawRms = event.payload["raw_rms"]?.double, rawRms > 0 {
+                rawRmsDb = 20.0 * log10(max(rawRms, 1e-7))
+            } else {
+                rawRmsDb = -100
+            }
+            agcGain = event.payload["gain"]?.double ?? 1.0
         case "capture_started":
             captureReady = true
         case "speech_started":
@@ -619,14 +701,60 @@ final class AppModel: ObservableObject {
                 }
                 completeOnboardingIfNeeded()
             }
+        case "available_models":
+            availableModels = event.payload["models"]?.array?.compactMap(AvailableModel.init) ?? []
+        case "installed_models":
+            installedModels = event.payload["installed"]?.array?.compactMap(InstalledModel.init) ?? []
+            slotAssignments = event.payload["slots"]?.array?.compactMap(SlotAssignment.init) ?? []
+            if event.payload["all_ready"]?.bool != nil {
+                completeOnboardingIfNeeded()
+            }
         case "runtime_status":
             runtimeReady = event.payload["ready"]?.bool ?? false
             runtimeLabel = runtimeReady ? "FunASR 与 PyTorch 已安装" : "缺少 FunASR 或 PyTorch（开发版需在 .venv 安装）"
         case "download_progress":
-            let downloaded = event.payload["total_downloaded"]?.double ?? 0
-            let total = event.payload["total_size"]?.double ?? 1
-            downloadProgress = total > 0 ? downloaded / total : 0
-            downloadLabel = event.payload["key"]?.string ?? ""
+            let key = event.payload["key"]?.string ?? ""
+            let total = event.payload["size"]?.double ?? event.payload["total_size"]?.double ?? 1
+            let downloaded = event.payload["downloaded"]?.double ?? 0
+            let stage = event.payload["stage"]?.string ?? "downloading"
+            let message = event.payload["message"]?.string ?? ""
+            let speed = event.payload["speed"]?.double ?? 0
+            let indeterminate = event.payload["indeterminate"]?.bool ?? false
+            let source = event.payload["source"]?.string ?? ""
+            let progress = total > 0 ? min(downloaded / total, 1.0) : 0
+            if !key.isEmpty {
+                downloadProgressByKey[key] = progress
+                downloadStageByKey[key] = stage
+                if !message.isEmpty {
+                    downloadMessageByKey[key] = message
+                }
+                downloadSizeByKey[key] = Int64(total)
+                downloadSpeedByKey[key] = speed
+                downloadIndeterminateByKey[key] = indeterminate
+                if !source.isEmpty {
+                    downloadSourceByKey[key] = source
+                }
+                downloadingKey = key
+            } else {
+                downloadProgress = progress
+            }
+            downloadLabel = key.isEmpty ? (downloadLabel) : key
+        case "model_install_status":
+            if let status = event.payload["status"]?.string {
+                if status == "ready" || status == "error" || status == "removed" || status == "cancelled" {
+                    if let key = event.payload["key"]?.string {
+                        downloadingKey = nil
+                        downloadProgressByKey.removeValue(forKey: key)
+                        downloadStageByKey.removeValue(forKey: key)
+                        downloadMessageByKey.removeValue(forKey: key)
+                        downloadSizeByKey.removeValue(forKey: key)
+                        downloadSpeedByKey.removeValue(forKey: key)
+                        downloadIndeterminateByKey.removeValue(forKey: key)
+                        downloadSourceByKey.removeValue(forKey: key)
+                    }
+                    refreshModelCatalog()
+                }
+            }
         case "profile_status":
             voiceProfile = VoiceProfileState(.object(event.payload))
             if let autoLearn = event.payload["auto_learn"]?.bool {
@@ -650,6 +778,19 @@ final class AppModel: ObservableObject {
                     if self?.manualEnrollStatus == status {
                         self?.manualEnrollStatus = "idle"
                         self?.manualEnrollError = nil
+                    }
+                }
+            }
+        case "voice_enroll_status":
+            let status = event.payload["status"]?.string ?? "failed"
+            enrollStatus = status
+            if let level = event.payload["level"]?.double {
+                enrollLevel = level
+            }
+            if status == "done" || status == "failed" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    if self?.enrollStatus == status {
+                        self?.enrollStatus = "idle"
                     }
                 }
             }

@@ -97,6 +97,21 @@ struct ActivityStatusView: View {
         VStack(spacing: 10) {
             WaveformView(audioLevel: model.audioLevel, state: model.engineState)
                 .frame(height: 42)
+            // 远场调试读数: 原始 dBFS + AGC 增益; 非监听态显示占位
+            HStack(spacing: 10) {
+                if model.isListening {
+                    Text(String(format: "%.0f dB", model.rawRmsDb))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(rawDbColor)
+                    Text(String(format: "×%.1f", model.agcGain))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("—")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
             Text(model.activityTitle).font(.headline)
             Text(model.activityDetail)
                 .font(.caption)
@@ -113,6 +128,13 @@ struct ActivityStatusView: View {
         }
         .padding(.horizontal, 24)
         .frame(maxWidth: .infinity, minHeight: 190, alignment: .center)
+    }
+
+    /// 原始音量颜色: >= -48dB 白色(正常); -60~-48 橙色(太轻, 可能录不上); < -60 灰色(基本没声)
+    private var rawDbColor: Color {
+        if model.rawRmsDb >= -48 { return .primary }
+        if model.rawRmsDb >= -60 { return .orange }
+        return .secondary
     }
 }
 
@@ -158,9 +180,20 @@ struct SegmentRow: View {
             .disabled(!audioFileExists)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text(segment.transcript.isEmpty ? "（无转写）" : segment.transcript)
-                    .lineLimit(3)
-                    .textSelection(.enabled)
+                Group {
+                    if segment.utterances.isEmpty {
+                        Text(cleanPrefix(from: segment.transcript).isEmpty ? "（无转写）" : cleanPrefix(from: segment.transcript))
+                            .lineLimit(3)
+                    } else {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(segment.utterances) { utt in
+                                Text(cleanPrefix(from: utt.text))
+                            }
+                        }
+                        .lineLimit(6)
+                    }
+                }
+                .textSelection(.enabled)
                 HStack(spacing: 10) {
                     Text(segment.speakerDisplayLabel)
                     Text(String(format: "%.1f 秒", Double(segment.durationMS) / 1000))
@@ -239,9 +272,20 @@ struct HistoryRow: View {
             .disabled(!audioFileExists)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text(segment.transcript.isEmpty ? "（无转写）" : segment.transcript)
-                    .lineLimit(3)
-                    .textSelection(.enabled)
+                Group {
+                    if segment.utterances.isEmpty {
+                        Text(cleanPrefix(from: segment.transcript).isEmpty ? "（无转写）" : cleanPrefix(from: segment.transcript))
+                            .lineLimit(3)
+                    } else {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(segment.utterances) { utt in
+                                Text(cleanPrefix(from: utt.text))
+                            }
+                        }
+                        .lineLimit(6)
+                    }
+                }
+                .textSelection(.enabled)
                 HStack(spacing: 10) {
                     Text(segment.speakerDisplayLabel)
                     Text(String(format: "%.1f 秒", Double(segment.durationMS) / 1000))
@@ -403,4 +447,16 @@ struct ChecklistRow: View {
             Spacer()
         }
     }
+}
+
+private func cleanPrefix(from text: String) -> String {
+    var result = text
+    let prefixes = ["（你）：", "（他人）：", "(你)：", "(他人)："]
+    for prefix in prefixes {
+        if result.hasPrefix(prefix) {
+            result.removeFirst(prefix.count)
+            break
+        }
+    }
+    return result.trimmingCharacters(in: .whitespaces)
 }

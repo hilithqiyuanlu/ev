@@ -2,101 +2,408 @@ import SwiftUI
 
 struct ModelsView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var selectedTab: ModelTab = .library
+    @State private var modelToDelete: AvailableModel?
 
-    private let names = [
-        "vad": "FSMN-VAD",
-        "asr_streaming": "Paraformer Streaming",
-        "asr_final": "Paraformer Large",
-        "speaker": "ERes2NetV2",
+    private enum ModelTab: String, CaseIterable, Identifiable {
+        case library = "模型库"
+        case slots = "槽位分配"
+        var id: String { rawValue }
+    }
+
+    private let typeNames: [String: String] = [
+        "vad": "VAD",
+        "asr_streaming": "流式 ASR",
+        "asr_final": "终稿 ASR",
+        "speaker": "声纹",
+    ]
+
+    private let slotNames: [String: String] = [
+        "vad": "语音活动检测",
+        "asr_streaming": "流式识别",
+        "asr_final": "终稿识别",
+        "speaker": "声纹识别",
     ]
 
     var body: some View {
-        CenteredPage(maxWidth: 760) {
+        ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                HStack(spacing: 16) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(model.allModelsReady ? "模型已就绪" : "需要准备模型")
-                            .font(.title2.bold())
-                        Text("固定版本 models-v0.1.0 · 约 1.82 GB")
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        if model.allModelsReady { model.verifyModels() }
-                        else { model.downloadModels() }
-                    } label: {
-                        Label(
-                            model.allModelsReady ? "重新校验" : "下载模型",
-                            systemImage: model.allModelsReady ? "checkmark.arrow.trianglehead.counterclockwise" : "arrow.down.circle"
-                        )
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
+                headerSection
+                filterBar
 
-                if model.downloadProgress > 0 && model.downloadProgress < 1 {
-                    VStack(alignment: .leading, spacing: 7) {
-                        ProgressView(value: model.downloadProgress)
-                        HStack {
-                            Text("\(model.downloadLabel) · \(Int(model.downloadProgress * 100))%")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Button("取消", role: .cancel) { model.cancelDownload() }
-                        }
-                    }
-                }
-
-                Divider()
-
-                StatusRow(
-                    title: "Python 运行时",
-                    detail: model.runtimeLabel,
-                    ready: model.runtimeReady
-                )
-
-                Divider()
-
-                if model.models.isEmpty {
-                    ContentUnavailableView("尚未检查模型", systemImage: "shippingbox")
-                        .frame(maxWidth: .infinity, minHeight: 260, alignment: .center)
-                } else {
-                    VStack(spacing: 0) {
-                        ForEach(model.models) { item in
-                            StatusRow(
-                                title: names[item.key] ?? item.key,
-                                detail: item.errors.isEmpty ? item.path : item.errors.joined(separator: "，"),
-                                ready: item.ready
-                            )
-                            if item.id != model.models.last?.id { Divider() }
-                        }
-                    }
+                switch selectedTab {
+                case .library:
+                    modelLibraryContent
+                case .slots:
+                    slotAssignmentContent
                 }
             }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .navigationTitle("模型")
+        .confirmationDialog(
+            "卸载模型",
+            isPresented: Binding(
+                get: { modelToDelete != nil },
+                set: { if !$0 { modelToDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: modelToDelete
+        ) { item in
+            Button("卸载 \(item.name)", role: .destructive) {
+                model.uninstallModel(key: item.key)
+                modelToDelete = nil
+            }
+            Button("取消", role: .cancel) {
+                modelToDelete = nil
+            }
+        } message: { item in
+            Text("将删除本地模型文件并释放其槽位绑定。此操作不可撤销。")
+        }
+        .onAppear {
+            model.refreshModelCatalog()
+        }
     }
-}
 
-private struct StatusRow: View {
-    let title: String
-    let detail: String
-    let ready: Bool
+    // MARK: - Header
 
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(ready ? .green : .orange)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.headline)
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .textSelection(.enabled)
+    private var headerSection: some View {
+        HStack(alignment: .center, spacing: 16) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(model.allModelsReady ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+                Text(model.allModelsReady ? "已就绪" : "待配置")
+                    .font(.title3.bold())
             }
             Spacer()
+            Button {
+                model.reloadRegistry()
+            } label: {
+                Label("刷新", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.bordered)
         }
-        .padding(.vertical, 10)
+    }
+
+    // MARK: - Filter Bar
+
+    private var filterBar: some View {
+        HStack(spacing: 0) {
+            ForEach(ModelTab.allCases) { tab in
+                Button {
+                    selectedTab = tab
+                } label: {
+                    Text(tab.rawValue)
+                        .font(.subheadline.weight(.medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .foregroundStyle(selectedTab == tab ? .primary : .secondary)
+                        .background(
+                            GeometryReader { _ in
+                                if selectedTab == tab {
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .fill(Color.primary.opacity(0.06))
+                                }
+                            }
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+        )
+        .fixedSize(horizontal: true, vertical: true)
+    }
+
+    // MARK: - Model Library
+
+    private var modelLibraryContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if model.availableModels.isEmpty {
+                EmptyStateView("尚未加载模型目录", systemImage: "shippingbox")
+                    .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+            } else {
+                let installedKeys = Set(model.installedModels.map(\.key))
+                let grouped = Dictionary(grouping: model.availableModels) { $0.type }
+                let sortedTypes = grouped.keys.sorted { typeNames[$0, default: $0] < typeNames[$1, default: $1] }
+
+                ForEach(sortedTypes, id: \.self) { type in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(typeNames[type, default: type])
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+
+                        ForEach(grouped[type] ?? []) { item in
+                            modelRow(for: item, isInstalled: installedKeys.contains(item.key))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func modelRow(for item: AvailableModel, isInstalled: Bool) -> some View {
+        let isDownloading = model.downloadingKey == item.key
+        let progress = model.downloadProgressByKey[item.key] ?? 0
+        let stage = model.downloadStageByKey[item.key] ?? "downloading"
+        let message = model.downloadMessageByKey[item.key] ?? "正在下载..."
+        let totalSize = model.downloadSizeByKey[item.key] ?? Int64(item.estimatedSizeBytes)
+        let downloadedBytes = Int64(Double(totalSize) * progress)
+        let speed = model.downloadSpeedByKey[item.key] ?? 0
+        let isIndeterminate = model.downloadIndeterminateByKey[item.key] ?? true
+        let source = model.downloadSourceByKey[item.key] ?? item.source
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: isInstalled ? "checkmark.circle.fill" : (isDownloading ? "arrow.down.circle" : "circle"))
+                    .foregroundStyle(isInstalled ? .green : (isDownloading ? .blue : .secondary))
+                    .font(.system(size: 18))
+                    .frame(width: 20)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.name)
+                        .font(.headline)
+                    if !item.description.isEmpty {
+                        Text(item.description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    HStack(spacing: 8) {
+                        Text(source == "modelscope" ? "ModelScope" : "GitHub")
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                        if isInstalled, let installed = model.installedModels.first(where: { $0.key == item.key }) {
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(installed.sizeBytes), countStyle: .binary))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if item.estimatedSizeBytes > 0 {
+                            Text("约 \(ByteCountFormatter.string(fromByteCount: Int64(item.estimatedSizeBytes), countStyle: .binary))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if item.minMemoryGb > 0 {
+                            Text("需 \(item.minMemoryGb, specifier: "%.0f")GB 内存")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Spacer()
+
+                if isDownloading {
+                    Button("取消") {
+                        model.cancelDownload()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else if isInstalled {
+                    Button {
+                        modelToDelete = item
+                    } label: {
+                        Label("卸载", systemImage: "trash")
+                            .foregroundStyle(.red)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else {
+                    Button {
+                        model.installModel(key: item.key)
+                    } label: {
+                        Label("下载", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+
+            if isDownloading {
+                VStack(alignment: .leading, spacing: 6) {
+                    if isIndeterminate || progress <= 0.01 {
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                    } else {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                    }
+                    HStack {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if !isIndeterminate && progress > 0.01 {
+                            Text("\(ByteCountFormatter.string(fromByteCount: downloadedBytes, countStyle: .binary)) / \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .binary))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if speed > 0 {
+                                Text("• \(formatSpeed(speed))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Text("约 \(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .binary))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(isDownloading ? Color.blue.opacity(0.04) : Color.primary.opacity(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(isDownloading ? Color.blue.opacity(0.2) : Color.primary.opacity(0.04), lineWidth: 0.5)
+                )
+        )
+    }
+
+    private func stageDisplayName(_ stage: String) -> String {
+        switch stage {
+        case "listing": return "正在连接..."
+        case "downloading": return "正在下载..."
+        case "installing": return "正在安装..."
+        case "done": return "下载完成"
+        default: return "处理中..."
+        }
+    }
+
+    private func formatSpeed(_ bytesPerSec: Double) -> String {
+        if bytesPerSec < 1024 {
+            return "\(Int(bytesPerSec)) B/s"
+        } else if bytesPerSec < 1024 * 1024 {
+            return String(format: "%.1f KB/s", bytesPerSec / 1024)
+        } else {
+            return String(format: "%.1f MB/s", bytesPerSec / 1024 / 1024)
+        }
+    }
+
+    // MARK: - Slot Assignment
+
+    private var slotAssignmentContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if model.slotAssignments.isEmpty {
+                EmptyStateView("尚未加载槽位配置", systemImage: "gearshape")
+                    .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+            } else {
+                ForEach(model.slotAssignments) { assignment in
+                    slotRow(for: assignment)
+                }
+            }
+        }
+    }
+
+    private func slotRow(for assignment: SlotAssignment) -> some View {
+        let compatibleModels = model.installedModels.filter { installed in
+            guard let def = model.availableModels.first(where: { $0.key == installed.key }) else { return false }
+            return def.type == mapSlotToType(assignment.slot)
+        }
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: assignment.status.ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(assignment.status.ready ? .green : .orange)
+                    .frame(width: 20)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(slotNames[assignment.slot, default: assignment.slot])
+                        .font(.headline)
+                    if !assignment.status.ready {
+                        Text(assignment.status.errors.joined(separator: "，"))
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .lineLimit(2)
+                    }
+                }
+
+                Spacer()
+
+                if compatibleModels.isEmpty {
+                    Text("无可用模型")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .italic()
+                        .frame(width: 200, alignment: .trailing)
+                } else {
+                    let currentName = assignment.modelKey.flatMap { key in
+                        model.availableModels.first(where: { $0.key == key })?.name
+                    } ?? "未分配"
+                    
+                    Menu {
+                        Button {
+                            model.setActiveModel(slot: assignment.slot, modelKey: nil)
+                        } label: {
+                            HStack {
+                                Text("未分配")
+                                Spacer()
+                                if assignment.modelKey == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                        
+                        ForEach(compatibleModels) { installed in
+                            let name = model.availableModels.first(where: { $0.key == installed.key })?.name ?? installed.key
+                            Button {
+                                model.setActiveModel(slot: assignment.slot, modelKey: installed.key)
+                            } label: {
+                                HStack {
+                                    Text(name)
+                                    Spacer()
+                                    if assignment.modelKey == installed.key {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Text(currentName)
+                            .font(.subheadline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.secondary.opacity(0.1))
+                            )
+                            .frame(width: 200)
+                    }
+                    .menuStyle(.borderlessButton)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.primary.opacity(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
+                )
+        )
+    }
+
+    private func mapSlotToType(_ slot: String) -> String {
+        switch slot {
+        case "vad": return "vad"
+        case "asr_streaming": return "asr_streaming"
+        case "asr_final": return "asr_final"
+        case "speaker": return "speaker"
+        default: return slot
+        }
     }
 }

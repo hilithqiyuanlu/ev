@@ -167,6 +167,30 @@ class TestAGC:
         per_frame_ms = (dt / N_ITERS) * 1000.0
         assert per_frame_ms < 0.5, f"AGC too slow: {per_frame_ms:.3f}ms/frame"
 
+    def test_far_field_whisper_gets_amplified(self):
+        """远场 3m 轻中声 (RMS ~0.0025 ≈ -52dBFS) 经新参数 AGC 后应被放大到 target_rms, 增益不超过 max_gain."""
+        agc = AGC(
+            sample_rate=SR,
+            target_rms=0.08,   # 远场目标
+            max_gain=40.0,     # 远场上限 (+32dB)
+            min_gain=0.1,
+            attack_ms=10.0,
+            release_ms=400.0,  # 远场慢 release
+        )
+        # 3m 轻中声典型 RMS ≈ 0.0025 (-52dBFS), sine peak = rms*sqrt(2)
+        soft = _sine(1000.0, 0.0025 * np.sqrt(2))
+        outs = []
+        for _ in range(80):  # release 400ms, 约 13 帧/半秒, 跑 80 帧 ≈ 2.4s 让增益收敛
+            out, gain = agc.process_frame(soft)
+            outs.append(out)
+        # 取后半段统计稳态
+        tail = np.concatenate(outs[40:])
+        tail_rms = _rms(tail)
+        assert 0.05 < tail_rms < 0.11, f"far-field out_rms={tail_rms:.4f} gain={gain:.1f} (expected ~0.08)"
+        assert 8.0 < gain < 40.0, f"AGC far-field gain={gain:.1f} (expected 10-32x)"
+        # 无削波
+        assert float(np.max(np.abs(tail))) <= 0.99
+
 
 class TestNoiseGate:
     def test_tracks_floor_and_suppresses_low_snr(self):

@@ -5,17 +5,17 @@ log_level = "INFO"
 sample_rate = 16000   # ASR/声纹统一 16kHz mono
 channels = 1
 
-# 帧级预处理: DC移除 → 预加重 → AGC → 噪声门. 全部开启 + 保守参数.
+# 帧级预处理: DC移除 → 预加重 → AGC → 噪声门. 远场友好参数.
 [preprocess]
 enabled = true
 preemphasis_coeff = 0.97
-agc_target_rms = 0.05
-agc_min_gain = 0.1      # -20dB, 超大音量压限
-agc_max_gain = 20.0     # +26dB, 远场补偿
-agc_attack_ms = 10.0    # 压缩快
-agc_release_ms = 100.0  # 放大慢
+agc_target_rms = 0.08       # 远场目标响度 (0.05 → 0.08, +4dBFS)
+agc_min_gain = 0.1          # -20dB, 超大音量压限
+agc_max_gain = 40.0         # +32dB, 覆盖 3m 远场 ~20dB 物理衰减
+agc_attack_ms = 10.0        # 压缩快
+agc_release_ms = 400.0      # 放大慢 4x, 防止句中停顿增益呼吸
 noisegate_enabled = true
-noisegate_snr_db = 3.0
+noisegate_snr_db = 1.5      # 远场 SNR 本就 2-5dB, 门槛过高会砍掉轻声 (3.0 → 1.5)
 noisegate_floor_track_sec = 3.0
 
 # VAD: FSMN 模型 + 能量兜底, 组合策略 start=OR end=AND+hangover
@@ -23,12 +23,12 @@ noisegate_floor_track_sec = 3.0
 # fsmn_threshold: 注释掉或不写 = 用 FunASR FSMN 默认阈值 (保守). 需要调的话设为 0.0~1.0 的浮点数
 # fsmn_threshold = 0.3
 energy_vad_enabled = true
-energy_snr_linear = 2.5  # 4dB SNR 判定语音
-energy_abs_min_rms = 0.001  # ~-60dBFS 绝对下限, 防止静音误触发
-energy_start_frames = 2   # 60ms
-energy_hangover_frames = 20  # 600ms
-combine_start_mode = "or"      # "or" / "fsmn_only" / "energy_only"
-combine_end_mode = "and"       # "and" / "fsmn_only" / "energy_only"
+energy_snr_linear = 1.8     # ~2.5dB, 远场轻声能触发 (2.5 → 1.8)
+energy_abs_min_rms = 0.0003 # ~-70dBFS, 3m 轻声 ~-66dBFS 能进来 (0.001 → 0.0003)
+energy_start_frames = 2     # 60ms
+energy_hangover_frames = 20 # 600ms
+combine_start_mode = "or"   # "or" / "fsmn_only" / "energy_only"
+combine_end_mode = "and"    # "and" / "fsmn_only" / "energy_only"
 
 [paths]
 data_dir = "data"     # 相对项目根目录;存模型权重、语音存档、SQLite、日志

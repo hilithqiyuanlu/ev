@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,21 +15,57 @@ _SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]+\|>")
 _TIMESTAMP_RE = re.compile(r"\(\d+(\.\d+)?-\d+(\.\d+)?\)")
 
 
+@dataclass
+class TranscriptionSegment:
+    """A sentence/utterance-level segment from ASR with optional timestamps.
+
+    When start_ms/end_ms are 0 (not provided by the model), alignment falls back
+    to proportional character mapping.
+    """
+    text: str
+    start_ms: int = 0
+    end_ms: int = 0
+
+
+@dataclass
+class TranscriptionResult:
+    """Structured result from final ASR transcription.
+
+    text:        full cleaned transcript string
+    segments:    sentence-level segments with timestamps (empty if model doesn't support them)
+    language:    detected language code (if model provides it)
+    confidence:  average confidence (if model provides it, else None)
+    """
+    text: str
+    segments: list[TranscriptionSegment] = field(default_factory=list)
+    language: str | None = None
+    confidence: float | None = None
+
+    @property
+    def has_timestamps(self) -> bool:
+        return bool(self.segments) and any(s.end_ms > 0 for s in self.segments)
+
+
 def _find_model_root(path: str) -> Path:
-    """Find the actual model directory containing configuration.json.
+    """Find the actual model directory containing config files.
 
     Handles cases where tar extraction creates a nested directory
     (e.g. ev-paraformer-zh-16k/ev-paraformer-zh-16k/).
+    Looks for FunASR (configuration.json/config.yaml) or HF (config.json) markers.
     """
     root = Path(path).expanduser().resolve()
     if not root.exists():
         return root
-    if (root / "configuration.json").exists():
-        return root
-    # Single-level nesting: look for subdirectory containing configuration.json
+    _CONFIG_MARKERS = ("configuration.json", "config.yaml", "config.json")
+    for marker in _CONFIG_MARKERS:
+        if (root / marker).exists():
+            return root
+    # Single-level nesting: look for subdirectory containing a config marker
     for child in root.iterdir():
-        if child.is_dir() and (child / "configuration.json").exists():
-            return child
+        if child.is_dir():
+            for marker in _CONFIG_MARKERS:
+                if (child / marker).exists():
+                    return child
     return root
 
 
@@ -103,6 +141,33 @@ class _FunASR:
                 options["model_revision"] = revision
             self.model = AutoModel(**options)
 
+    def unload(self) -> None:
+        """Release model resources. Safe to call multiple times."""
+        import gc
+
+        if self.model is not None:
+            try:
+                # FunASR AutoModel may hold onnxruntime sessions
+                if hasattr(self.model, "model"):
+                    try:
+                        del self.model.model
+                    except Exception:
+                        pass
+                # Try to close any onnxruntime inference sessions
+                for attr_name in dir(self.model):
+                    if attr_name.startswith("_"):
+                        continue
+                    try:
+                        attr = getattr(self.model, attr_name, None)
+                        if attr is not None and hasattr(attr, "close"):
+                            attr.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.model = None
+        gc.collect()
+
 
 class StreamingASRAdapter(_FunASR):
     CHUNK_SIZE = [0, 10, 5]
@@ -150,6 +215,12 @@ class StreamingASRAdapter(_FunASR):
         self._buffer = np.empty(0, dtype=np.float32)
         self._pieces = []
 
+    def unload(self) -> None:
+        self.cache.clear()
+        self._buffer = np.empty(0, dtype=np.float32)
+        self._pieces = []
+        super().unload()
+
 
 class FinalASRAdapter(_FunASR):
     def __init__(self, model_path: str, model: Any | None = None):
@@ -168,7 +239,7 @@ class FinalASRAdapter(_FunASR):
         audio: np.ndarray,
         sample_rate: int = 16000,
         hotword: str = "",
-    ) -> str:
+    ) -> TranscriptionResult:
         kwargs: dict[str, Any] = {
             "input": audio,
             "sampling_rate": sample_rate,
@@ -178,8 +249,14 @@ class FinalASRAdapter(_FunASR):
         }
         if hotword:
             kwargs["hotword"] = hotword
+            logging.getLogger(__name__).debug(
+                "FinalASR hotwords (%d words): %s",
+                len(hotword.split()),
+                hotword[:100],
+            )
         result = self.model.generate(**kwargs)
-        return _text(result)
+        text = _text(result)
+        return TranscriptionResult(text=text)
 
 
 class SpeakerEmbeddingAdapter(_FunASR):

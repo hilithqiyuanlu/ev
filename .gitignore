@@ -20,3 +20,6 @@ apps/macos/.build/
 
 # IDE
 .trae/
+
+# nodeterm 画布本地状态
+.nodeterm/

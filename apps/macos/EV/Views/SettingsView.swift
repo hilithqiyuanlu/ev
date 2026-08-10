@@ -231,15 +231,43 @@ struct SettingsView: View {
                 Text("自动学习")
                     .font(.subheadline)
                 Spacer()
-                Menu {
-                    Button("录制 2 秒") { model.manualEnrollDuration = 2.0; model.captureManualSample() }
-                    Button("录制 3 秒") { model.manualEnrollDuration = 3.0; model.captureManualSample() }
-                    Button("录制 5 秒") { model.manualEnrollDuration = 5.0; model.captureManualSample() }
-                } label: {
-                    Label(manualEnrollButtonText, systemImage: manualEnrollIcon)
-                        .foregroundStyle(manualEnrollColor)
+
+                if model.enrollStatus == "recording" {
+                    HStack(spacing: 10) {
+                        enrollWaveform
+                        Button {
+                            model.stopVoiceEnrollment()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "stop.circle.fill")
+                                Text("完成录入")
+                                    .fontWeight(.medium)
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.red, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    Button {
+                        model.startVoiceEnrollment()
+                    } label: {
+                        Label("添加样本", systemImage: "plus.circle")
+                    }
+                    .tint(.accentColor)
+                    .disabled(model.enrollStatus == "processing")
                 }
-                .disabled(model.manualEnrollStatus == "recording" || model.manualEnrollStatus == "processing")
+
+                if model.enrollStatus == "done" {
+                    Label("已添加", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else if model.enrollStatus == "failed" {
+                    Label("失败，重试", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+
                 Button {
                     model.loadVoiceSamples()
                     showVoiceSamples = true
@@ -260,33 +288,18 @@ struct SettingsView: View {
         }
     }
 
-    private var manualEnrollButtonText: String {
-        switch model.manualEnrollStatus {
-        case "recording": return "录制中..."
-        case "processing": return "处理中..."
-        case "done": return "已添加"
-        case "failed": return "失败，重试"
-        default: return "手动添加样本"
+    private var enrollWaveform: some View {
+        HStack(alignment: .center, spacing: 3) {
+            ForEach(0..<5, id: \.self) { index in
+                let base = max(0.05, model.enrollLevel + Double(index - 2) * 0.15)
+                let height = max(3, min(24, base * 30))
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.red.opacity(0.7))
+                    .frame(width: 4, height: height)
+                    .animation(.easeOut(duration: 0.1), value: model.enrollLevel)
+            }
         }
-    }
-
-    private var manualEnrollIcon: String {
-        switch model.manualEnrollStatus {
-        case "recording": return "record.circle"
-        case "processing": return "gearshape.2"
-        case "done": return "checkmark.circle"
-        case "failed": return "exclamationmark.triangle"
-        default: return "plus.circle"
-        }
-    }
-
-    private var manualEnrollColor: Color {
-        switch model.manualEnrollStatus {
-        case "recording": return .red
-        case "done": return .green
-        case "failed": return .orange
-        default: return .accentColor
-        }
+        .frame(width: 32, height: 28)
     }
 
     private var voiceStatusBadge: some View {

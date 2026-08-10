@@ -15,10 +15,11 @@ def archive_wav(
     audio: np.ndarray,
     sample_rate: int,
     started_at: datetime,
+    suffix: str = "",
 ) -> Path:
     day_dir = archive_root / started_at.astimezone().strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    path = day_dir / f"{segment_id}.wav"
+    path = day_dir / f"{segment_id}{suffix}.wav"
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
     with wave.open(str(path), "wb") as wav:

@@ -16,6 +16,10 @@ _PREFIX_GREETINGS = (
     "嗨", "喂", "哎", "诶", "噢", "哦",
 )
 
+# ASR 常把"嗨"转写成英文/拼音问候（如 "hi 小易"、"hai 小易"）。需大小写不敏感剥离，
+# 但要求后随边界（空白/标点/CJK），避免误剥 "history"、"hey" 之外以同样字母开头的普通词。
+_EN_PREFIX_GREETINGS = ("hi", "hai", "hay", "hey", "hei")
+
 _SMALL_E_HOMOPHONES = (
     # Common ASR misrecognitions for "小E" - kept minimal to avoid false triggers
     # Only includes characters that:
@@ -46,6 +50,11 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def _is_cjk_char(ch: str) -> bool:
+    """Whether a single character is CJK (used for English greeting word boundary)."""
+    return "一" <= ch <= "鿿"
+
+
 def _strip_leading_greetings(text: str) -> tuple[str, bool]:
     """Strip leading greeting words (嗨/喂/哎 etc.) even when directly followed by wake word without space."""
     stripped = text.lstrip()
@@ -59,6 +68,19 @@ def _strip_leading_greetings(text: str) -> tuple[str, bool]:
                 had_greeting = True
                 changed = True
                 break
+        if changed:
+            continue
+        # English/拼音 greetings: case-insensitive, require a boundary after
+        # (whitespace / punctuation / CJK) so we don't clip words like "history".
+        low = stripped.casefold()
+        for egreet in _EN_PREFIX_GREETINGS:
+            if low.startswith(egreet):
+                after = stripped[len(egreet):]
+                if not after or after[0].isspace() or _is_cjk_char(after[0]) or after[0] in "，。！？、；：,.!?;：":
+                    stripped = after.lstrip(" ，。！？、；：,.!?;:")
+                    had_greeting = True
+                    changed = True
+                    break
     return stripped, had_greeting
 
 
@@ -134,4 +156,63 @@ def decide_query(
         candidate,
         wake.query_text if candidate else None,
         wake.had_leading_filler,
+    )
+
+
+def decide_query_from_utterances(
+    utterances: list[dict],
+    aliases: tuple[str, ...] = ("小E",),
+    profile_ready: bool = True,
+    dominant_speaker: str = "user",
+) -> QueryDecision:
+    """Check utterances for wake words, gate query candidate on segment-level speaker.
+
+    Wake-word detection is deliberately speaker-agnostic: per-utterance speaker
+    labels come from noisy real-time sliding-window turns that can flip to
+    "non-user" on a single bad window even when the whole segment is the user
+    (segment-level fusion is far more stable). Coupling wake detection to those
+    noisy turns made identical utterances randomly fail to trigger. We instead
+    detect the wake word on any utterance, and gate query_candidate on the
+    segment-level dominant_speaker decision.
+
+    utterances: list of dicts with keys 'speaker' ('user'/'non-user'), 'text'
+    """
+    combined_query_parts = []
+    wake_detected = False
+    had_leading_filler = False
+    found_wake_anywhere = False
+
+    for i, utt in enumerate(utterances):
+        text = utt.get("text", "")
+        wake = match_wake_prefix(text, aliases)
+        if wake.detected:
+            wake_detected = True
+            had_leading_filler = wake.had_leading_filler
+            found_wake_anywhere = True
+            q = wake.query_text.strip(" ，。！？、；：,.!?;:")
+            if q:
+                combined_query_parts.append(q)
+            # Include subsequent user utterances as part of the query context
+            for later_utt in utterances[i + 1:]:
+                if later_utt.get("speaker") != "user":
+                    break
+                t = later_utt.get("text", "").strip()
+                if t:
+                    combined_query_parts.append(t)
+            break
+
+    if not wake_detected or not found_wake_anywhere:
+        return QueryDecision(False, False, None)
+
+    if not profile_ready:
+        if not combined_query_parts or len("".join(combined_query_parts)) < 2:
+            return QueryDecision(True, False, None, had_leading_filler)
+
+    candidate = dominant_speaker == "user"
+    query_text = " ".join(combined_query_parts) if combined_query_parts else ""
+    return QueryDecision(
+        True,
+        candidate,
+        query_text if query_text else None,
+        had_leading_filler,
     )

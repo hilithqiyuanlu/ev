@@ -23,6 +23,7 @@ struct HistoryView: View {
     @State private var editingSegment: Segment?
     @State private var editText = ""
     @State private var showClearConfirm = false
+    @State private var showDatePickerPopover = false
 
     private static let dateDisplayFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -39,13 +40,12 @@ struct HistoryView: View {
     private var displayedDate: Date { filterDate ?? Calendar.current.startOfDay(for: Date()) }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 20) {
             filterHeader
-
-            Divider()
 
             if model.historyItems.isEmpty && !model.isLoadingHistory {
                 EmptyStateView("暂无历史记录", systemImage: "tray")
+                    .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
             } else {
                 List(model.historyItems) { item in
                     HistoryRow(item: item, onDelete: {
@@ -116,10 +116,10 @@ struct HistoryView: View {
                 }
                 .listStyle(.inset)
                 .scrollContentBackground(.hidden)
-                .padding(.horizontal, 8)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationTitle("历史")
         .onAppear { applyFilters() }
         .sheet(item: $editingSegment) { segment in
@@ -153,23 +153,20 @@ struct HistoryView: View {
             dateCapsule
             speakerCapsule
             queryToggleCapsule
-            clearCapsule
             Spacer()
             if model.isLoadingHistory {
                 ProgressView().controlSize(.small)
             }
+            clearCapsule
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 12)
     }
 
     private var dateCapsule: some View {
         HStack(spacing: 0) {
-            // 全部日期
             Button {
                 dateOption = .all
                 filterDate = nil
+                showDatePickerPopover = false
                 scheduleFilter()
             } label: {
                 Text("全部日期")
@@ -189,12 +186,15 @@ struct HistoryView: View {
             }
             .buttonStyle(.plain)
 
-            // 具体日期 (yyyy/MM/dd)
-            // 点击切换逻辑：
-            //   dateOption == .all 时：优先走 Button 切换到当天（allowsHitTesting=false 忽略 DatePicker）
-            //   dateOption == .specific 时：DatePicker 吸收点击，弹出下拉日历（allowsHitTesting=true）
             Button {
-                handleDateCapsuleTap()
+                if dateOption == .all {
+                    let today = Calendar.current.startOfDay(for: Date())
+                    filterDate = today
+                    dateOption = .specific
+                    scheduleFilter()
+                } else {
+                    showDatePickerPopover = true
+                }
             } label: {
                 Text(Self.dateDisplayFormatter.string(from: displayedDate))
                     .font(.subheadline.weight(.medium))
@@ -212,8 +212,7 @@ struct HistoryView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .overlay(
-                // overlay：不改变按钮布局尺寸，仅在上方叠一层可点击的 DatePicker
+            .popover(isPresented: $showDatePickerPopover) {
                 DatePicker(
                     "",
                     selection: Binding(
@@ -222,17 +221,17 @@ struct HistoryView: View {
                             let day = Calendar.current.startOfDay(for: newDate)
                             filterDate = day
                             dateOption = .specific
+                            showDatePickerPopover = false
                             scheduleFilter()
                         }
                     ),
                     displayedComponents: .date
                 )
                 .labelsHidden()
-                .controlSize(.mini)
-                .opacity(0.001)
-                .allowsHitTesting(dateOption == .specific)
-                .clipped()
-            )
+                .datePickerStyle(.graphical)
+                .frame(width: 300)
+                .padding(16)
+            }
         }
         .padding(4)
         .background(
@@ -331,21 +330,6 @@ struct HistoryView: View {
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color.secondary.opacity(0.06))
         )
-    }
-
-    private func handleDateCapsuleTap() {
-        switch dateOption {
-        case .all:
-            // 第一次点击：默认选当天
-            let today = Calendar.current.startOfDay(for: Date())
-            filterDate = today
-            dateOption = .specific
-            scheduleFilter()
-        case .specific:
-            // 再次点击：触发日历选择（让 DatePicker 接收点击，
-            // 由 allowsHitTesting 控制，这里不需要额外处理）
-            break
-        }
     }
 
     private func scheduleFilter() {

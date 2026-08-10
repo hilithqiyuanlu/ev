@@ -20,20 +20,23 @@ class AudioSettings:
 
 @dataclass(frozen=True)
 class PreprocessSettings:
-    """帧级音频预处理参数. 全部有默认值, toml 缺省时用默认 (全部开启)."""
+    """帧级音频预处理参数. 全部有默认值, toml 缺省时用默认 (全部开启).
+
+    默认值按远场友好调校 (外出场景, 3m 轻中声能稳定录入).
+    """
 
     enabled: bool = True
     # Preemphasis
     preemphasis_coeff: float = 0.97
-    # AGC
-    agc_target_rms: float = 0.05
+    # AGC (远场: 更高目标响度 + 更大增益上限 + 更慢 release 防句中呼吸)
+    agc_target_rms: float = 0.08
     agc_min_gain: float = 0.1       # -20dB
-    agc_max_gain: float = 20.0      # +26dB
+    agc_max_gain: float = 40.0      # +32dB
     agc_attack_ms: float = 10.0     # 增益下降 (压大音量) 快
-    agc_release_ms: float = 100.0   # 增益上升 (放大小音量) 慢
-    # NoiseGate
+    agc_release_ms: float = 400.0   # 增益上升 (放大小音量) 慢
+    # NoiseGate (远场 SNR 本就低, 门槛调松)
     noisegate_enabled: bool = True
-    noisegate_snr_db: float = 3.0
+    noisegate_snr_db: float = 1.5
     noisegate_floor_track_sec: float = 3.0
 
 
@@ -43,12 +46,12 @@ class VADSettings:
 
     # FSMN model threshold (若模型支持该参数; None = 模型默认)
     fsmn_threshold: float | None = None
-    # Energy VAD fallback
+    # Energy VAD fallback (远场: 更低绝对底噪 + 更松 SNR)
     energy_vad_enabled: bool = True
-    energy_snr_linear: float = 2.5     # RMS > floor * 2.5x (≈4dB)
-    energy_abs_min_rms: float = 0.001  # ~-60dBFS
-    energy_start_frames: int = 2       # 60ms @ 30ms/帧
-    energy_hangover_frames: int = 20   # 600ms @ 30ms/帧
+    energy_snr_linear: float = 1.8      # RMS > floor * 1.8x (≈2.5dB)
+    energy_abs_min_rms: float = 0.0003  # ~-70dBFS
+    energy_start_frames: int = 2        # 60ms @ 30ms/帧
+    energy_hangover_frames: int = 20    # 600ms @ 30ms/帧
     # 复合策略: "or"/"fsmn_only"/"energy_only"
     combine_start_mode: str = "or"       # 启动放宽松: OR
     combine_end_mode: str = "and"        # 结束保守: AND + hangover
@@ -61,6 +64,20 @@ class ModelSettings:
     asr_streaming: str
     asr_final: str
     speaker: str
+
+
+@dataclass(frozen=True)
+class ModelSlotConfig:
+    """单个槽位的动态配置。"""
+    model_key: str | None = None
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ModelRegistrySettings:
+    """注册表模型配置 — 支持动态槽位分配。"""
+    root: Path
+    slots: dict[str, ModelSlotConfig]
 
 
 @dataclass(frozen=True)
@@ -80,6 +97,14 @@ class VuiSettings:
 @dataclass(frozen=True)
 class SegmentSettings:
     min_duration_ms: int = 500
+    max_duration_ms: int = 20000        # 硬上限: 超过20s强制切分
+    silence_timeout_ms: int = 1200      # 尾部绝对静音超时: 1.2s
+    silence_rms_threshold: float = 0.003  # 绝对静音RMS阈值（raw音频，~-50dBFS）
+    # 相对静音检测: RMS从说话峰值下降到该比例以下视为静音
+    relative_silence_ratio: float = 0.30  # 峰值的30%以下
+    relative_silence_timeout_ms: int = 1500  # 相对静音持续1.5s强制切分
+    # ASR停滞超时: 流式ASR长时间无新partial结果视为说完
+    asr_stall_timeout_ms: int = 2500
     discard_filler_only: bool = True
 
 
@@ -103,6 +128,7 @@ class Settings:
     vad: VADSettings
     data_dir: Path
     models: ModelSettings
+    model_registry: ModelRegistrySettings
     speaker: SpeakerSettings
     vui: VuiSettings
     segment: SegmentSettings
@@ -163,6 +189,45 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if not model_root.is_absolute():
         model_root = PROJECT_ROOT / model_root
 
+    # 旧格式兼容：4 硬编码字段
+    old_model_settings = ModelSettings(
+        root=model_root,
+        vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
+        asr_streaming=str(models_raw.get("asr_streaming", "ev-paraformer-zh-streaming-16k")),
+        asr_final=str(models_raw.get("asr_final", "ev-paraformer-zh-16k")),
+        speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
+    )
+
+    # 新格式：动态槽位（从 toml 或默认值构建）
+    slots_raw = models_raw.get("slots", {})
+    default_slots = {
+        "vad": "fsmn-vad",
+        "asr_streaming": "paraformer-zh-streaming",
+        "asr_final": "qwen3-asr-1.7b",
+        "speaker": "eres2netv2",
+    }
+    slot_configs: dict[str, ModelSlotConfig] = {}
+    for slot, default_key in default_slots.items():
+        slot_data = slots_raw.get(slot, {})
+        if isinstance(slot_data, str):
+            model_key = slot_data
+            enabled = True
+        elif isinstance(slot_data, dict):
+            model_key = slot_data.get("model_key", default_key)
+            enabled = slot_data.get("enabled", True)
+        else:
+            model_key = default_key
+            enabled = True
+        slot_configs[slot] = ModelSlotConfig(
+            model_key=model_key if model_key else None,
+            enabled=bool(enabled),
+        )
+
+    registry_settings = ModelRegistrySettings(
+        root=model_root,
+        slots=slot_configs,
+    )
+
     # fsmn_threshold: 允许 toml 写 null / 数值
     _fsmn_th = vad_raw.get("fsmn_threshold", None)
     fsmn_threshold: float | None
@@ -203,13 +268,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
             combine_end_mode=str(vad_raw.get("combine_end_mode", "and")).lower(),
         ),
         data_dir=data_dir,
-        models=ModelSettings(
-            root=model_root,
-            vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
-            asr_streaming=str(models_raw.get("asr_streaming", "ev-paraformer-zh-streaming-16k")),
-            asr_final=str(models_raw.get("asr_final", "ev-paraformer-zh-16k")),
-            speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
-        ),
+        models=old_model_settings,
+        model_registry=registry_settings,
         speaker=SpeakerSettings(
             threshold=float(
                 speaker_raw.get("threshold",
@@ -224,6 +284,12 @@ def load_settings(config_path: Path | None = None) -> Settings:
         vui=VuiSettings(tuple(str(x) for x in vui_raw.get("wake_words", ["小E"]))),
         segment=SegmentSettings(
             min_duration_ms=int(segment_raw.get("min_duration_ms", 500)),
+            max_duration_ms=int(segment_raw.get("max_duration_ms", 20000)),
+            silence_timeout_ms=int(segment_raw.get("silence_timeout_ms", 1200)),
+            silence_rms_threshold=float(segment_raw.get("silence_rms_threshold", 0.003)),
+            relative_silence_ratio=float(segment_raw.get("relative_silence_ratio", 0.30)),
+            relative_silence_timeout_ms=int(segment_raw.get("relative_silence_timeout_ms", 1500)),
+            asr_stall_timeout_ms=int(segment_raw.get("asr_stall_timeout_ms", 2500)),
             discard_filler_only=bool(segment_raw.get("discard_filler_only", True)),
         ),
         voice_learning=VoiceLearningSettings(

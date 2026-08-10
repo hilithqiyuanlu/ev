@@ -108,6 +108,34 @@ class VADAdapter:
         self.cache.clear()
         self._buffer = np.empty(0, dtype=np.float32)
 
+    def unload(self) -> None:
+        """Release model resources. Safe to call multiple times."""
+        import gc
+
+        self.cache.clear()
+        self._buffer = np.empty(0, dtype=np.float32)
+        if self.model is not None:
+            try:
+                # Try to close onnxruntime sessions
+                for attr_name in dir(self.model):
+                    if attr_name.startswith("_"):
+                        continue
+                    try:
+                        attr = getattr(self.model, attr_name, None)
+                        if attr is not None and hasattr(attr, "close"):
+                            attr.close()
+                    except Exception:
+                        pass
+                if hasattr(self.model, "model"):
+                    try:
+                        del self.model.model
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.model = None
+        gc.collect()
+
 
 class CompositeVAD:
     """复合 VAD: FSMN-VAD + EnergyVAD.
@@ -185,6 +213,20 @@ class CompositeVAD:
         self._fsmn_pending_end = False
         self._elapsed_ms = 0
         self._start_at_ms = None
+
+    def unload(self) -> None:
+        """Release underlying model resources."""
+        if hasattr(self.fsmn, "unload"):
+            try:
+                self.fsmn.unload()
+            except Exception:
+                pass
+        if self.energy is not None and hasattr(self.energy, "unload"):
+            try:
+                self.energy.unload()
+            except Exception:
+                pass
+        self._active = False
 
     def accept(
         self,

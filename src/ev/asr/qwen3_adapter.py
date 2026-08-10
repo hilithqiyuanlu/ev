@@ -1,0 +1,356 @@
+"""Qwen3-ASR 适配器 — 基于 Transformers 的中英混合 ASR。
+
+支持模型:
+  - Qwen3-ASR-0.6B  (中英混合轻量版)
+  - Qwen3-ASR-1.7B  (中英混合标准版)
+
+适配 transformers 5.x Qwen3-ASR API（chat-template 风格多模态调用）。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from .adapters import TranscriptionResult, TranscriptionSegment
+
+logger = logging.getLogger(__name__)
+
+_ASR_PROMPT = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+_ASR_TEXT_TAG = "<asr_text>"
+_IM_END = "<|im_end|>"
+
+
+class Qwen3ASRAdapter:
+    """使用 Qwen3-ASR 模型进行语音识别。
+
+    基于 transformers 5.x 的 Qwen3ASRProcessor + Qwen3ASRForConditionalGeneration。
+    调用方式：chat template 风格（text 含 audio 占位符 + audio tensor），
+    模型输出格式为：language <lang><asr_text>...<|im_end|>
+    """
+
+    def __init__(self, model_path: str, model: Any | None = None, tokenizer: Any | None = None):
+        self.model_path = str(Path(model_path).expanduser().resolve())
+        self.model = model
+        self.processor = None
+        self.tokenizer = tokenizer
+        self.device: str | None = None
+        self.torch_dtype: Any | None = None
+        self._suppress_tokens: list[int] | None = None
+        self._loaded = model is not None and tokenizer is not None
+        self._detect_variant()
+
+    def _detect_variant(self) -> None:
+        config_path = Path(self.model_path) / "config.json"
+        if not config_path.exists():
+            self._model_variant = "unknown"
+            return
+        try:
+            config = json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            self._model_variant = "unknown"
+            return
+        name = (config.get("_name_or_path", "") or "").lower()
+        if "1.7b" in name or "1_7b" in name:
+            self._model_variant = "1.7b"
+        else:
+            self._model_variant = "0.6b"
+        logger.info(
+            "Qwen3-ASR detected variant=%s at %s",
+            self._model_variant, self.model_path,
+        )
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._load_model()
+        self._loaded = True
+
+    def _load_model(self) -> None:
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("Qwen3-ASR 需要安装 torch") from exc
+
+        try:
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+        except ImportError as exc:
+            raise RuntimeError("Qwen3-ASR 需要安装 transformers>=5.0") from exc
+
+        if torch.cuda.is_available():
+            self.device = "cuda"
+            self.torch_dtype = torch.float16
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+            self.torch_dtype = torch.float16
+        else:
+            self.device = "cpu"
+            self.torch_dtype = torch.float32
+
+        logger.info(
+            "Loading Qwen3-ASR (%s) from %s on %s (dtype=%s)",
+            self._model_variant, self.model_path, self.device, self.torch_dtype,
+        )
+
+        attn_impl = None
+        try:
+            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                attn_impl = "sdpa"
+        except Exception:
+            pass
+
+        # transformers 5.x: 参数名从 torch_dtype 改为 dtype；
+        # device_map="auto" 强制依赖 accelerate，仅在 CUDA+accelerate 可用时启用。
+        load_kwargs: dict[str, Any] = {
+            "dtype": self.torch_dtype,
+            "trust_remote_code": True,
+        }
+        if self.device == "cuda":
+            try:
+                import accelerate  # noqa: F401
+                load_kwargs["device_map"] = "auto"
+                logger.info("Qwen3-ASR: using device_map='auto' (CUDA with accelerate)")
+            except ImportError:
+                logger.info("Qwen3-ASR: accelerate not installed, loading without device_map")
+        if attn_impl:
+            load_kwargs["attn_implementation"] = attn_impl
+        if "device_map" in load_kwargs:
+            load_kwargs["low_cpu_mem_usage"] = True
+
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_path, trust_remote_code=True,
+        )
+        self.tokenizer = self.processor.tokenizer
+
+        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            self.model_path,
+            **load_kwargs,
+        )
+        if "device_map" not in load_kwargs:
+            self.model = self.model.to(self.device)
+        self.model.eval()
+
+        # Build suppress list: prevent audio placeholder tokens from being generated
+        audio_tokens = [
+            self._get_token_id("<|audio_pad|>"),
+            self._get_token_id("<|audio_start|>"),
+            self._get_token_id("<|audio_end|>"),
+        ]
+        self._suppress_tokens = [t for t in audio_tokens if t is not None]
+
+        logger.info("Qwen3-ASR loaded successfully.")
+
+    def _get_token_id(self, token: str) -> int | None:
+        try:
+            ids = self.tokenizer.convert_tokens_to_ids(token)
+            return ids if ids != self.tokenizer.unk_token_id else None
+        except Exception:
+            return None
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        hotword: str = "",
+        return_timestamps: bool = False,
+    ) -> TranscriptionResult:
+        import torch
+
+        self._ensure_loaded()
+
+        audio_arr = np.asarray(audio, dtype=np.float32)
+        if audio_arr.ndim > 1:
+            audio_arr = audio_arr.mean(axis=-1)
+        if sample_rate != 16000:
+            audio_arr = self._resample_np(audio_arr, sample_rate, 16000)
+            sample_rate = 16000
+
+        # Build prompt with hotword injection if provided
+        prompt = _ASR_PROMPT
+        if hotword and hotword.strip():
+            words = [w.strip() for w in hotword.replace("\n", " ").split() if w.strip()]
+            if words:
+                hint = "，".join(words)
+                prompt = (
+                    "<|im_start|>system\n<|im_end|>\n"
+                    f"<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+                    f"请准确转写，注意以下词：{hint}<|im_end|>\n"
+                    "<|im_start|>assistant\n"
+                )
+
+        inputs = self.processor(
+            text=prompt,
+            audio=audio_arr,
+            sampling_rate=16000,
+            return_tensors="pt",
+        )
+
+        input_len = inputs["input_ids"].shape[1]
+
+        # Move to device with correct dtype
+        model_inputs: dict[str, Any] = {}
+        for k, v in inputs.items():
+            if hasattr(v, "to"):
+                if v.dtype in (torch.float32, torch.float64):
+                    model_inputs[k] = v.to(self.device, dtype=self.torch_dtype)
+                else:
+                    model_inputs[k] = v.to(self.device)
+            else:
+                model_inputs[k] = v
+
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": 256,
+            "do_sample": False,
+        }
+        if self._suppress_tokens:
+            gen_kwargs["suppress_tokens"] = self._suppress_tokens
+
+        with torch.no_grad():
+            output_ids = self.model.generate(**model_inputs, **gen_kwargs)
+
+        new_tokens = output_ids[0][input_len:]
+        raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
+
+        return self._parse_output(raw_text, return_timestamps)
+
+    def _parse_output(
+        self, raw_text: str, with_timestamps: bool,
+    ) -> TranscriptionResult:
+        # Expected format: language <lang><asr_text>...<|im_end|>
+        # Extract content after <asr_text>, before <|im_end|>
+        text = raw_text
+
+        # Strip language tag
+        lang_match = re.match(r"language\s+\S+\s*", text)
+        if lang_match:
+            text = text[lang_match.end():]
+
+        # Extract content inside <asr_text>...</asr_text> or after <asr_text>
+        asr_start = text.find(_ASR_TEXT_TAG)
+        if asr_start >= 0:
+            text = text[asr_start + len(_ASR_TEXT_TAG):]
+
+        # Cut at end marker
+        im_end_pos = text.find(_IM_END)
+        if im_end_pos >= 0:
+            text = text[:im_end_pos]
+
+        text = self._clean_text(text)
+
+        if not text.strip():
+            return TranscriptionResult(text="")
+
+        if with_timestamps:
+            # Attempt to parse timestamp tokens (Qwen3-ASR uses <|x.xx|> format)
+            segments = self._parse_timestamp_segments(raw_text)
+            if segments:
+                cleaned_segments = [
+                    TranscriptionSegment(
+                        text=self._clean_text(s.text),
+                        start_ms=s.start_ms,
+                        end_ms=s.end_ms,
+                    )
+                    for s in segments
+                    if self._clean_text(s.text).strip()
+                ]
+                if cleaned_segments:
+                    full = "".join(s.text for s in cleaned_segments).strip()
+                    return TranscriptionResult(text=full or text, segments=cleaned_segments)
+
+        return TranscriptionResult(text=text)
+
+    def _parse_timestamp_segments(self, raw_text: str) -> list[TranscriptionSegment]:
+        matches = list(re.finditer(r"<\|(\d+\.?\d*)\|>", raw_text))
+        if len(matches) < 2:
+            return []
+
+        segments: list[TranscriptionSegment] = []
+        i = 0
+        while i < len(matches) - 1:
+            start_match = matches[i]
+            end_match = matches[i + 1]
+            try:
+                start_sec = float(start_match.group(1))
+                end_sec = float(end_match.group(1))
+            except ValueError:
+                i += 1
+                continue
+
+            text_between = raw_text[start_match.end():end_match.start()]
+            start_ms = int(round(start_sec * 1000))
+            end_ms = int(round(end_sec * 1000))
+
+            if end_ms > start_ms and text_between.strip():
+                # Strip ASR tags from segment text
+                seg_text = text_between
+                for tag in (_ASR_TEXT_TAG, _IM_END, "language", "None", "zh", "en"):
+                    seg_text = seg_text.replace(tag, "")
+                seg_text = self._clean_text(seg_text)
+                if seg_text.strip():
+                    segments.append(TranscriptionSegment(
+                        text=seg_text,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                    ))
+            i += 1
+
+        return segments
+
+    @staticmethod
+    def _resample_np(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
+        if orig_rate == target_rate:
+            return audio
+        duration = len(audio) / orig_rate
+        target_length = int(duration * target_rate)
+        indices = np.linspace(0, len(audio) - 1, target_length)
+        return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        text = re.sub(r"<\|[^|]*\|>", "", text)
+        text = re.sub(r"<asr_text>", "", text)
+        text = re.sub(r"\(\d+\.?\d*-\d+\.?\d*\)", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def reset(self) -> None:
+        pass
+
+    def unload(self) -> None:
+        """Release model and processor resources. Safe to call multiple times."""
+        import gc
+
+        if self.model is not None:
+            try:
+                import torch
+                try:
+                    self.model.to("cpu")
+                except Exception:
+                    pass
+            except ImportError:
+                pass
+            try:
+                del self.model
+            except Exception:
+                pass
+            self.model = None
+        self.processor = None
+        self.tokenizer = None
+        self.device = None
+        self.torch_dtype = None
+        self._suppress_tokens = None
+        self._loaded = False
+        gc.collect()
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

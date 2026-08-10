@@ -42,11 +42,11 @@ struct LexiconView: View {
     private var headerBar: some View {
         HStack(alignment: .center, spacing: 12) {
             filterBar
-            addCapsule
-            Spacer()
             Text("\(visibleWords.count) 词")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+            Spacer()
+            addCapsule
             let autoCount = model.lexiconWords.filter { $0.source == "auto" }.count
             if autoCount > 0 {
                 clearAutoCapsule(autoCount: autoCount)
