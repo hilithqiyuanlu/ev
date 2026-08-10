@@ -83,6 +83,7 @@ final class AppModel: ObservableObject {
     @Published var downloadLabel = ""
     @Published var voiceProfile = VoiceProfileState.empty
     @Published var voiceSamples: [VoiceSample] = []
+    @Published var lexiconWords: [LexiconItem] = []
     @Published var manualEnrollStatus = "idle" // idle, recording, processing, done, failed
     @Published var manualEnrollError: String?
     @Published var manualEnrollDuration: Double = 3.0
@@ -100,6 +101,8 @@ final class AppModel: ObservableObject {
     @Published var isVerifyingModels = false
     @Published var isLoadingHistory = false
     @Published var showVerificationDone = false
+    @Published var learnedWordsToast: String?
+    @Published var showLearnedWordsToast = false
 
     let audioPlayer = AudioPlayer()
     private let engine: EngineTransport
@@ -248,6 +251,7 @@ final class AppModel: ObservableObject {
         engine.send("verify_models")
         loadHistory()
         loadVoiceSamples()
+        loadLexicon()
     }
 
     func toggleListening() {
@@ -317,6 +321,10 @@ final class AppModel: ObservableObject {
         engine.send("delete_segment", payload: ["segment_id": id])
     }
 
+    func correctSegment(_ segmentId: String, correctedText: String) {
+        engine.send("correct_segment", payload: ["segment_id": segmentId, "corrected_text": correctedText])
+    }
+
     func deleteAllSegments() {
         engine.send("delete_all_segments")
     }
@@ -346,6 +354,36 @@ final class AppModel: ObservableObject {
 
     func loadVoiceSamples() {
         engine.send("list_voice_samples", payload: ["limit": 50])
+    }
+
+    func loadLexicon() {
+        engine.send("list_lexicon")
+    }
+
+    func addLexiconWord(_ word: String) {
+        let trimmed = word.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        engine.send("add_lexicon_word", payload: ["word": trimmed])
+    }
+
+    func updateLexiconWord(_ id: String, word: String? = nil, weight: Double? = nil, promoteToManual: Bool = false) {
+        var payload: [String: Any] = ["id": id]
+        if let word { payload["word"] = word }
+        if let weight { payload["weight"] = weight }
+        if promoteToManual { payload["promote_to_manual"] = true }
+        engine.send("update_lexicon_word", payload: payload)
+    }
+
+    func deleteLexiconWord(_ id: String) {
+        engine.send("delete_lexicon_word", payload: ["id": id])
+    }
+
+    func clearAutoLexicon() {
+        engine.send("clear_auto_lexicon")
+    }
+
+    func learnCorrections() {
+        engine.send("learn_corrections")
     }
 
     func deleteVoiceSample(_ id: String) {
@@ -511,6 +549,19 @@ final class AppModel: ObservableObject {
             loadHistory()
             // Deleting segments may cascade-delete auto voice samples - refresh
             loadVoiceSamples()
+        case "segment_corrected":
+            if let changed = event.payload["changed"]?.bool, changed,
+               let segmentId = event.payload["segment_id"]?.string {
+                // Optimistic update: mark as corrected locally
+                segments = segments.map { seg in
+                    if seg.id == segmentId {
+                        // Re-fetch to get updated transcript
+                        return seg  // will be replaced by loadHistory
+                    }
+                    return seg
+                }
+            }
+            loadHistory()
         case "query_candidate":
             loadHistory()
         case "model_status":
@@ -555,6 +606,37 @@ final class AppModel: ObservableObject {
                     if self?.manualEnrollStatus == status {
                         self?.manualEnrollStatus = "idle"
                         self?.manualEnrollError = nil
+                    }
+                }
+            }
+        case "lexicon_list":
+            lexiconWords = event.payload["words"]?.array?.compactMap(LexiconItem.init) ?? []
+        case "lexicon_updated":
+            loadLexicon()
+            // Show toast if words were learned from corrections
+            if let words = event.payload["words"]?.array?.compactMap({ $0.string }),
+               !words.isEmpty,
+               event.payload["source"]?.string == "correction" || event.payload["source"]?.string == "manual_learn" {
+                learnedWordsToast = "已学习新词汇：" + words.joined(separator: "、")
+                showLearnedWordsToast = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    if self.showLearnedWordsToast {
+                        self.showLearnedWordsToast = false
+                        self.learnedWordsToast = nil
+                    }
+                }
+            }
+        case "corrections_learned":
+            if let words = event.payload["words"]?.array?.compactMap({ $0.string }),
+               !words.isEmpty {
+                learnedWordsToast = "从纠错历史学习到 \(words.count) 个词：" + words.joined(separator: "、")
+                showLearnedWordsToast = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    if self.showLearnedWordsToast {
+                        self.showLearnedWordsToast = false
+                        self.learnedWordsToast = nil
                     }
                 }
             }

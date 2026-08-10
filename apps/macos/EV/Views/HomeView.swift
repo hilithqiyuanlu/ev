@@ -78,8 +78,22 @@ struct HomeView: View {
                 } else {
                     List(model.queries) { query in
                         QueryRow(query: query)
+                            .padding(.vertical, 2)
+                            .listRowBackground(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(Color.primary.opacity(0.03))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
+                                    )
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 2)
+                            )
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
                     }
                     .listStyle(.inset)
+                    .scrollContentBackground(.hidden)
                 }
             }
             .padding(.horizontal, 16)

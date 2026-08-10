@@ -54,7 +54,8 @@ This is an early development version. The speech input pipeline is working end-t
 - Real-time streaming transcription with endpoint detection
 - Automatic speaker recognition — it learns your voice as you use it
 - Wake word "小E" (with ASR homophone tolerance for natural speech)
-- Local recording history with playback and instant filtering
+- Local recording history with playback, instant filtering, and one-click correction
+- Personal hotword lexicon — learns new words from your corrections to improve ASR accuracy
 - Ctrl+T global shortcut to toggle listening
 - Adjustable sensitivity threshold
 

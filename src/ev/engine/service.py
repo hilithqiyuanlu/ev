@@ -91,6 +91,14 @@ class EngineService:
             "submit_manual_query": self._submit_manual_query,
             "delete_query": self._delete_query,
             "delete_all_queries": self._delete_all_queries,
+            "list_lexicon": self._list_lexicon,
+            "add_lexicon_word": self._add_lexicon_word,
+            "update_lexicon_word": self._update_lexicon_word,
+            "delete_lexicon_word": self._delete_lexicon_word,
+            "clear_auto_lexicon": self._clear_auto_lexicon,
+            "correct_segment": self._correct_segment,
+            "list_corrections": self._list_corrections,
+            "learn_corrections": self._learn_corrections,
             "shutdown": self._shutdown_command,
         }
         handler = handlers.get(request.command)
@@ -500,6 +508,137 @@ class EngineService:
         with Store(self.settings.db_path) as store:
             count = store.delete_all_queries()
         self.writer.emit("queries_deleted", {"count": count}, request.request_id)
+
+    def _broadcast_hotwords(self) -> None:
+        """Rebuild hotwords string from store and push to the active segment worker."""
+        with Store(self.settings.db_path) as store:
+            hotwords = store.get_hotwords_string()
+        if self._segment_worker is not None:
+            self._segment_worker.update_hotwords(hotwords)
+
+    def _list_lexicon(self, request: EngineRequest) -> None:
+        with Store(self.settings.db_path) as store:
+            words = store.list_lexicon()
+        self.writer.emit("lexicon_list", {"words": words}, request.request_id)
+
+    def _add_lexicon_word(self, request: EngineRequest) -> None:
+        word = str(request.payload.get("word", "")).strip()
+        weight = float(request.payload.get("weight", 3.0))
+        if not word:
+            raise ValueError("词语不能为空")
+        with Store(self.settings.db_path) as store:
+            entry = store.add_lexicon_word(word, weight, source="manual")
+            # Record as implicit correction signal: user manually added a word ASR didn't know
+            store.record_correction(
+                asr_text="",
+                corrected_text=word,
+                source="manual_add_word",
+            )
+        self._broadcast_hotwords()
+        self.writer.emit("lexicon_updated", {"added": True, "word": entry}, request.request_id)
+        self._ack(request)
+
+    def _update_lexicon_word(self, request: EngineRequest) -> None:
+        word_id = str(request.payload.get("id", ""))
+        if not word_id:
+            raise ValueError("缺少 id")
+        word = request.payload.get("word")
+        weight = request.payload.get("weight")
+        promote = bool(request.payload.get("promote_to_manual", False))
+        w = float(weight) if weight is not None else None
+        wd = str(word) if word is not None else None
+        with Store(self.settings.db_path) as store:
+            updated = store.update_lexicon_word(word_id, word=wd, weight=w, promote_to_manual=promote)
+        if updated:
+            self._broadcast_hotwords()
+        self.writer.emit("lexicon_updated", {"updated": updated, "id": word_id}, request.request_id)
+        self._ack(request)
+
+    def _delete_lexicon_word(self, request: EngineRequest) -> None:
+        word_id = str(request.payload.get("id", ""))
+        if not word_id:
+            raise ValueError("缺少 id")
+        with Store(self.settings.db_path) as store:
+            deleted = store.delete_lexicon_word(word_id)
+        if deleted:
+            self._broadcast_hotwords()
+        self.writer.emit("lexicon_updated", {"deleted": deleted, "id": word_id}, request.request_id)
+        self._ack(request)
+
+    def _clear_auto_lexicon(self, request: EngineRequest) -> None:
+        with Store(self.settings.db_path) as store:
+            count = store.clear_auto_words()
+        if count > 0:
+            self._broadcast_hotwords()
+        self.writer.emit("lexicon_updated", {"cleared_auto": count}, request.request_id)
+        self._ack(request)
+
+    def _correct_segment(self, request: EngineRequest) -> None:
+        segment_id = str(request.payload.get("segment_id", ""))
+        corrected_text = str(request.payload.get("corrected_text", "")).strip()
+        if not segment_id:
+            raise ValueError("缺少 segment_id")
+        if not corrected_text:
+            raise ValueError("修正文本不能为空")
+        learned_words: list[str] = []
+        with Store(self.settings.db_path) as store:
+            original = store.connection.execute(
+                "SELECT transcript_final, speaker_label, speaker_score, audio_path FROM segments WHERE id=?",
+                (segment_id,),
+            ).fetchone()
+            if original is None:
+                raise ValueError(f"未找到语音记录: {segment_id}")
+            asr_text = original["transcript_final"]
+            if asr_text == corrected_text:
+                # No change needed
+                self.writer.emit("segment_corrected", {"segment_id": segment_id, "changed": False}, request.request_id)
+                self._ack(request)
+                return
+            updated = store.update_segment_transcript(segment_id, corrected_text)
+            store.record_correction(
+                segment_id=segment_id,
+                asr_text=asr_text,
+                corrected_text=corrected_text,
+                source="manual_edit",
+                speaker_label=original["speaker_label"],
+                speaker_score=original["speaker_score"],
+                audio_path=original["audio_path"],
+            )
+            # Trigger learning from this correction (and any other unapplied)
+            learned_words = store.learn_from_corrections()
+        if learned_words:
+            self._broadcast_hotwords()
+            self.writer.emit("lexicon_updated", {"added": len(learned_words), "words": learned_words, "source": "correction"})
+        self.writer.emit(
+            "segment_corrected",
+            {"segment_id": segment_id, "changed": True, "corrected_text": corrected_text, "learned_words": learned_words},
+            request.request_id,
+        )
+        self._ack(request)
+
+    def _list_corrections(self, request: EngineRequest) -> None:
+        payload = request.payload
+        with Store(self.settings.db_path) as store:
+            corrections = store.list_corrections(
+                limit=int(payload.get("limit", 100)),
+                offset=int(payload.get("offset", 0)),
+                source=payload.get("source") or None,
+            )
+        self.writer.emit("correction_list", {"corrections": corrections}, request.request_id)
+
+    def _learn_corrections(self, request: EngineRequest) -> None:
+        """Manually trigger learning from all unapplied correction history."""
+        with Store(self.settings.db_path) as store:
+            learned_words = store.learn_from_corrections()
+        if learned_words:
+            self._broadcast_hotwords()
+            self.writer.emit("lexicon_updated", {"added": len(learned_words), "words": learned_words, "source": "manual_learn"})
+        self.writer.emit(
+            "corrections_learned",
+            {"added": len(learned_words), "words": learned_words},
+            request.request_id,
+        )
+        self._ack(request)
 
     def _shutdown_command(self, request: EngineRequest) -> None:
         LOGGER.info("engine shutdown requested")

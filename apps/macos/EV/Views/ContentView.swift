@@ -3,6 +3,7 @@ import SwiftUI
 enum AppSection: String, CaseIterable, Identifiable {
     case home = "首页"
     case history = "历史"
+    case lexicon = "词典"
     case settings = "设置"
     var id: String { rawValue }
 
@@ -10,6 +11,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .home: "house"
         case .history: "clock.arrow.circlepath"
+        case .lexicon: "character.book.closed"
         case .settings: "gearshape"
         }
     }
@@ -29,6 +31,7 @@ struct ContentView: View {
             switch section ?? (model.hasCompletedOnboarding ? .home : .settings) {
             case .home: HomeView()
             case .history: HistoryView()
+            case .lexicon: LexiconView()
             case .settings: SettingsView()
             }
         }
@@ -53,5 +56,18 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("goHome"))) { _ in
             section = .home
         }
+        .overlay(alignment: .bottom) {
+            if model.showLearnedWordsToast, let text = model.learnedWordsToast {
+                Text(text)
+                    .font(.subheadline)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.orange.opacity(0.9), in: Capsule())
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: model.showLearnedWordsToast)
     }
 }

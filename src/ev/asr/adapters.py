@@ -163,14 +163,22 @@ class FinalASRAdapter(_FunASR):
             disable_update=True,
         )
 
-    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
-        result = self.model.generate(
-            input=audio,
-            sampling_rate=sample_rate,
-            use_itn=True,
-            batch_size_s=300,
-            disable_pbar=True,
-        )
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        hotword: str = "",
+    ) -> str:
+        kwargs: dict[str, Any] = {
+            "input": audio,
+            "sampling_rate": sample_rate,
+            "use_itn": True,
+            "batch_size_s": 300,
+            "disable_pbar": True,
+        }
+        if hotword:
+            kwargs["hotword"] = hotword
+        result = self.model.generate(**kwargs)
         return _text(result)
 
 

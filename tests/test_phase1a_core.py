@@ -152,7 +152,7 @@ def test_sqlite_segment_and_profile(tmp_path):
             )
         )
         assert store.connection.execute("select count(*) from segments").fetchone()[0] == 1
-        assert store.connection.execute("pragma user_version").fetchone()[0] == 6
+        assert store.connection.execute("pragma user_version").fetchone()[0] == 9
         assert store.connection.execute("select count(*) from speaker_samples").fetchone()[0] == 0
 
 
@@ -179,7 +179,7 @@ def test_segment_processor_archives_every_segment_and_gates_query(tmp_path, monk
     class Final:
         model_id = "final"
 
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return "小E 打开灯"
 
     with Store(settings.db_path) as store:
@@ -231,7 +231,7 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
         def __init__(self, path):
             self.model_id = path
 
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return "测试终稿"
 
     class Speaker:
@@ -279,7 +279,7 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
             self.ended = ended
 
     class VAD:
-        def __init__(self, path):
+        def __init__(self, path, **kwargs):
             self.calls = 0
 
         def accept(self, frame, sample_rate, is_final=False):
@@ -316,11 +316,11 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
         def __init__(self, path):
             self.model_id = path
 
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return "测试终稿"
 
     class Capture:
-        def __init__(self, audio, device=None):
+        def __init__(self, audio, device=None, **kwargs):
             self.stopped = False
 
         def start(self):
@@ -393,7 +393,7 @@ def test_segment_processor_discards_empty_final(tmp_path, monkeypatch):
     settings = load_settings()
 
     class Final:
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return ""
 
     class Speaker:
@@ -421,7 +421,7 @@ def test_segment_processor_discards_filler_only(tmp_path, monkeypatch):
     settings = load_settings()
 
     class Final:
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return "嗯啊"
 
     class Speaker:
@@ -449,7 +449,7 @@ def test_segment_processor_commits_valid_segment(tmp_path, monkeypatch):
     settings = load_settings()
 
     class Final:
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return "帮我打开灯"
 
     class Speaker:
@@ -484,7 +484,7 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
             self.ended = ended
 
     class VAD:
-        def __init__(self, path):
+        def __init__(self, path, **kwargs):
             self.calls = 0
         def accept(self, frame, sample_rate, is_final=False):
             self.calls += 1
@@ -515,11 +515,11 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
     class Final:
         def __init__(self, path):
             self.model_id = path
-        def transcribe(self, audio, sample_rate):
+        def transcribe(self, audio, sample_rate, **kwargs):
             return "短"
 
     class Capture:
-        def __init__(self, audio, device=None):
+        def __init__(self, audio, device=None, **kwargs):
             self.stopped = False
         def start(self):
             pass
@@ -556,3 +556,74 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
     assert "segment_committed" not in kinds
     discarded = [p for k, p in events if k == "segment_discarded"]
     assert discarded[0]["reason"] == "too_short"
+
+
+def test_correction_history_crud(tmp_path):
+    from ev.store.db import Store
+    from datetime import datetime, timezone
+    db = tmp_path / "test.db"
+    now = datetime.now(timezone.utc).isoformat()
+    with Store(db) as store:
+        # Insert a segment first
+        store.insert_segment(SegmentRecord(
+            "seg1", now, now, 1500, "/tmp/a.wav", 16000, 1,
+            "我想研究强化学", "我想研究强化学", "user", 0.82,
+            False, True, "我想研究强化学", "vad", "stream", "final", "speaker", now,
+        ))
+        # Record a correction
+        corr = store.record_correction(
+            segment_id="seg1",
+            asr_text="我想研究强化学",
+            corrected_text="我想研究强化学习",
+            source="manual_edit",
+            speaker_label="user",
+            speaker_score=0.82,
+            audio_path="/tmp/a.wav",
+        )
+        assert corr["source"] == "manual_edit"
+        assert corr["corrected_text"] == "我想研究强化学习"
+        assert store.count_corrections() == 1
+
+        # List corrections
+        corrs = store.list_corrections()
+        assert len(corrs) == 1
+        assert corrs[0]["asr_text"] == "我想研究强化学"
+
+        # List with source filter
+        manual = store.list_corrections(source="manual_edit")
+        assert len(manual) == 1
+        auto = store.list_corrections(source="implicit_repeat")
+        assert len(auto) == 0
+
+        # Update segment transcript
+        updated = store.update_segment_transcript("seg1", "我想研究强化学习")
+        assert updated is not None
+        assert updated["transcript_final"] == "我想研究强化学习"
+
+        # was_corrected annotation in list_segments
+        segments = store.list_segments()
+        assert len(segments) == 1
+        assert segments[0]["was_corrected"] is True
+
+        # Invalid source raises
+        import pytest
+        with pytest.raises(ValueError, match="invalid correction source"):
+            store.record_correction("a", "b", "bogus")
+
+        # Non-existent segment returns None for update
+        assert store.update_segment_transcript("nonexistent", "x") is None
+
+
+def test_correction_manual_add_word_signal(tmp_path):
+    """Manually adding a lexicon word should be recordable as manual_add_word correction."""
+    from ev.store.db import Store
+    db = tmp_path / "test.db"
+    with Store(db) as store:
+        store.add_lexicon_word("强化学习", 3.0, source="manual")
+        corr = store.record_correction(
+            asr_text="",
+            corrected_text="强化学习",
+            source="manual_add_word",
+        )
+        assert corr["source"] == "manual_add_word"
+        assert store.count_corrections() == 1

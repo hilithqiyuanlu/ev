@@ -197,7 +197,8 @@ struct SegmentRow: View {
                             onDelete?()
                         } label: {
                             Image(systemName: "xmark")
-                                .foregroundStyle(.secondary)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.primary)
                         }
                         .buttonStyle(.borderless)
                         .help("删除此记录")
@@ -213,6 +214,7 @@ struct HistoryRow: View {
     @EnvironmentObject private var model: AppModel
     let item: HistoryItem
     var onDelete: (() -> Void)?
+    var onEdit: ((Segment) -> Void)?
 
     var body: some View {
         switch item {
@@ -246,6 +248,10 @@ struct HistoryRow: View {
                     if let score = segment.speakerScore {
                         Text(String(format: "声纹 %.3f", score))
                     }
+                    if segment.wasCorrected {
+                        Label("已修正", systemImage: "pencil.and.outline")
+                            .foregroundStyle(.orange)
+                    }
                     if segment.queryCandidate {
                         Label(segment.queryText.isEmpty ? "Query" : segment.queryText, systemImage: "bolt.fill")
                             .foregroundStyle(.green)
@@ -261,6 +267,16 @@ struct HistoryRow: View {
             Spacer(minLength: 8)
             HStack(spacing: 10) {
                 Button {
+                    onEdit?(segment)
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.borderless)
+                .help("修正转写文本")
+
+                Button {
                     model.openInFinder(segment.audioPath)
                 } label: {
                     Image(systemName: "folder")
@@ -274,7 +290,8 @@ struct HistoryRow: View {
                     onDelete?()
                 } label: {
                     Image(systemName: "xmark")
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
                 }
                 .buttonStyle(.borderless)
                 .help("删除此记录")
@@ -309,7 +326,8 @@ struct HistoryRow: View {
                 onDelete?()
             } label: {
                 Image(systemName: "xmark")
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.borderless)
             .help("删除此记录")
@@ -346,7 +364,8 @@ struct QueryRow: View {
                 model.deleteQuery(query.id)
             } label: {
                 Image(systemName: "xmark")
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.borderless)
             .help("删除")

@@ -17,6 +17,8 @@ import numpy as np
 
 from ..asr.adapters import FinalASRAdapter, SpeakerEmbeddingAdapter, StreamingASRAdapter
 from ..audio.capture import AudioCapture
+from ..audio.preprocess import AudioPreprocessor, PreprocessParams
+from ..audio.energy_vad import EnergyVAD, EnergyVADParams
 from ..config import Settings
 from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import (
@@ -27,7 +29,7 @@ from ..speaker.verification import (
 from ..store.audio import archive_wav
 from ..store.db import SegmentRecord, Store
 from ..vui import decide_query, match_wake_prefix
-from ..vad.adapters import VADAdapter
+from ..vad.adapters import VADAdapter, CompositeVAD
 
 _FILLER_WORDS = frozenset({
     "嗯", "啊", "呃", "哦", "诶", "唉", "哈", "喂", "哎", "噢",
@@ -66,6 +68,7 @@ class SegmentProcessor:
         final_asr: FinalASRAdapter | None = None,
         output: Callable[[str], None] = print,
         emit: Callable[[str, dict], None] | None = None,
+        hotwords: str = "",
     ):
         self.settings = settings
         self.store = store
@@ -79,10 +82,15 @@ class SegmentProcessor:
         self.emit = emit or (lambda *_: None)
         # Mutable threshold - can be updated at runtime without restart
         self.threshold: float = settings.speaker.threshold
+        # Hotwords for final ASR - can be updated at runtime
+        self.hotwords: str = hotwords
 
     def update_thresholds(self, threshold: float | None = None) -> None:
         if threshold is not None:
             self.threshold = float(threshold)
+
+    def update_hotwords(self, hotwords: str) -> None:
+        self.hotwords = hotwords or ""
 
     def process(
         self,
@@ -205,7 +213,11 @@ class SegmentProcessor:
     def _final(self, audio: np.ndarray) -> str:
         if self.final_asr is None:
             return ""
-        return self.final_asr.transcribe(audio, self.settings.audio.sample_rate)
+        return self.final_asr.transcribe(
+            audio,
+            self.settings.audio.sample_rate,
+            hotword=self.hotwords,
+        )
 
 
 @dataclass(frozen=True)
@@ -248,6 +260,10 @@ class SegmentWorker:
         if self._shared_threshold is not None and threshold is not None:
             self._shared_threshold["threshold"] = float(threshold)
 
+    def update_hotwords(self, hotwords: str) -> None:
+        if self._processor is not None:
+            self._processor.update_hotwords(hotwords)
+
     def submit(self, job: SegmentJob) -> None:
         self.jobs.put(job)
 
@@ -260,6 +276,12 @@ class SegmentWorker:
         with Store(self.settings.db_path) as store:
             from ..speaker.profile import VoiceProfileManager
             voice_profile = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+            # Initial hotword load and one-time correction learning on startup
+            try:
+                store.learn_from_corrections()
+            except Exception:
+                pass
+            hotwords_str = store.get_hotwords_string()
             processor = SegmentProcessor(
                 self.settings,
                 store,
@@ -270,6 +292,7 @@ class SegmentWorker:
                 final,
                 self.output,
                 self.emit,
+                hotwords=hotwords_str,
             )
             self._processor = processor
             # Sync initial threshold to shared state
@@ -342,10 +365,68 @@ async def transcribe_forever(
         if emit is not None:
             emit(event_type, payload)
 
-    vad = VADAdapter(str(paths["vad"]))
+    # --- 预处理 & VAD 初始化 ---
+    sr = settings.audio.sample_rate
+    frame_ms_default = 30
+    # 1) 预处理管线 (DC → preemphasis → AGC → NoiseGate)
+    preprocessor: AudioPreprocessor | None = None
+    if settings.preprocess.enabled:
+        pp_params = PreprocessParams(
+            preemphasis_coeff=settings.preprocess.preemphasis_coeff,
+            agc_target_rms=settings.preprocess.agc_target_rms,
+            agc_min_gain=settings.preprocess.agc_min_gain,
+            agc_max_gain=settings.preprocess.agc_max_gain,
+            agc_attack_ms=settings.preprocess.agc_attack_ms,
+            agc_release_ms=settings.preprocess.agc_release_ms,
+            noisegate_enabled=settings.preprocess.noisegate_enabled,
+            noisegate_snr_db=settings.preprocess.noisegate_snr_db,
+            noisegate_floor_track_sec=settings.preprocess.noisegate_floor_track_sec,
+        )
+        preprocessor = AudioPreprocessor(
+            sample_rate=sr, frame_ms=frame_ms_default, params=pp_params
+        )
+        output(
+            f"[preprocess] enabled target_rms={pp_params.agc_target_rms} "
+            f"gain=[{pp_params.agc_min_gain:.2f}x..{pp_params.agc_max_gain:.1f}x] "
+            f"ng={pp_params.noisegate_enabled} snr={pp_params.noisegate_snr_db}dB"
+        )
+    # 2) VAD: FSMN + (可选) EnergyVAD, 组合 start=OR/end=AND
+    vad_model = VADAdapter(
+        str(paths["vad"]),
+        threshold=settings.vad.fsmn_threshold,
+    )
+    energy_vad: EnergyVAD | None = None
+    if settings.vad.energy_vad_enabled:
+        ev_params = EnergyVADParams(
+            snr_threshold_linear=settings.vad.energy_snr_linear,
+            abs_min_rms=settings.vad.energy_abs_min_rms,
+            start_frames=settings.vad.energy_start_frames,
+            hangover_frames=settings.vad.energy_hangover_frames,
+        )
+        energy_vad = EnergyVAD(
+            sample_rate=sr, frame_ms=frame_ms_default, params=ev_params
+        )
+        output(
+            f"[vad] energy enabled snr={ev_params.snr_threshold_linear:.1f}x "
+            f"start={ev_params.start_frames} hangover={ev_params.hangover_frames}"
+        )
+    vad = CompositeVAD(
+        fsmn_vad=vad_model,
+        energy_vad=energy_vad,
+        start_mode=settings.vad.combine_start_mode,
+        end_mode=settings.vad.combine_end_mode,
+        sample_rate=sr,
+        frame_ms=frame_ms_default,
+    )
+    output(
+        f"[vad] composite start={settings.vad.combine_start_mode} "
+        f"end={settings.vad.combine_end_mode} "
+        f"fsmn_th={settings.vad.fsmn_threshold}"
+    )
+
     stream = StreamingASRAdapter(str(paths["asr_streaming"]))
     speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
-    capture = AudioCapture(settings.audio, device=device)
+    capture = AudioCapture(settings.audio, device=device, preprocessor=preprocessor)
 
     # Shared mutable threshold for cross-thread access
     shared_threshold = {

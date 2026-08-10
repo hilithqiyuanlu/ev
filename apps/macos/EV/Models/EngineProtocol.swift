@@ -77,6 +77,7 @@ struct Segment: Identifiable, Hashable {
     let wakeDetected: Bool
     let queryCandidate: Bool
     let queryText: String
+    let wasCorrected: Bool
 
     var speakerDisplayLabel: String {
         switch speakerLabel {
@@ -102,6 +103,7 @@ struct Segment: Identifiable, Hashable {
         self.wakeDetected = object["wake_detected"]?.bool ?? (object["wake_detected"]?.double == 1)
         self.queryCandidate = object["query_candidate"]?.bool ?? (object["query_candidate"]?.double == 1)
         self.queryText = object["query_text"]?.string ?? ""
+        self.wasCorrected = object["was_corrected"]?.bool ?? (object["was_corrected"]?.double == 1)
     }
 }
 
@@ -186,6 +188,38 @@ struct VoiceSample: Identifiable, Hashable {
         self.transcriptHint = object["transcript_hint"]?.string
         self.tier = object["tier"]?.string ?? "core"
         self.isManual = object["is_manual"]?.bool ?? (object["is_manual"]?.double == 1)
+    }
+}
+
+struct LexiconItem: Identifiable, Hashable {
+    let id: String
+    let word: String
+    let weight: Double
+    let source: String  // "manual", "auto", "system"
+    let useCount: Int
+    let createdAt: String
+
+    var sourceLabel: String {
+        switch source {
+        case "manual": return "手动"
+        case "auto": return "自动"
+        case "system": return "系统"
+        default: return source
+        }
+    }
+
+    init?(_ value: JSONValue) {
+        guard let object = value.object,
+              let id = object["id"]?.string,
+              let word = object["word"]?.string,
+              let source = object["source"]?.string,
+              let createdAt = object["created_at"]?.string else { return nil }
+        self.id = id
+        self.word = word
+        self.weight = object["weight"]?.double ?? 2.0
+        self.source = source
+        self.useCount = Int(object["use_count"]?.double ?? 0)
+        self.createdAt = createdAt
     }
 }
 

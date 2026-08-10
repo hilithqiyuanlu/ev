@@ -72,19 +72,6 @@ struct SettingsView: View {
                     ChecklistRow("声纹已建立", done: model.voiceProfile.isReady,
                                 detail: voiceProfileDetail)
                 }
-                if model.isOnboardingComplete {
-                    HStack(spacing: 10) {
-                        statusIcon("checkmark.circle.fill", color: .green)
-                        Text("准备就绪！前往首页开始使用")
-                            .font(.subheadline)
-                            .foregroundStyle(.green)
-                        Spacer()
-                        Button("前往首页") {
-                            NotificationCenter.default.post(name: NSNotification.Name("goHome"), object: nil)
-                        }
-                    }
-                    .padding(.top, 6)
-                }
             }
         }
     }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass
@@ -9,6 +10,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+
+# Chinese stopwords: common function words, particles, pronouns that should not be auto-learned
+_STOPWORDS = frozenset({
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+    "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
+    "自己", "这", "他", "她", "它", "们", "那", "些", "什么", "怎么", "如何", "为什么",
+    "哪里", "哪个", "谁", "吗", "呢", "吧", "啊", "哦", "嗯", "呃", "诶", "唉", "哈",
+    "喂", "哎", "噢", "呀", "哇", "啦", "哟", "呗", "噻", "咯", "嗬", "嗯啊",
+    "那个", "这个", "就是", "然后", "所以", "因为", "但是", "不过", "其实", "可能",
+    "应该", "可以", "已经", "还是", "只是", "不是", "没", "被", "把", "让", "给",
+    "从", "向", "对", "与", "及", "等", "而", "且", "或", "但", "之", "其", "此",
+    "以", "于", "为", "将", "能", "会", "要", "想", "觉得", "知道", "时候", "现在",
+    "今天", "明天", "昨天", "这里", "那里", "这样", "那样", "这么", "那么", "怎么",
+    "一下", "一点", "一些", "有些", "某个", "某种", "东西", "事情", "问题",
+})
+
+_PUNCT_RE = re.compile(r"[\s，。！？、；：""''（）【】…—\[\]().,!?;:+\-=~`@#$%^&*|\\/<>]+")
 
 
 @dataclass(frozen=True)
@@ -93,18 +111,33 @@ class Store:
               status TEXT NOT NULL DEFAULT 'pending',
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS lexicon (
+              id TEXT PRIMARY KEY,
+              word TEXT NOT NULL UNIQUE,
+              weight REAL NOT NULL DEFAULT 2.0,
+              source TEXT NOT NULL CHECK(source IN ('manual','auto','system')),
+              use_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_segments_started_at ON segments(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_segments_speaker ON segments(speaker_label);
             CREATE INDEX IF NOT EXISTS idx_queries_created_at ON queries(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_speaker_samples_created ON speaker_samples(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_lexicon_source ON lexicon(source);
+            CREATE INDEX IF NOT EXISTS idx_lexicon_word ON lexicon(word);
             """
         )
         self._migrate_samples_v4()
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_speaker_samples_tier ON speaker_samples(tier)")
         self._migrate_binary_classification_v5()
         self._migrate_remove_unknown_v6()
-        self.connection.execute("PRAGMA user_version=6")
+        self._migrate_lexicon_v7()
+        self._migrate_corrections_v8()
+        self._migrate_cleanup_high_freq_v9()
+        self.connection.execute("PRAGMA user_version=9")
         self._migrate_legacy_profile()
+        self._seed_system_words()
         self.connection.commit()
 
     def _migrate_samples_v4(self) -> None:
@@ -126,6 +159,70 @@ class Store:
     def _migrate_remove_unknown_v6(self) -> None:
         """Remove 'unknown' label - cold-start segments are treated as 'user'."""
         self.connection.execute("UPDATE segments SET speaker_label='user' WHERE speaker_label='unknown'")
+
+    def _migrate_lexicon_v7(self) -> None:
+        """Create lexicon table if it doesn't exist (v7)."""
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lexicon (
+              id TEXT PRIMARY KEY,
+              word TEXT NOT NULL UNIQUE,
+              weight REAL NOT NULL DEFAULT 2.0,
+              source TEXT NOT NULL CHECK(source IN ('manual','auto','system')),
+              use_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_lexicon_source ON lexicon(source)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_lexicon_word ON lexicon(word)")
+
+    def _migrate_corrections_v8(self) -> None:
+        """Create correction_history table (v8) for ASR error tracking."""
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS correction_history (
+              id TEXT PRIMARY KEY,
+              segment_id TEXT REFERENCES segments(id) ON DELETE SET NULL,
+              asr_text TEXT NOT NULL,
+              corrected_text TEXT NOT NULL,
+              source TEXT NOT NULL CHECK(source IN ('manual_edit','manual_add_word','implicit_repeat')),
+              context TEXT,
+              speaker_label TEXT,
+              speaker_score REAL,
+              audio_path TEXT,
+              is_applied INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_corrections_source ON correction_history(source)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_corrections_applied ON correction_history(is_applied)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_corrections_created ON correction_history(created_at)")
+
+    def _migrate_cleanup_high_freq_v9(self) -> None:
+        """Clean up legacy high-frequency auto-learned words (weight=1.5) from v7/v8.
+        These were added by the naive high-frequency word learner which produced garbage.
+        Only keep auto words from correction learning (weight >= 2.0).
+        """
+        self.connection.execute("DELETE FROM lexicon WHERE source='auto' AND weight < 2.0")
+
+    def _seed_system_words(self) -> None:
+        """Seed built-in system words (wake words) that cannot be deleted."""
+        now = datetime.now(timezone.utc).isoformat()
+        system_words = [
+            ("小E", 5.0),
+            ("小e", 5.0),
+        ]
+        for word, weight in system_words:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO lexicon (id, word, weight, source, use_count, created_at, updated_at)
+                VALUES (?, ?, ?, 'system', 0, ?, ?)
+                """,
+                (uuid.uuid4().hex, word, weight, now, now),
+            )
 
     def _migrate_legacy_profile(self) -> None:
         """Migrate legacy single-embedding profile to a sample entry if samples table is empty."""
@@ -224,7 +321,22 @@ class Store:
             f"SELECT * FROM segments{where} ORDER BY started_at DESC LIMIT :limit OFFSET :offset",
             params,
         ).fetchall()
-        return [dict(row) for row in rows]
+        results = [dict(row) for row in rows]
+        # Annotate with correction status
+        if results:
+            ids = [r["id"] for r in results]
+            placeholders = ",".join("?" * len(ids))
+            corrected_ids = {
+                row["segment_id"]
+                for row in self.connection.execute(
+                    f"SELECT DISTINCT segment_id FROM correction_history WHERE segment_id IN ({placeholders}) AND source='manual_edit'",
+                    ids,
+                ).fetchall()
+                if row["segment_id"]
+            }
+            for r in results:
+                r["was_corrected"] = r["id"] in corrected_ids
+        return results
 
     def list_queries(self, limit: int = 100) -> list[dict]:
         rows = self.connection.execute(
@@ -234,9 +346,20 @@ class Store:
         return [dict(row) for row in rows]
 
     def delete_query(self, query_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT source, segment_id FROM queries WHERE id=?", (query_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        segment_id = row["segment_id"] if row["source"] == "voice" else None
         with self.connection:
-            cursor = self.connection.execute("DELETE FROM queries WHERE id=?", (query_id,))
-        return cursor.rowcount > 0
+            self.connection.execute("DELETE FROM queries WHERE id=?", (query_id,))
+            if segment_id:
+                self.connection.execute(
+                    "UPDATE segments SET query_candidate=0, query_text='' WHERE id=?",
+                    (segment_id,),
+                )
+        return True
 
     def delete_all_queries(self) -> int:
         with self.connection:
@@ -468,6 +591,330 @@ class Store:
             deleted = cursor.rowcount
             self.connection.execute("DELETE FROM speaker_profiles WHERE id='user-v1'")
         return deleted
+
+    # --- Lexicon (hotwords) ---
+
+    def list_lexicon(self) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT * FROM lexicon ORDER BY CASE source WHEN 'system' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END, weight DESC, use_count DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_lexicon_word(self, word: str, weight: float = 3.0, source: str = "manual") -> dict:
+        cleaned = word.strip()
+        if not cleaned:
+            raise ValueError("词语不能为空")
+        if source not in ("manual", "auto", "system"):
+            raise ValueError(f"invalid source: {source}")
+        w = max(0.5, min(10.0, float(weight)))
+        now = datetime.now(timezone.utc).isoformat()
+        word_id = uuid.uuid4().hex
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO lexicon (id, word, weight, source, use_count, created_at, updated_at)
+                VALUES (
+                    COALESCE((SELECT id FROM lexicon WHERE word=?), ?),
+                    ?, ?, ?,
+                    COALESCE((SELECT use_count FROM lexicon WHERE word=?), 0),
+                    COALESCE((SELECT created_at FROM lexicon WHERE word=?), ?),
+                    ?
+                )
+                """,
+                (cleaned, word_id, cleaned, w, source, cleaned, cleaned, now, now),
+            )
+        row = self.connection.execute("SELECT * FROM lexicon WHERE word=?", (cleaned,)).fetchone()
+        return dict(row) if row else {}
+
+    def update_lexicon_word(self, word_id: str, word: str | None = None, weight: float | None = None, promote_to_manual: bool = False) -> bool:
+        existing = self.connection.execute("SELECT * FROM lexicon WHERE id=?", (word_id,)).fetchone()
+        if existing is None:
+            return False
+        updates = []
+        params: list = []
+        if word is not None:
+            cleaned = word.strip()
+            if cleaned:
+                updates.append("word=?")
+                params.append(cleaned)
+        if weight is not None:
+            w = max(0.5, min(10.0, float(weight)))
+            updates.append("weight=?")
+            params.append(w)
+        if promote_to_manual and existing["source"] != "system":
+            updates.append("source='manual'")
+            updates.append("weight=?")
+            params.append(max(float(existing["weight"]), 3.0))
+        if not updates:
+            return False
+        updates.append("updated_at=?")
+        params.append(datetime.now(timezone.utc).isoformat())
+        params.append(word_id)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"UPDATE lexicon SET {', '.join(updates)} WHERE id=?",
+                params,
+            )
+            return cursor.rowcount > 0
+
+    def delete_lexicon_word(self, word_id: str) -> bool:
+        """Delete a lexicon entry. System words cannot be deleted."""
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM lexicon WHERE id=? AND source!='system'", (word_id,)
+            )
+            return cursor.rowcount > 0
+
+    def clear_auto_words(self) -> int:
+        """Delete all auto-learned words. Returns count deleted."""
+        with self.connection:
+            cursor = self.connection.execute("DELETE FROM lexicon WHERE source='auto'")
+            return cursor.rowcount
+
+    def get_hotwords_string(self, max_words: int = 80) -> str:
+        """Build hotwords string for FunASR: 'word1:weight word2:weight ...'
+        Prioritizes system > manual > auto, highest weight first.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT word, weight FROM lexicon
+            ORDER BY CASE source WHEN 'system' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END, weight DESC
+            LIMIT ?
+            """,
+            (max_words,),
+        ).fetchall()
+        parts = []
+        for row in rows:
+            w = str(row["word"]).strip()
+            if w and _PUNCT_RE.sub("", w):
+                wt = float(row["weight"])
+                # Format: if weight is integer-ish, use one decimal; else two
+                wstr = f"{wt:.1f}" if wt == int(wt) else f"{wt:.2f}"
+                parts.append(f"{w}:{wstr}")
+        return " ".join(parts)
+
+    def learn_high_frequency_words(self, min_count: int = 2, max_auto_words: int = 100) -> int:
+        """Deprecated: High-frequency word learning is disabled.
+        It produced too many garbage common words. Only correction-driven learning is used now.
+        """
+        return 0
+
+    def record_correction(
+        self,
+        asr_text: str,
+        corrected_text: str,
+        source: str,
+        segment_id: str | None = None,
+        context: str | None = None,
+        speaker_label: str | None = None,
+        speaker_score: float | None = None,
+        audio_path: str | None = None,
+    ) -> dict:
+        """Record an ASR correction event. This is append-only research data."""
+        if source not in ("manual_edit", "manual_add_word", "implicit_repeat"):
+            raise ValueError(f"invalid correction source: {source}")
+        now = datetime.now(timezone.utc).isoformat()
+        cid = uuid.uuid4().hex
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO correction_history
+                    (id, segment_id, asr_text, corrected_text, source, context,
+                     speaker_label, speaker_score, audio_path, is_applied, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (cid, segment_id, asr_text, corrected_text, source, context,
+                 speaker_label, speaker_score, audio_path, now),
+            )
+        row = self.connection.execute("SELECT * FROM correction_history WHERE id=?", (cid,)).fetchone()
+        return dict(row) if row else {}
+
+    def list_corrections(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        source: str | None = None,
+        is_applied: bool | None = None,
+    ) -> list[dict]:
+        sql = "SELECT * FROM correction_history WHERE 1=1"
+        params: list = []
+        if source is not None:
+            sql += " AND source=?"
+            params.append(source)
+        if is_applied is not None:
+            sql += " AND is_applied=?"
+            params.append(1 if is_applied else 0)
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = self.connection.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_corrections(self) -> int:
+        row = self.connection.execute("SELECT COUNT(*) as c FROM correction_history").fetchone()
+        return int(row["c"]) if row else 0
+
+    def learn_from_corrections(self, min_corrections: int = 1, max_auto_words: int = 100) -> list[str]:
+        """Learn new hotwords from unapplied correction history.
+
+        Conservative, predictable learning without LLM: extracts the exact difference
+        region between ASR output and user correction. No n-gram guessing, no window
+        expansion - the user explicitly told us what ASR got wrong, so we take that
+        exact text as the hotword (after filtering obvious junk).
+
+        - Requires min_corrections=1 (first correction adds immediately)
+        - Filters: small edits (<10% diff), complete rewrites (<30% similarity),
+          common words, stopwords, pure digits, single chars, words already in ASR.
+        - Supports English phrases with spaces/slashes (e.g. "vibe coding").
+        Returns list of newly added words.
+        """
+        rows = self.connection.execute(
+            "SELECT asr_text, corrected_text FROM correction_history WHERE is_applied=0"
+        ).fetchall()
+        if not rows:
+            return []
+        word_freq: dict[str, int] = {}
+
+        _COMMON_WORDS = frozenset({
+            "一个", "一些", "这种", "那个", "这个", "就是", "还是", "但是", "然后", "所以",
+            "因为", "如果", "可能", "应该", "可以", "已经", "只是", "不是", "没有",
+            "我们", "你们", "他们", "自己", "什么", "怎么", "为什么", "哪里", "哪个",
+            "时候", "现在", "今天", "明天", "昨天", "这里", "那里", "这样", "那样",
+            "一下", "一点", "东西", "事情", "问题", "觉得", "知道", "认为",
+            "希望", "需要", "开始", "继续", "进行", "通过", "使用", "以及", "或者",
+            "而且", "并且", "不过", "其实", "当然", "确实", "真的", "感觉", "发现",
+            "啊", "嗯", "哦", "呃", "诶", "唉", "哈", "喂", "哎", "噢",
+            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
+            "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有",
+            "看", "好", "自己", "这",
+        })
+
+        def _normalize(text: str) -> str:
+            """Normalize: keep alphanumeric, CJK, spaces, slashes, hyphens, dots, underscores; everything else -> space."""
+            result = []
+            for c in text:
+                if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in (' ', '/', '-', '_', '.'):
+                    result.append(c)
+                else:
+                    result.append(' ')
+            return ''.join(result).strip()
+
+        def _common_prefix_len(a: str, b: str) -> int:
+            i = 0
+            while i < len(a) and i < len(b) and a[i] == b[i]:
+                i += 1
+            return i
+
+        def _common_suffix_len(a: str, b: str) -> int:
+            i = 0
+            while i < len(a) and i < len(b) and a[-(i+1)] == b[-(i+1)]:
+                i += 1
+            return i
+
+        def _extract_replacement(asr_text: str, corrected_text: str) -> str | None:
+            """Extract the exact corrected text segment that differs from ASR.
+            Returns None if the edit should be skipped (too small, too large, or invalid)."""
+            asr_clean = _normalize(asr_text)
+            corrected_clean = _normalize(corrected_text)
+            if not corrected_clean or asr_clean == corrected_clean:
+                return None
+
+            prefix = _common_prefix_len(asr_clean, corrected_clean)
+            suffix = _common_suffix_len(asr_clean, corrected_clean)
+
+            diff = corrected_clean[prefix : len(corrected_clean) - suffix].strip()
+            compact = diff.replace(' ', '').replace('/', '').replace('-', '').replace('.', '').replace('_', '')
+
+            if len(compact) < 2:
+                return None
+            if len(compact) > 20:
+                return None
+            if compact.isdigit():
+                return None
+            if diff in _COMMON_WORDS or compact in _COMMON_WORDS:
+                return None
+            if diff in _STOPWORDS:
+                return None
+            if diff in asr_clean:
+                return None
+
+            lcs_approx = prefix + suffix
+            if lcs_approx < 2:
+                return None
+
+            return diff
+
+        for row in rows:
+            asr_text = row["asr_text"] or ""
+            corrected_text = row["corrected_text"] or ""
+            w = _extract_replacement(asr_text, corrected_text)
+            if w is not None:
+                word_freq[w] = word_freq.get(w, 0) + 1
+
+        auto_count = self.connection.execute(
+            "SELECT COUNT(*) as c FROM lexicon WHERE source='auto'"
+        ).fetchone()["c"]
+        added_words: list[str] = []
+        now = datetime.now(timezone.utc).isoformat()
+        for word, count in sorted(word_freq.items(), key=lambda x: (-len(x[0].replace(' ', '')), -x[1])):
+            if count < min_corrections:
+                continue
+            existing = self.connection.execute(
+                "SELECT id, source, use_count, weight FROM lexicon WHERE word=?", (word,)
+            ).fetchone()
+            if existing is not None:
+                if existing["source"] in ("manual", "system"):
+                    with self.connection:
+                        self.connection.execute(
+                            "UPDATE lexicon SET use_count=use_count+?, updated_at=? WHERE id=?",
+                            (count, now, existing["id"]),
+                        )
+                else:
+                    with self.connection:
+                        self.connection.execute(
+                            "UPDATE lexicon SET use_count=use_count+?, updated_at=? WHERE id=?",
+                            (count, now, existing["id"]),
+                        )
+                continue
+            if auto_count + len(added_words) >= max_auto_words:
+                with self.connection:
+                    self.connection.execute(
+                        """
+                        DELETE FROM lexicon WHERE source='auto' AND id IN (
+                            SELECT id FROM lexicon WHERE source='auto'
+                            ORDER BY use_count ASC, updated_at ASC
+                            LIMIT ?
+                        )
+                        """,
+                        (max(1, max_auto_words // 10),),
+                    )
+            word_id = uuid.uuid4().hex
+            with self.connection:
+                self.connection.execute(
+                    """
+                    INSERT INTO lexicon (id, word, weight, source, use_count, created_at, updated_at)
+                    VALUES (?, ?, 2.0, 'auto', ?, ?, ?)
+                    """,
+                    (word_id, word, count, now, now),
+                )
+            added_words.append(word)
+        with self.connection:
+            self.connection.execute("UPDATE correction_history SET is_applied=1 WHERE is_applied=0")
+        return added_words
+
+    def update_segment_transcript(self, segment_id: str, corrected_text: str) -> dict | None:
+        """Update a segment's transcript_final and return the updated row, or None if not found."""
+        row = self.connection.execute(
+            "SELECT * FROM segments WHERE id=?", (segment_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        with self.connection:
+            self.connection.execute(
+                "UPDATE segments SET transcript_final=? WHERE id=?",
+                (corrected_text, segment_id),
+            )
+        row = self.connection.execute("SELECT * FROM segments WHERE id=?", (segment_id,)).fetchone()
+        return dict(row) if row else None
 
     def close(self) -> None:
         self.connection.close()
