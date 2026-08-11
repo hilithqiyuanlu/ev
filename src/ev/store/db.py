@@ -111,7 +111,7 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS speaker_samples (
               id TEXT PRIMARY KEY,
-              segment_id TEXT REFERENCES segments(id) ON DELETE CASCADE,
+              segment_id TEXT REFERENCES segments(id) ON DELETE SET NULL,
               audio_path TEXT NOT NULL,
               duration_ms INTEGER NOT NULL,
               embedding_blob BLOB NOT NULL,
@@ -157,7 +157,8 @@ class Store:
         self._migrate_speaker_turns_v11()
         self._migrate_end_trigger_v12()
         self._migrate_quality_v13()
-        self.connection.execute("PRAGMA user_version=13")
+        self._migrate_samples_fk_v14()
+        self.connection.execute("PRAGMA user_version=14")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -171,6 +172,51 @@ class Store:
             self.connection.execute("ALTER TABLE speaker_samples ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0")
         # Ensure check constraint by updating any invalid values
         self.connection.execute("UPDATE speaker_samples SET tier='core' WHERE tier NOT IN ('core','cache')")
+
+    def _migrate_samples_fk_v14(self) -> None:
+        """Rebuild speaker_samples so deleting a history segment NULLs sample.segment_id
+        instead of cascading the sample away (v13->v14). Sample wavs live in the managed
+        voice-samples dir and are only removed via explicit sample deletion/reset."""
+        fks = self.connection.execute("PRAGMA foreign_key_list(speaker_samples)").fetchall()
+        if not any(row["on_delete"] == "CASCADE" for row in fks):
+            return
+        with self.connection:
+            self.connection.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self.connection.execute(
+                    """
+                    CREATE TABLE speaker_samples_new (
+                      id TEXT PRIMARY KEY,
+                      segment_id TEXT REFERENCES segments(id) ON DELETE SET NULL,
+                      audio_path TEXT NOT NULL,
+                      duration_ms INTEGER NOT NULL,
+                      embedding_blob BLOB NOT NULL,
+                      embedding_dim INTEGER NOT NULL,
+                      score REAL NOT NULL,
+                      tier TEXT NOT NULL DEFAULT 'core' CHECK(tier IN ('core','cache')),
+                      is_manual INTEGER NOT NULL DEFAULT 0,
+                      created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO speaker_samples_new
+                      (id, segment_id, audio_path, duration_ms, embedding_blob, embedding_dim, score, tier, is_manual, created_at)
+                    SELECT id, segment_id, audio_path, duration_ms, embedding_blob, embedding_dim, score, tier, is_manual, created_at
+                    FROM speaker_samples
+                    """
+                )
+                self.connection.execute("DROP TABLE speaker_samples")
+                self.connection.execute("ALTER TABLE speaker_samples_new RENAME TO speaker_samples")
+            finally:
+                self.connection.execute("PRAGMA foreign_keys=ON")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_speaker_samples_created ON speaker_samples(created_at DESC)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_speaker_samples_tier ON speaker_samples(tier)"
+            )
 
     def _migrate_binary_classification_v5(self) -> None:
         """Migrate from three-class (user/uncertain/non-user) to binary (user/non-user).

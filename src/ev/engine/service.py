@@ -845,7 +845,7 @@ class EngineService:
         with Store(self.settings.db_path) as store:
             deleted = store.delete_segment(segment_id)
         self.writer.emit("segment_deleted", {"segment_id": segment_id, "deleted": deleted}, request.request_id)
-        # Cascade may have deleted voice samples - refresh profile
+        # 历史删除与声纹解耦：样本保留，segment_id 置空（schema v14 ON DELETE SET NULL）
         with Store(self.settings.db_path) as store:
             profile = store.profile_status()
         profile["auto_learn"] = self._voice_auto_learn
@@ -855,7 +855,7 @@ class EngineService:
         with Store(self.settings.db_path) as store:
             count = store.delete_all_segments()
         self.writer.emit("segments_deleted", {"count": count}, request.request_id)
-        # Deleting all segments removes non-manual voice samples - refresh profile
+        # 同上：清空历史不影响声纹样本
         with Store(self.settings.db_path) as store:
             profile = store.profile_status()
         profile["auto_learn"] = self._voice_auto_learn
