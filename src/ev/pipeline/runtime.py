@@ -30,6 +30,7 @@ from ..asr.qwen3_adapter import Qwen3ASRAdapter
 from ..audio.capture import AudioCapture
 from ..audio.preprocess import AudioPreprocessor, PreprocessParams
 from ..audio.energy_vad import EnergyVAD, EnergyVADParams
+from ..audio.voice_check import classify_voice
 from ..config import Settings
 from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import (
@@ -778,6 +779,18 @@ class SegmentWorker:
                                 _quality_label = "rejected_low_level"
                             elif _snr_db < _seg.min_snr_db:
                                 _quality_label = "rejected_low_snr"
+                    # --- 声学特征检测 (非人声过滤: 风扇/键盘/稳态噪声) ---
+                    # 仅在 quality_label 仍为 "ok" 时运行 (SNR/电平已通过的段才做二次检查)
+                    _voice_result = {}
+                    if _quality_label == "ok" and job.raw_audio is not None and job.raw_audio.size > 0:
+                        _voice_result = classify_voice(job.raw_audio, int(self.settings.audio.sample_rate))
+                        if not job.is_warmup and not _voice_result.get("is_voice", True):
+                            _quality_label = "rejected_non_voice"
+                            self.output(
+                                f"[{job.segment_id[:8]}] voice check: non-voice → "
+                                f"{_voice_result.get('reasons', [])}"
+                            )
+
                     _is_quality_rejected = _quality_label != "ok"
 
                     # Very short segments (< 800ms) with no speaker turns AND empty/meaningless partial

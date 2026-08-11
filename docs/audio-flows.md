@@ -80,6 +80,7 @@ OBSERVING 门内 VAD end → 静默丢弃回 IDLE (咳嗽/短促他人声, 不�
 - warm-up 期 (前 3s) 不拒绝
 - `avg_raw_rms < min_audible_rms (0.0005)` → `rejected_low_level`
 - `snr_db < min_snr_db (3.0)` → `rejected_low_snr`
+- **声学特征二次检查**（仅 SNR/电平通过的段）：ZCR、频谱质心、频谱平坦度、RMS 包络方差 → `rejected_non_voice`
 - 质量拒绝段跳过 final ASR，转写留空，但 WAV 仍存档 + DB 写质量元数据
 
 **6.2 终稿 ASR**（懒加载，首个非跳过段才加载）：

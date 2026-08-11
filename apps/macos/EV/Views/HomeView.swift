@@ -3,6 +3,7 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @State private var queryText = ""
+    @State private var showDevicePopover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -45,44 +46,46 @@ struct HomeView: View {
     }
 
     private var deviceMenu: some View {
-        Menu {
-            if model.devicePickerItems.isEmpty {
-                Text("无可用设备")
-            }
-            ForEach(model.devicePickerItems, id: \.tag) { item in
-                Button {
-                    model.selectedDevice = item.tag
-                } label: {
-                    HStack {
-                        Text(item.label)
-                        Spacer()
-                        if model.selectedDevice == item.tag || (model.selectedDevice.isEmpty && item.isDefault) {
-                            Image(systemName: "checkmark")
+        Button {
+            showDevicePopover = true
+        } label: {
+            Text(model.selectedDeviceLabel)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+        }
+        .buttonStyle(CapsuleButtonStyle())
+        .disabled(model.isListening || model.devices.isEmpty)
+        .popover(isPresented: $showDevicePopover, arrowEdge: .bottom) {
+            VStack(spacing: 0) {
+                if model.devicePickerItems.isEmpty {
+                    Text("无可用设备")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                }
+                ForEach(model.devicePickerItems, id: \.tag) { item in
+                    Button {
+                        model.selectedDevice = item.tag
+                        showDevicePopover = false
+                    } label: {
+                        HStack {
+                            Text(item.label)
+                            Spacer()
+                            if model.selectedDevice == item.tag || (model.selectedDevice.isEmpty && item.isDefault) {
+                                Image(systemName: "checkmark")
+                            }
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
                     }
+                    .buttonStyle(.plain)
                 }
             }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "mic.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                Text(model.selectedDeviceLabel)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .foregroundStyle(model.devices.isEmpty ? .tertiary : .primary)
-            .contentShape(Rectangle())
+            .padding(4)
+            .frame(width: 280)
         }
-        .menuStyle(.borderlessButton)
-        .disabled(model.isListening || model.devices.isEmpty)
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.secondary.opacity(0.06))
-                .contentShape(Rectangle())
-        )
         .help(
             model.isListening
                 ? "监听中无法切换设备，请先停止监听"
