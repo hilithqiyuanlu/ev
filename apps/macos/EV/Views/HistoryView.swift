@@ -148,6 +148,10 @@ struct HistoryView: View {
 
     // MARK: - Filter Header
 
+    private var invalidSegmentCount: Int {
+        model.segments.filter { $0.qualityLabel != "ok" }.count
+    }
+
     private var filterHeader: some View {
         HStack(alignment: .center, spacing: 12) {
             dateCapsule
@@ -157,6 +161,7 @@ struct HistoryView: View {
             if model.isLoadingHistory {
                 ProgressView().controlSize(.small)
             }
+            clearInvalidCapsule
             clearCapsule
         }
     }
@@ -301,6 +306,34 @@ struct HistoryView: View {
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color.secondary.opacity(0.06))
         )
+    }
+
+    private var clearInvalidCapsule: some View {
+        Button {
+            model.deleteQualityRejectedSegments()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "line.3.horizontal.decrease")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("清空无效")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(invalidSegmentCount == 0 ? .tertiary : .secondary)
+            .background(
+                GeometryReader { _ in EmptyView() }
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(invalidSegmentCount == 0)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+        )
+        .help("仅删除信噪比低、音量过低、非人声等质量不佳的录音段，保留正常录音")
     }
 
     private var clearCapsule: some View {

@@ -157,6 +157,7 @@ final class AppModel: ObservableObject {
     private let engine: EngineTransport
     private let permissionProvider: MicrophonePermissionProviding
     private var didInitialRefresh = false
+    private var receivedInitialDeviceList = false
     private var deviceRefreshTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
@@ -386,6 +387,10 @@ final class AppModel: ObservableObject {
 
     func deleteAllSegments() {
         engine.send("delete_all_segments")
+    }
+
+    func deleteQualityRejectedSegments() {
+        engine.send("delete_quality_rejected_segments")
     }
 
     func deleteQuery(_ id: String) {
@@ -641,23 +646,42 @@ final class AppModel: ObservableObject {
                 refreshAll()
             }
         case "device_list":
-            devices = event.payload["devices"]?.array?.compactMap(AudioDevice.init) ?? []
-            let deviceNames = Set(devices.map(\.name))
-            // 1) 系统默认哨兵值 (空串) —— 永远保留用户选择
-            if selectedDevice == Self.systemDefaultDeviceTag {
-                // no-op
+            let newDevices = event.payload["devices"]?.array?.compactMap(AudioDevice.init) ?? []
+            let previousNames = Set(devices.map(\.name))
+            devices = newDevices
+            let deviceNames = Set(newDevices.map(\.name))
+
+            if receivedInitialDeviceList {
+                // 新接入且成为系统默认 → 自动切到系统默认（跟随新默认设备）
+                if let addedDefault = newDevices.first(where: { !previousNames.contains($0.name) && $0.isDefault }) {
+                    selectedDevice = Self.systemDefaultDeviceTag
+                    lastEngineLog = String(
+                        (lastEngineLog + "已接入新默认输入设备「\(addedDefault.name)」，已切换为使用系统默认\n")
+                            .suffix(8_192)
+                    )
+                }
+                // 用户选中的设备被拔出 → 回退到系统默认
+                else if selectedDevice != Self.systemDefaultDeviceTag && !deviceNames.contains(selectedDevice) {
+                    let removed = selectedDevice
+                    selectedDevice = Self.systemDefaultDeviceTag
+                    lastEngineLog = String(
+                        (lastEngineLog + "输入设备「\(removed)」已断开，已自动切换为使用系统默认\n")
+                            .suffix(8_192)
+                    )
+                }
+                // 其余情况 —— 不再强制覆盖用户手动选择（避免闪烁）
+            } else {
+                // 首次列表到达：校验 UserDefaults 恢复的设备是否仍存在
+                receivedInitialDeviceList = true
+                if selectedDevice != Self.systemDefaultDeviceTag && !deviceNames.contains(selectedDevice) {
+                    let persisted = selectedDevice
+                    selectedDevice = Self.systemDefaultDeviceTag
+                    lastEngineLog = String(
+                        (lastEngineLog + "保存的输入设备「\(persisted)」不在当前列表中，已回退为使用系统默认\n")
+                            .suffix(8_192)
+                    )
+                }
             }
-            // 2) 用户选了具体设备 → 只有当设备真的不在列表中 (被拔出) 才回退到系统默认
-            else if !deviceNames.contains(selectedDevice) {
-                let removed = selectedDevice
-                selectedDevice = Self.systemDefaultDeviceTag
-                lastEngineLog = String(
-                    (lastEngineLog + "输入设备「\(removed)」已断开，已自动切换为使用系统默认\n")
-                        .suffix(8_192)
-                )
-            }
-            // 3) 其余情况 —— 不再强制覆盖 selectedDevice
-            //    (修复「未监听时系统默认设备变动会瞬间覆盖用户手动选择」导致的闪烁)
             completeOnboardingIfNeeded()
         case "audio_level":
             audioLevel = min(max((event.payload["rms"]?.double ?? 0) * 10, 0), 1)

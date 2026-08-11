@@ -40,6 +40,7 @@ class TranscriptionResult:
     segments: list[TranscriptionSegment] = field(default_factory=list)
     language: str | None = None
     confidence: float | None = None
+    avg_logprob: float | None = None  # 生成序列的平均 log 概率 (越低越不确定)
 
     @property
     def has_timestamps(self) -> bool:

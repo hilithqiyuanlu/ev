@@ -122,6 +122,7 @@ class EngineService:
             "list_segments": self._list_segments,
             "delete_segment": self._delete_segment,
             "delete_all_segments": self._delete_all_segments,
+            "delete_quality_rejected_segments": self._delete_quality_rejected_segments,
             "submit_manual_query": self._submit_manual_query,
             "delete_query": self._delete_query,
             "delete_all_queries": self._delete_all_queries,
@@ -856,6 +857,19 @@ class EngineService:
             count = store.delete_all_segments()
         self.writer.emit("segments_deleted", {"count": count}, request.request_id)
         # 同上：清空历史不影响声纹样本
+        with Store(self.settings.db_path) as store:
+            profile = store.profile_status()
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
+
+    def _delete_quality_rejected_segments(self, request: EngineRequest) -> None:
+        with Store(self.settings.db_path) as store:
+            count = store.delete_quality_rejected_segments()
+        self.writer.emit(
+            "segments_deleted",
+            {"count": count, "reason": "quality_rejected"},
+            request.request_id,
+        )
         with Store(self.settings.db_path) as store:
             profile = store.profile_status()
         profile["auto_learn"] = self._voice_auto_learn

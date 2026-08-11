@@ -100,7 +100,7 @@ class AsrSettings:
 
     hotword_boosting_enabled: bool = True
     hotword_boost_scale: float = 2.0    # 每个权重单位叠加的 logits 增量
-    hotword_boost_max: float = 6.0      # 单 token 叠加上限
+    hotword_boost_max: float = 4.0      # 单 token 叠加上限 (6→4, 防弱信号幻觉)
     hotword_min_anchor_len: int = 1     # 触发所需的最少已匹配前缀字符数
     hotword_inject_max_words: int = 30  # prompt 注入的最大词数
 
@@ -347,7 +347,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         asr=AsrSettings(
             hotword_boosting_enabled=bool(asr_raw.get("hotword_boosting_enabled", True)),
             hotword_boost_scale=float(asr_raw.get("hotword_boost_scale", 2.0)),
-            hotword_boost_max=float(asr_raw.get("hotword_boost_max", 6.0)),
+            hotword_boost_max=float(asr_raw.get("hotword_boost_max", 4.0)),
             hotword_min_anchor_len=int(asr_raw.get("hotword_min_anchor_len", 1)),
             hotword_inject_max_words=int(asr_raw.get("hotword_inject_max_words", 30)),
         ),

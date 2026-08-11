@@ -536,6 +536,17 @@ class Store:
                 deleted += 1
         return deleted
 
+    def delete_quality_rejected_segments(self) -> int:
+        """仅删除 quality_label != 'ok' 的段 (含音频文件移至 .trash)."""
+        rows = self.connection.execute(
+            "SELECT id FROM segments WHERE quality_label != 'ok'"
+        ).fetchall()
+        deleted = 0
+        for row in rows:
+            if self.delete_segment(row["id"]):
+                deleted += 1
+        return deleted
+
     @staticmethod
     def _move_to_trash(audio_path: Path) -> Path | None:
         if not audio_path.exists():

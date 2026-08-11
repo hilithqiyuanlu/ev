@@ -217,6 +217,7 @@ struct SegmentRow: View {
                 }
                 .textSelection(.enabled)
                 HStack(spacing: 10) {
+                    Text(timeFromISO(segment.startedAt))
                     Text(segment.speakerDisplayLabel)
                     Text(String(format: "%.1f 秒", Double(segment.durationMS) / 1000))
                     if let score = segment.speakerScore {
@@ -321,6 +322,7 @@ struct HistoryRow: View {
                 }
                 .textSelection(.enabled)
                 HStack(spacing: 10) {
+                    Text(timeFromISO(segment.startedAt))
                     Text(segment.speakerDisplayLabel)
                     Text(String(format: "%.1f 秒", Double(segment.durationMS) / 1000))
                     if let score = segment.speakerScore {
@@ -406,7 +408,7 @@ struct HistoryRow: View {
                         .padding(.horizontal, 5).padding(.vertical, 1)
                         .background(Color.secondary.opacity(0.15))
                         .clipShape(RoundedRectangle(cornerRadius: 3))
-                    Text(query.createdAt.prefix(19).replacingOccurrences(of: "T", with: " "))
+                    Text(timeFromISO(query.createdAt))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -444,7 +446,7 @@ struct QueryRow: View {
                         .padding(.horizontal, 5).padding(.vertical, 1)
                         .background(Color.secondary.opacity(0.15))
                         .clipShape(RoundedRectangle(cornerRadius: 3))
-                    Text(query.createdAt.prefix(19).replacingOccurrences(of: "T", with: " "))
+                    Text(timeFromISO(query.createdAt))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -520,4 +522,13 @@ private func cleanPrefix(from text: String) -> String {
         }
     }
     return result.trimmingCharacters(in: .whitespaces)
+}
+
+/// 从 ISO 8601 字符串（如 "2026-08-10T19:21:00"）中提取 "HH:mm" 部分
+private func timeFromISO(_ iso: String) -> String {
+    // ISO 格式: "2026-08-10T19:21:00" → 取 index 11..<16 → "19:21"
+    guard iso.count >= 16 else { return iso }
+    let start = iso.index(iso.startIndex, offsetBy: 11)
+    let end = iso.index(iso.startIndex, offsetBy: 16)
+    return String(iso[start..<end])
 }

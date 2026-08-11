@@ -48,6 +48,15 @@ _FILLER_WORDS = frozenset({
     "嗯", "啊", "呃", "哦", "诶", "唉", "哈", "喂", "哎", "噢",
     "那个", "这个", "就是", "然后", "所以", "嗯啊", "啊对",
 })
+# 热词幻觉检测: 自然中文必然包含功能词; 若输出全由热词组成且无功能词 → 幻觉
+_ASR_FUNCTION_WORDS: set[str] = {
+    "的", "了", "是", "在", "我", "你", "不", "有", "这", "他",
+    "也", "就", "都", "会", "要", "能", "说", "来", "去", "到",
+    "和", "很", "还", "把", "被", "让", "给", "对", "从", "与",
+    "什么", "怎么", "没有", "可以", "自己", "知道", "这个",
+    "因为", "所以", "如果", "虽然", "但是", "然后", "时候",
+    "一下", "已经", "可能", "应该", "觉得",
+}
 _PUNCT_RE = re.compile(r"[][\s，。！？、；：""''（）【】…—().,!?;:+=~`@#$%^&*|\\/<>-]+")
 
 
@@ -67,6 +76,27 @@ def _is_filler_only(text: str) -> bool:
         if not matched:
             return False
     return True
+
+
+def _compute_hotword_coverage(text: str, hotword_entries: list[tuple[str, float]]) -> float:
+    """返回 text 中被热词子串覆盖的字符比例 (0.0-1.0)."""
+    if not text or not hotword_entries:
+        return 0.0
+    n = len(text)
+    covered = bytearray(n)
+    for word, _ in hotword_entries:
+        word = word.strip()
+        if len(word) < 2:
+            continue
+        start = 0
+        while True:
+            pos = text.find(word, start)
+            if pos < 0:
+                break
+            for i in range(pos, min(pos + len(word), n)):
+                covered[i] = 1
+            start = pos + 1
+    return sum(covered) / n if n > 0 else 0.0
 
 
 _PUNCT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])\s*")
@@ -372,6 +402,25 @@ class SegmentProcessor:
         else:
             final_result = self._final(audio)
             final_text = final_result.text if final_result else ""
+
+            # --- 热词幻觉检测: 音频模糊时词典词被串联输出 ---
+            # 仅当 hotword logits boosting 活跃时检查 (Qwen3-ASR + 有热词 + 未禁用)
+            if final_text and self.hotword_entries and self.settings.asr.hotword_boosting_enabled:
+                _hotword_density = _compute_hotword_coverage(final_text, self.hotword_entries)
+                _has_function = any(fw in final_text for fw in _ASR_FUNCTION_WORDS)
+                _avg_lp = getattr(final_result, "avg_logprob", None) if final_result else None
+                # 低置信度 (avg_logprob < -2.0) + (高热词覆盖 >55% 或 无功能词)
+                if (
+                    (_avg_lp is not None and _avg_lp < -2.0)
+                    and (_hotword_density > 0.55 or not _has_function)
+                ):
+                    self.output(
+                        f"[{segment_id[:8]}] hotword overload: "
+                        f"logprob={_avg_lp:.2f} density={_hotword_density:.2f} "
+                        f"func_words={_has_function}, falling back"
+                    )
+                    final_text = ""
+
             # Defensive fallback: if final ASR output is dramatically shorter than the
             # streaming partial (e.g. the model was token-truncated), prefer the fuller
             # partial text instead of storing a broken half-transcript.

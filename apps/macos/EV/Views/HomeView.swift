@@ -14,7 +14,7 @@ struct HomeView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .navigationTitle("首页")
+        .navigationTitle("输入")
         .onAppear { model.loadHistory() }
     }
 
@@ -47,6 +47,7 @@ struct HomeView: View {
 
     private var deviceMenu: some View {
         Button {
+            model.refreshDevices()
             showDevicePopover = true
         } label: {
             Text(model.selectedDeviceLabel)

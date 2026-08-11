@@ -220,6 +220,12 @@ class Qwen3ASRAdapter:
             "max_new_tokens": max_new_tokens,
             "do_sample": False,
         }
+        # Only materialize scores when hotword hallucination detection is active
+        # (output_scores stores [1, vocab_size] per step; up to ~150MB for 256 tokens)
+        _compute_scores = enable_hotword_boost and bool(hotword_entries)
+        if _compute_scores:
+            gen_kwargs["output_scores"] = True
+            gen_kwargs["return_dict_in_generate"] = True
         if self._suppress_tokens:
             gen_kwargs["suppress_tokens"] = self._suppress_tokens
 
@@ -239,18 +245,38 @@ class Qwen3ASRAdapter:
                 logger.warning("transformers not importable; hotword logits boost disabled")
 
         with torch.no_grad():
-            output_ids = self.model.generate(**model_inputs, **gen_kwargs)
+            outputs = self.model.generate(**model_inputs, **gen_kwargs)
 
-        new_tokens = output_ids[0][input_len:]
+        if _compute_scores:
+            new_tokens = outputs.sequences[0][input_len:]
+        else:
+            new_tokens = outputs[0][input_len:]
         if len(new_tokens) >= max_new_tokens:
             logger.warning(
                 "Qwen3-ASR output truncated at %d tokens (audio=%.1fs, variant=%s); "
                 "consider raising the token budget for long recordings",
                 max_new_tokens, duration_sec, self._model_variant,
             )
+
+        # Compute per-token log probabilities for hallucination detection
+        avg_logprob: float | None = None
+        if hasattr(outputs, "scores") and outputs.scores and len(new_tokens) > 0:
+            import torch.nn.functional as F
+            log_probs: list[float] = []
+            for i, token_id in enumerate(new_tokens):
+                if i >= len(outputs.scores):
+                    break
+                scores = outputs.scores[i][0].float()  # [vocab_size]
+                lp = F.log_softmax(scores, dim=-1)[token_id].item()
+                log_probs.append(lp)
+            if log_probs:
+                avg_logprob = float(sum(log_probs) / len(log_probs))
+
         raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
 
-        return self._parse_output(raw_text, return_timestamps)
+        result = self._parse_output(raw_text, return_timestamps)
+        result.avg_logprob = avg_logprob
+        return result
 
     def _build_hotword_processor(
         self,

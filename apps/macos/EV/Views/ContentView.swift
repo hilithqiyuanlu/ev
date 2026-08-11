@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable {
-    case home = "首页"
+    case home = "输入"
     case history = "历史"
     case lexicon = "词典"
     case models = "模型"
@@ -11,7 +11,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
-        case .home: "house"
+        case .home: "mic"
         case .history: "clock.arrow.circlepath"
         case .lexicon: "character.book.closed"
         case .models: "cube.box"

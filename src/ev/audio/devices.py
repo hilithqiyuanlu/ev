@@ -17,7 +17,12 @@ class InputDevice:
 
 
 def list_input_devices() -> list[InputDevice]:
-    default_input = sd.default.device[0]
+    # 每次实时查询系统默认输入设备（而非缓存 sd.default），
+    # 保证热插拔新默认设备后 is_default 立即正确。
+    try:
+        default_input = sd.query_devices(kind="input")["index"]
+    except Exception:
+        default_input = None
     devices: list[InputDevice] = []
     for i, d in enumerate(sd.query_devices()):
         if d["max_input_channels"] < 1:
