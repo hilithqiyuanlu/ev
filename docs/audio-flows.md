@@ -76,7 +76,7 @@ OBSERVING 门内 VAD end → 静默丢弃回 IDLE (咳嗽/短促他人声, 不�
 
 **6.0 省流** → `<800ms 且无 speaker turns 且 partial 空/语气词` → 跳过 final ASR
 
-**6.1 质量门控** → raw 音频计算 SNR / RMS / 底噪 floor（RawNoiseTracker 跨段持久）：
+**6.1 质量门控** → raw 音频分帧计算 SNR（90 百分位帧 RMS，防静音稀释）/ 底噪 floor（RawNoiseTracker 跨段持久）：
 - warm-up 期 (前 3s) 不拒绝
 - `avg_raw_rms < min_audible_rms (0.0005)` → `rejected_low_level`
 - `snr_db < min_snr_db (3.0)` → `rejected_low_snr`

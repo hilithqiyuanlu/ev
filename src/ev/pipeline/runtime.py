@@ -773,7 +773,19 @@ class SegmentWorker:
                         _peak_raw_rms = float(np.max(np.abs(_raw)))
                         _noise_floor = max(job.noise_floor_rms, 1e-7)
                         if _avg_raw_rms > 0 and _noise_floor > 0:
-                            _snr_db = float(20.0 * np.log10(_avg_raw_rms / _noise_floor))
+                            # 用 90 百分位帧 RMS 估算"说话响度", 避免段内大量静音稀释 SNR
+                            # (远场轻声 + 自然停顿 → 全段均值 RMS 会系统性低估真实语音 SNR)
+                            _frame_len = int(self.settings.audio.sample_rate * 0.030)
+                            _n_frames = max(1, len(_raw) // _frame_len)
+                            if _n_frames >= 3:
+                                _frame_rms = np.array([
+                                    float(np.sqrt(np.mean(np.square(_raw[i*_frame_len:(i+1)*_frame_len]))))
+                                    for i in range(_n_frames)
+                                ])
+                                _speech_rms = float(np.percentile(_frame_rms, 90))
+                            else:
+                                _speech_rms = _avg_raw_rms
+                            _snr_db = float(20.0 * np.log10(max(_speech_rms, 1e-10) / _noise_floor))
                         if not job.is_warmup:
                             if _avg_raw_rms < _seg.min_audible_rms:
                                 _quality_label = "rejected_low_level"
@@ -793,35 +805,42 @@ class SegmentWorker:
 
                     _is_quality_rejected = _quality_label != "ok"
 
-                    # Very short segments (< 800ms) with no speaker turns AND empty/meaningless partial
-                    # skip final ASR to save inference cost. Final ASR provides hotword boosting
-                    # and higher accuracy, so we only skip for truly tiny/no-content segments.
-                    # Quality-rejected segments also skip final ASR (audio too poor to transcribe).
+                    # --- final ASR 模型懒加载 (一次性, 不因质量拒绝而跳过) ---
+                    # 模型加载与"是否跑推理"解耦: 质量拒绝段不跑推理,
+                    # 但模型必须加载好, 否则第一个合格段出现时来不及加载.
+                    with self._final_asr_lock:
+                        final = self._final_asr
+                    if final is None:
+                        final_path = self._resolve_final_asr_path()
+                        self.output(f"[final-asr] loading from {final_path.name}...")
+                        final = _create_final_asr_adapter(final_path)
+                        with self._final_asr_lock:
+                            self._final_asr = final
+                        self._reload_final.clear()
+                        self.output(f"[final-asr] {type(final).__name__} ready")
+                        _log_memory(f"final-asr loaded ({type(final).__name__})")
+                    processor.final_asr = final
+
+                    # --- 推理跳过决策 (仅限两类: 极短无内容段 + 质量拒绝段) ---
                     _VERY_SHORT_MS = 800
                     partial_clean = job.partial.strip() if job.partial else ""
                     is_very_short = duration_ms < _VERY_SHORT_MS and not job.speaker_turns
                     has_no_content = (not partial_clean) or _is_filler_only(partial_clean)
-                    skip_final = (is_very_short and has_no_content) or _is_quality_rejected
+                    _skip_very_short = is_very_short and has_no_content
 
-                    if not skip_final:
-                        with self._final_asr_lock:
-                            final = self._final_asr
-                        if final is None:
-                            final_path = self._resolve_final_asr_path()
-                            self.output(f"[final-asr] loading from {final_path.name}...")
-                            final = _create_final_asr_adapter(final_path)
-                            with self._final_asr_lock:
-                                self._final_asr = final
-                            processor.final_asr = final
-                            self._reload_final.clear()
-                            self.output(f"[final-asr] {type(final).__name__} ready")
-                            _log_memory(f"final-asr loaded ({type(final).__name__})")
-                    else:
-                        # Temporarily bypass final ASR for this very short empty segment
+                    if _skip_very_short:
+                        # 极短无内容段: 临时绕过 final ASR (process() 会 fallback 到 partial)
                         processor.final_asr = None
                         self.output(
-                            f"[{job.segment_id[:8]}] very short no-content segment "
+                            f"[{job.segment_id[:8]}] very short no-content "
                             f"({duration_ms}ms), skipping final ASR"
+                        )
+                    elif _is_quality_rejected:
+                        # 质量拒绝段: final_asr 保持设置, 但 process() 内部跳过 _final()
+                        self.output(
+                            f"[{job.segment_id[:8]}] quality rejected "
+                            f"({_quality_label}, rms={_avg_raw_rms:.5f}, snr={_snr_db:.1f}dB), "
+                            f"skipping final ASR"
                         )
 
                     record = processor.process(
@@ -840,10 +859,9 @@ class SegmentWorker:
                         snr_db=_snr_db,
                     )
 
-                    # Restore final_asr on processor after short-segment skip
-                    if skip_final:
-                        with self._final_asr_lock:
-                            processor.final_asr = self._final_asr
+                    # 恢复极短段绕过的 final_asr
+                    if _skip_very_short:
+                        processor.final_asr = final
 
                     if record is None:
                         self.emit(

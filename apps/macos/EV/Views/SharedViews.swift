@@ -499,6 +499,7 @@ private func qualityLabelText(_ label: String) -> String {
     switch label {
     case "rejected_low_snr": return "信噪比低"
     case "rejected_low_level": return "音量过低"
+    case "rejected_non_voice": return "非人声"
     default: return label
     }
 }
