@@ -12,6 +12,8 @@ class ModelType(str, Enum):
     ASR_STREAMING = "asr_streaming"
     ASR_FINAL = "asr_final"
     SPEAKER = "speaker"
+    SPEECH_ENHANCEMENT = "speech_enhancement"
+    ENVIRONMENT = "environment"
 
 
 class ModelSource(str, Enum):
@@ -73,29 +75,18 @@ _DEFAULT_CATALOG: tuple[ModelDefinition, ...] = (
         needs_seg_dict=True,
     ),
     ModelDefinition(
-        key="paraformer-zh",
-        name="Paraformer Large",
+        key="sensevoice-small",
+        name="SenseVoice Small",
         type=ModelType.ASR_FINAL,
         source=ModelSource.GITHUB,
-        default_dirname="ev-paraformer-zh-16k",
-        description="FunASR Paraformer 中文非流式识别",
+        default_dirname="ev-sensevoice-small",
+        description="SenseVoice Small 多语言终稿识别，支持中英日韩粤",
         github_asset_key="asr_final",
-        github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-paraformer-zh-16k.tar.gz",
-        github_filename="ev-paraformer-zh-16k.tar.gz",
-        github_size=921180174,
-        github_sha256="13b8c7b7ca8bdd15dc472885a9b9d3009e2659728098188a70f50b0b375193c9",
+        github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-sensevoice-small.tar.gz",
+        github_filename="ev-sensevoice-small.tar.gz",
+        github_size=870_507_697,
+        github_sha256="f61dcfc2fd855e25c1990eda841113e45d6521bfbd115a9bdd559106554c03cb",
         needs_tokens=True,
-    ),
-    ModelDefinition(
-        key="qwen3-asr-0.6b",
-        name="Qwen3-ASR 0.6B",
-        type=ModelType.ASR_FINAL,
-        source=ModelSource.MODELSCOPE,
-        default_dirname="qwen3-asr-0.6b",
-        description="通义 Qwen3-ASR 轻量版，支持中英混合识别、词级时间戳",
-        modelscope_id="Qwen/Qwen3-ASR-0.6B-hf",
-        estimated_size_bytes=1_576_000_000,
-        min_memory_gb=2.0,
     ),
     ModelDefinition(
         key="qwen3-asr-1.7b",
@@ -121,14 +112,42 @@ _DEFAULT_CATALOG: tuple[ModelDefinition, ...] = (
         github_size=68820465,
         github_sha256="a921151bb77ff72221a1b39759f12ec8ee891e167d5cc43932d350eb80dc5d3c",
     ),
+    ModelDefinition(
+        key="dfsmn-ans",
+        name="DFSMN-ANS",
+        type=ModelType.SPEECH_ENHANCEMENT,
+        source=ModelSource.MODELSCOPE,
+        default_dirname="ev-dfsmn-ans-zh-16k",
+        description="DFSMN 语音降噪模型（FunASR 前端增强）",
+        modelscope_id="damo/speech_dfsmn_ans_psm_48k_causal",
+        estimated_size_bytes=20_000_000,
+    ),
+    ModelDefinition(
+        key="yamnet",
+        name="YAMNet",
+        type=ModelType.ENVIRONMENT,
+        source=ModelSource.GITHUB,
+        default_dirname="yamnet",
+        description="环境声音分类模型（AudioSet 521 类），独立于语音路径",
+        github_asset_key="yamnet",
+        github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-yamnet-16k.tar.gz",
+        github_filename="ev-yamnet-16k.tar.gz",
+        github_size=3_239_056,
+        github_sha256="d19fae6afc9a05537cf7960c6b038eb247c212378909833849e43c10d61203ee",
+        estimated_size_bytes=4_500_000,
+        config_filenames=("yamnet_class_map.csv",),
+        weight_suffixes=(".tflite",),
+    ),
 )
 
 # 槽位默认分配
 _DEFAULT_SLOTS: dict[str, str] = {
     "vad": "fsmn-vad",
     "asr_streaming": "paraformer-zh-streaming",
+    "speech_enhancement": "dfsmn-ans",
     "asr_final": "qwen3-asr-1.7b",
     "speaker": "eres2netv2",
+    "environment": "yamnet",
 }
 
 _ALL_SLOTS: tuple[str, ...] = tuple(_DEFAULT_SLOTS.keys())

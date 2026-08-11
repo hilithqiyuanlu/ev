@@ -1,8 +1,6 @@
 """Qwen3-ASR 适配器 — 基于 Transformers 的中英混合 ASR。
 
-支持模型:
-  - Qwen3-ASR-0.6B  (中英混合轻量版)
-  - Qwen3-ASR-1.7B  (中英混合标准版)
+支持模型: Qwen3-ASR-1.7B (中英混合标准版)
 
 适配 transformers 5.x Qwen3-ASR API（chat-template 风格多模态调用）。
 """
@@ -57,14 +55,9 @@ class Qwen3ASRAdapter:
         except (json.JSONDecodeError, OSError):
             self._model_variant = "unknown"
             return
-        name = (config.get("_name_or_path", "") or "").lower()
-        if "1.7b" in name or "1_7b" in name:
-            self._model_variant = "1.7b"
-        else:
-            self._model_variant = "0.6b"
+        self._model_variant = "1.7b"
         logger.info(
-            "Qwen3-ASR detected variant=%s at %s",
-            self._model_variant, self.model_path,
+            "Qwen3-ASR loaded at %s", self.model_path,
         )
 
     def _ensure_loaded(self) -> None:

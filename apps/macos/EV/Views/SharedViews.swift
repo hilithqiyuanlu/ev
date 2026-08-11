@@ -524,9 +524,24 @@ private func cleanPrefix(from text: String) -> String {
     return result.trimmingCharacters(in: .whitespaces)
 }
 
-/// 从 ISO 8601 字符串（如 "2026-08-10T19:21:00"）中提取 "HH:mm" 部分
+/// 从 ISO 8601 UTC 字符串中提取用户本地时区的 "HH:mm" 部分
 private func timeFromISO(_ iso: String) -> String {
-    // ISO 格式: "2026-08-10T19:21:00" → 取 index 11..<16 → "19:21"
+    let utcFormatter = ISO8601DateFormatter()
+    utcFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = utcFormatter.date(from: iso) {
+        let localFormatter = DateFormatter()
+        localFormatter.dateFormat = "HH:mm"
+        return localFormatter.string(from: date)
+    }
+    // 回退：尝试无毫秒的 ISO 8601
+    let fallbackFormatter = ISO8601DateFormatter()
+    fallbackFormatter.formatOptions = [.withInternetDateTime]
+    if let date = fallbackFormatter.date(from: iso) {
+        let localFormatter = DateFormatter()
+        localFormatter.dateFormat = "HH:mm"
+        return localFormatter.string(from: date)
+    }
+    // 最终回退
     guard iso.count >= 16 else { return iso }
     let start = iso.index(iso.startIndex, offsetBy: 11)
     let end = iso.index(iso.startIndex, offsetBy: 16)

@@ -19,11 +19,11 @@
     },
     {
       "key": "asr_final",
-      "directory": "ev-paraformer-zh-16k",
-      "filename": "ev-paraformer-zh-16k.tar.gz",
-      "url": "https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-paraformer-zh-16k.tar.gz",
-      "size": 921180174,
-      "sha256": "13b8c7b7ca8bdd15dc472885a9b9d3009e2659728098188a70f50b0b375193c9"
+      "directory": "ev-sensevoice-small",
+      "filename": "ev-sensevoice-small.tar.gz",
+      "url": "https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-sensevoice-small.tar.gz",
+      "size": 870507697,
+      "sha256": "f61dcfc2fd855e25c1990eda841113e45d6521bfbd115a9bdd559106554c03cb"
     },
     {
       "key": "speaker",

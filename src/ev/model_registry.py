@@ -606,6 +606,7 @@ class ModelRegistry:
             staging.mkdir()
             self._safe_extract(archive, staging)
 
+            backup: Path | None = None
             if target.exists():
                 backup = self.models_root / f".{definition.default_dirname}.backup"
                 if backup.exists():
@@ -613,10 +614,10 @@ class ModelRegistry:
                 os.replace(str(target), str(backup))
             try:
                 shutil.move(str(staging), str(target))
-                if backup.exists():
+                if backup is not None and backup.exists():
                     shutil.rmtree(backup)
             except Exception:
-                if backup.exists():
+                if backup is not None and backup.exists():
                     os.replace(str(backup), str(target))
                 raise
 
@@ -753,19 +754,16 @@ def _guess_model_key(slot: str, dirname: str) -> str | None:
     catalog = {
         "ev-fsmn-vad-zh-16k": "fsmn-vad",
         "ev-paraformer-zh-streaming-16k": "paraformer-zh-streaming",
-        "ev-paraformer-zh-16k": "paraformer-zh",
+        "ev-sensevoice-small": "sensevoice-small",
         "ev-eres2netv2-zh-16k": "eres2netv2",
-        "qwen3-asr-0.6b": "qwen3-asr-0.6b",
         "qwen3-asr-1.7b": "qwen3-asr-1.7b",
     }
     if dirname in catalog:
         return catalog[dirname]
-    # Handle ModelScope-style directory names (e.g. "Qwen3-ASR-0.6B-hf")
+    # Handle ModelScope-style directory names (e.g. "Qwen3-ASR-1.7B-hf")
     lower = dirname.lower()
     if "qwen3-asr" in lower or "qwen3_asr" in lower:
-        if "1.7b" in lower or "1_7b" in lower:
-            return "qwen3-asr-1.7b"
-        return "qwen3-asr-0.6b"
+        return "qwen3-asr-1.7b"
     return None
 
 
@@ -774,7 +772,7 @@ def def_key_to_model_key(slot: str) -> str | None:
     mapping = {
         "vad": "fsmn-vad",
         "asr_streaming": "paraformer-zh-streaming",
-        "asr_final": "paraformer-zh",
+        "asr_final": "sensevoice-small",
         "speaker": "eres2netv2",
     }
     return mapping.get(slot)

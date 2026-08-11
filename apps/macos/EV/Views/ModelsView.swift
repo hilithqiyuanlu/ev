@@ -2,41 +2,31 @@ import SwiftUI
 
 struct ModelsView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var selectedTab: ModelTab = .library
     @State private var modelToDelete: AvailableModel?
 
-    private enum ModelTab: String, CaseIterable, Identifiable {
-        case library = "模型库"
-        case slots = "槽位分配"
-        var id: String { rawValue }
-    }
-
-    private let typeNames: [String: String] = [
-        "vad": "VAD",
-        "asr_streaming": "流式 ASR",
-        "asr_final": "终稿 ASR",
-        "speaker": "声纹",
+    private let typeOrder: [String] = [
+        "vad",
+        "asr_streaming",
+        "speech_enhancement",
+        "asr_final",
+        "speaker",
+        "environment",
     ]
 
-    private let slotNames: [String: String] = [
-        "vad": "语音活动检测",
-        "asr_streaming": "流式识别",
-        "asr_final": "终稿识别",
+    private let typeNames: [String: String] = [
+        "vad": "语音活动检测（VAD）",
+        "asr_streaming": "流式识别（流式 ASR）",
+        "speech_enhancement": "语音增强/降噪",
+        "asr_final": "终稿识别（终稿 ASR）",
         "speaker": "声纹识别",
+        "environment": "环境感知",
     ]
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 headerSection
-                filterBar
-
-                switch selectedTab {
-                case .library:
-                    modelLibraryContent
-                case .slots:
-                    slotAssignmentContent
-                }
+                modelLibraryContent
             }
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -100,40 +90,6 @@ struct ModelsView: View {
         }
     }
 
-    // MARK: - Filter Bar
-
-    private var filterBar: some View {
-        HStack(spacing: 0) {
-            ForEach(ModelTab.allCases) { tab in
-                Button {
-                    selectedTab = tab
-                } label: {
-                    Text(tab.rawValue)
-                        .font(.subheadline.weight(.medium))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .foregroundStyle(selectedTab == tab ? .primary : .secondary)
-                        .background(
-                            GeometryReader { _ in
-                                if selectedTab == tab {
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .fill(Color.primary.opacity(0.06))
-                                }
-                            }
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.secondary.opacity(0.06))
-        )
-        .fixedSize(horizontal: true, vertical: true)
-    }
-
     // MARK: - Model Library
 
     private var modelLibraryContent: some View {
@@ -144,7 +100,11 @@ struct ModelsView: View {
             } else {
                 let installedKeys = Set(model.installedModels.map(\.key))
                 let grouped = Dictionary(grouping: model.availableModels) { $0.type }
-                let sortedTypes = grouped.keys.sorted { typeNames[$0, default: $0] < typeNames[$1, default: $1] }
+                let sortedTypes = grouped.keys.sorted { a, b in
+                    let idxA = typeOrder.firstIndex(of: a) ?? Int.max
+                    let idxB = typeOrder.firstIndex(of: b) ?? Int.max
+                    return idxA < idxB
+                }
 
                 ForEach(sortedTypes, id: \.self) { type in
                     VStack(alignment: .leading, spacing: 8) {
@@ -152,12 +112,77 @@ struct ModelsView: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
 
+                        slotSwitch(for: type)
+
                         ForEach(grouped[type] ?? []) { item in
                             modelRow(for: item, isInstalled: installedKeys.contains(item.key))
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// 类型头下方的槽位切换：该类型已安装 ≥2 个模型时才显示（当前仅终稿识别有 SenseVoice/Qwen3 两个候选）。
+    @ViewBuilder
+    private func slotSwitch(for type: String) -> some View {
+        let compatible = model.installedModels.filter { installed in
+            guard let def = model.availableModels.first(where: { $0.key == installed.key }) else { return false }
+            return def.type == type
+        }
+        if compatible.count >= 2,
+           let assignment = model.slotAssignments.first(where: { $0.slot == type }) {
+            let currentName = assignment.modelKey.flatMap { key in
+                model.availableModels.first(where: { $0.key == key })?.name
+            } ?? "未分配"
+            HStack(spacing: 8) {
+                Text("当前模型")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Menu {
+                    Button {
+                        model.setActiveModel(slot: assignment.slot, modelKey: nil)
+                    } label: {
+                        HStack {
+                            Text("未分配")
+                            Spacer()
+                            if assignment.modelKey == nil {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                    ForEach(compatible) { installed in
+                        let name = model.availableModels.first(where: { $0.key == installed.key })?.name ?? installed.key
+                        Button {
+                            model.setActiveModel(slot: assignment.slot, modelKey: installed.key)
+                        } label: {
+                            HStack {
+                                Text(name)
+                                Spacer()
+                                if assignment.modelKey == installed.key {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(currentName)
+                            .font(.subheadline.weight(.medium))
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.secondary.opacity(0.1))
+                    )
+                }
+                .menuStyle(.borderlessButton)
+            }
+            .padding(.top, 2)
         }
     }
 
@@ -323,122 +348,5 @@ struct ModelsView: View {
             return String(format: "%.1f MB/s", bytesPerSec / 1024 / 1024)
         }
     }
-
-    // MARK: - Slot Assignment
-
-    private var slotAssignmentContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if model.slotAssignments.isEmpty {
-                EmptyStateView("尚未加载槽位配置", systemImage: "gearshape")
-                    .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
-            } else {
-                ForEach(model.slotAssignments) { assignment in
-                    slotRow(for: assignment)
-                }
-            }
-        }
-    }
-
-    private func slotRow(for assignment: SlotAssignment) -> some View {
-        let compatibleModels = model.installedModels.filter { installed in
-            guard let def = model.availableModels.first(where: { $0.key == installed.key }) else { return false }
-            return def.type == mapSlotToType(assignment.slot)
-        }
-
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                Image(systemName: assignment.status.ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(assignment.status.ready ? .green : .orange)
-                    .frame(width: 20)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(slotNames[assignment.slot, default: assignment.slot])
-                        .font(.headline)
-                    if !assignment.status.ready {
-                        Text(assignment.status.errors.joined(separator: "，"))
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .lineLimit(2)
-                    }
-                }
-
-                Spacer()
-
-                if compatibleModels.isEmpty {
-                    Text("无可用模型")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .italic()
-                        .frame(width: 200, alignment: .trailing)
-                } else {
-                    let currentName = assignment.modelKey.flatMap { key in
-                        model.availableModels.first(where: { $0.key == key })?.name
-                    } ?? "未分配"
-                    
-                    Menu {
-                        Button {
-                            model.setActiveModel(slot: assignment.slot, modelKey: nil)
-                        } label: {
-                            HStack {
-                                Text("未分配")
-                                Spacer()
-                                if assignment.modelKey == nil {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                        
-                        ForEach(compatibleModels) { installed in
-                            let name = model.availableModels.first(where: { $0.key == installed.key })?.name ?? installed.key
-                            Button {
-                                model.setActiveModel(slot: assignment.slot, modelKey: installed.key)
-                            } label: {
-                                HStack {
-                                    Text(name)
-                                    Spacer()
-                                    if assignment.modelKey == installed.key {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        Text(currentName)
-                            .font(.subheadline)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .foregroundStyle(.primary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(Color.secondary.opacity(0.1))
-                            )
-                            .frame(width: 200)
-                    }
-                    .menuStyle(.borderlessButton)
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.primary.opacity(0.03))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
-                )
-        )
-    }
-
-    private func mapSlotToType(_ slot: String) -> String {
-        switch slot {
-        case "vad": return "vad"
-        case "asr_streaming": return "asr_streaming"
-        case "asr_final": return "asr_final"
-        case "speaker": return "speaker"
-        default: return slot
-        }
-    }
 }
+

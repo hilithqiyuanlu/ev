@@ -223,12 +223,14 @@ class StreamingASRAdapter(_FunASR):
         super().unload()
 
 
-class FinalASRAdapter(_FunASR):
+class SenseVoiceAdapter(_FunASR):
+    """SenseVoice Small — 多语言终稿 ASR（FunASR 引擎）。"""
+
     def __init__(self, model_path: str, model: Any | None = None):
         super().__init__(
             model_path,
             model,
-            model_name="paraformer-zh",
+            model_name="iic/SenseVoiceSmall",
             vad_model=None,
             punc_model=None,
             trust_remote_code=False,
@@ -251,9 +253,7 @@ class FinalASRAdapter(_FunASR):
         if hotword:
             kwargs["hotword"] = hotword
             logging.getLogger(__name__).debug(
-                "FinalASR hotwords (%d words): %s",
-                len(hotword.split()),
-                hotword[:100],
+                "SenseVoiceASR hotwords: %s", hotword[:100],
             )
         result = self.model.generate(**kwargs)
         text = _text(result)

@@ -9,6 +9,7 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 20) {
             topBar
             ActivityStatusView()
+            environmentBar
             querySection
             inputBar
         }
@@ -114,6 +115,43 @@ struct HomeView: View {
             model.engineState == .loading || model.engineState == .stopping ||
             (!model.isListening && !model.canStartListening)
         )
+    }
+
+    // MARK: - Environment Bar
+
+    private var environmentBar: some View {
+        Group {
+            if model.isListening {
+                HStack(spacing: 10) {
+                    Image(systemName: model.envActive ? "ear.fill" : "ear")
+                        .font(.system(size: 13))
+                        .foregroundStyle(model.envActive ? .blue : .secondary)
+
+                    if !model.envCategoryLabel.isEmpty {
+                        Text(model.envCategoryLabel)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.primary)
+                        if model.envConfidence > 0 {
+                            Text("\(Int(model.envConfidence * 100))%")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if model.isListening && model.envCategory.isEmpty {
+                        Text("环境感知中...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(model.envActive ? Color.blue.opacity(0.06) : Color.secondary.opacity(0.04))
+                )
+            }
+        }
     }
 
     // MARK: - Query Section

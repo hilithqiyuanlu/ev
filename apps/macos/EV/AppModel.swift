@@ -107,6 +107,11 @@ final class AppModel: ObservableObject {
     @Published var partialText = ""
     @Published var lastFinalText = ""
     @Published var captureReady = false
+    @Published var envCategory: String = ""
+    @Published var envCategoryLabel: String = ""
+    @Published var envConfidence: Double = 0
+    @Published var envActive: Bool = false
+    @Published var envLastUpdate: Date? = nil
     @Published var processingSegmentIDs: Set<String> = []
     @Published var segments: [Segment] = []
     @Published var queries: [QueryItem] = []
@@ -706,6 +711,16 @@ final class AppModel: ObservableObject {
             agcGain = event.payload["gain"]?.double ?? 1.0
         case "capture_started":
             captureReady = true
+            envCategory = ""
+            envCategoryLabel = ""
+            envActive = false
+        case "environment_event":
+            let cat = event.payload["category"]?.string ?? ""
+            envCategory = cat
+            envCategoryLabel = envDisplayName(cat)
+            envConfidence = event.payload["confidence"]?.double ?? 0
+            envActive = envConfidence > 0.3
+            envLastUpdate = Date()
         case "speech_started":
             partialText = ""
         case "transcript_partial":
@@ -928,6 +943,23 @@ final class AppModel: ObservableObject {
     func resetOnboarding() {
         hasCompletedOnboarding = false
         UserDefaults.standard.set(false, forKey: "hasCompletedOnboarding")
+    }
+
+    /// 环境音类别 → 中文显示名
+    private func envDisplayName(_ category: String) -> String {
+        switch category {
+        case "typing": return "键盘打字"
+        case "music": return "音乐"
+        case "background_speech": return "背景人声"
+        case "background_noise": return "环境噪声"
+        case "alert": return "警报声"
+        case "animal": return "动物声"
+        case "impact": return "撞击声"
+        case "appliance": return "家电运行"
+        case "silence": return "安静"
+        case "": return ""
+        default: return category.replacingOccurrences(of: "_", with: " ")
+        }
     }
 
     private func rebuildHistoryItems() {

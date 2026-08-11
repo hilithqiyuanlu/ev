@@ -19,6 +19,7 @@ import numpy as np
 from ..asr.adapters import SpeakerEmbeddingAdapter
 from ..audio.capture import AudioCapture
 from ..audio.devices import list_input_devices, resolve_device
+from ..audio.environment import EnvironmentMonitor, EnvEvent
 from ..config import Settings
 from ..model_catalog import get_catalog, get_definition
 from ..model_download import DownloadCancelled, ModelDownloader
@@ -29,6 +30,7 @@ from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import build_profile, normalize_embedding
 from ..store.audio import archive_wav, read_wav
 from ..store.db import Store
+from ..store.environment import EnvironmentLog
 from .protocol import EngineRequest, ProtocolWriter
 
 
@@ -60,6 +62,8 @@ class EngineService:
         self._voice_auto_learn = settings.voice_learning.auto_learn_enabled
         self._segment_worker = None  # type: ignore[assignment]
         self._last_listen_params: dict | None = None
+        self._env_log: EnvironmentLog | None = None
+        self._env_monitor: EnvironmentMonitor | None = None
 
         self._registry = ModelRegistry(
             models_root=settings.models_dir,
@@ -396,6 +400,26 @@ class EngineService:
         self._emit_state(request.request_id)
         worker_holder: dict = {}
 
+        # 环境感知: 通过 Registry 解析 YAMNet 模型路径
+        self._env_log = EnvironmentLog(self.settings.logs_dir)
+        self._env_monitor = None
+        env_model = self._registry.get_active_model("environment")
+        if env_model is not None:
+            env_path = Path(env_model.local_path)
+            yamnet_model = env_path / "yamnet.tflite"
+            yamnet_labels = env_path / "yamnet_class_map.csv"
+            if yamnet_model.exists() and yamnet_labels.exists():
+                self._env_monitor = EnvironmentMonitor(
+                    model_path=str(yamnet_model),
+                    label_path=str(yamnet_labels),
+                    sample_rate=self.settings.audio.sample_rate,
+                )
+                LOGGER.info("YAMNet environment monitor ready: %s", env_path)
+            else:
+                LOGGER.info("YAMNet model files incomplete in %s, environment monitoring disabled", env_path)
+        else:
+            LOGGER.info("YAMNet model not assigned to 'environment' slot, environment monitoring disabled")
+
         def resolve_final_asr_path() -> Path:
             model = self._registry.get_active_model("asr_final")
             if model is None:
@@ -415,6 +439,7 @@ class EngineService:
                         emit=self._on_runtime_event,
                         worker_holder=worker_holder,
                         final_asr_resolver=resolve_final_asr_path,
+                        env_monitor=self._env_monitor,
                     )
                 )
                 self.state = "stopped"
@@ -496,6 +521,16 @@ class EngineService:
                 profile = self._profile_status(store)
             profile["auto_learn"] = self._voice_auto_learn
             self.writer.emit("profile_status", profile)
+        elif event_type == "environment_event":
+            # 写入环境事件日志
+            if self._env_log is not None:
+                event = EnvEvent(
+                    timestamp=float(payload.get("timestamp", 0)),
+                    category=str(payload.get("category", "unknown")),
+                    confidence=float(payload.get("confidence", 0)),
+                    duration_sec=payload.get("duration_sec"),
+                )
+                self._env_log.append(event)
         self.writer.emit(event_type, payload)
 
     def _list_voice_samples(self, request: EngineRequest) -> None:
@@ -1095,6 +1130,9 @@ class EngineService:
         self._download_cancel.set()
         if self._listen_thread and self._listen_thread.is_alive():
             self._listen_thread.join()
+        if self._env_monitor is not None:
+            self._env_monitor.stop()
+            self._env_monitor = None
         self.state = "stopped"
 
     def _emit_state(self, request_id: str | None = None) -> None:

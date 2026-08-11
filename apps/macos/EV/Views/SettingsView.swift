@@ -51,8 +51,8 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 VStack(spacing: 6) {
-                    ChecklistRow("模型已下载并校验", done: model.onboardingChecks.models,
-                                detail: model.onboardingChecks.models ? "四个模型均已就绪" : "请到「模型」页下载并校验")
+                    ChecklistRow("核心模型已就绪", done: model.onboardingChecks.models,
+                                detail: model.onboardingChecks.models ? "VAD / ASR / 声纹均已就绪" : "请到「模型」页下载并校验")
                     ChecklistRow("麦克风权限已允许", done: model.onboardingChecks.permission,
                                 detail: permissionDetail)
                     ChecklistRow("声纹已建立", done: !model.needsVoiceOnboarding,

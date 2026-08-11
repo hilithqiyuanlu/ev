@@ -19,7 +19,7 @@ from typing import Any, Callable
 import numpy as np
 
 from ..asr.adapters import (
-    FinalASRAdapter,
+    SenseVoiceAdapter,
     SpeakerEmbeddingAdapter,
     StreamingASRAdapter,
     TranscriptionResult,
@@ -30,6 +30,7 @@ from ..asr.qwen3_adapter import Qwen3ASRAdapter
 from ..audio.capture import AudioCapture
 from ..audio.preprocess import AudioPreprocessor, PreprocessParams
 from ..audio.energy_vad import EnergyVAD, EnergyVADParams
+from ..audio.denoise import DenoiseAdapter
 from ..audio.voice_check import classify_voice
 from ..config import Settings
 from ..speaker.profile import VoiceProfileManager
@@ -76,6 +77,45 @@ def _is_filler_only(text: str) -> bool:
         if not matched:
             return False
     return True
+
+
+def _check_speech_segment(
+    vad_model: object | None,
+    audio: np.ndarray,
+    speech_ratio_threshold: float = 0.05,
+) -> bool:
+    """Run FSMN VAD on a complete segment to check if it contains speech.
+
+    Unlike streaming VAD used for endpointing, this is a one-shot check.
+    Returns True if >= speech_ratio_threshold of frames are marked as speech.
+
+    Args:
+        vad_model: A VADAdapter instance (or None, returns False).
+        audio: Full audio segment, float32 numpy array.
+        speech_ratio_threshold: Minimum fraction of audio frames that must
+            contain speech for a positive result (default 5%).
+    """
+    if vad_model is None:
+        return False
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return False
+    try:
+        result = vad_model.model.generate(input=arr, chunk_size=200)
+    except Exception:
+        return False
+    if not result or not isinstance(result, (list, tuple)):
+        return False
+    total_speech_ms = 0
+    for item in result:
+        if isinstance(item, dict):
+            for seg in item.get("value", []):
+                if isinstance(seg, (list, tuple)) and len(seg) >= 2:
+                    dur = seg[1] - seg[0]
+                    if dur > 0:
+                        total_speech_ms += dur
+    audio_duration_ms = max(len(arr) / 16000.0 * 1000.0, 1.0)
+    return (total_speech_ms / audio_duration_ms) >= speech_ratio_threshold
 
 
 def _compute_hotword_coverage(text: str, hotword_entries: list[tuple[str, float]]) -> float:
@@ -273,12 +313,12 @@ def _compute_dominant_speaker(speaker_turns: tuple) -> tuple[str, bool]:
     return dominant, contains_user
 
 
-def _create_final_asr_adapter(model_path: Path) -> FinalASRAdapter | Qwen3ASRAdapter:
+def _create_final_asr_adapter(model_path: Path) -> SenseVoiceAdapter | Qwen3ASRAdapter:
     """根据模型目录内容自动检测并创建对应的 ASR 适配器。
 
     检测逻辑 (优先级):
     1. config.json 且 model_type 包含 qwen3/qwen2/omni/whisper → Qwen3ASRAdapter
-    2. configuration.json/config.yaml (FunASR格式) → FinalASRAdapter (Paraformer)
+    2. configuration.json/config.yaml (FunASR格式) → SenseVoiceAdapter (SenseVoice)
     3. 仅 config.json (transformers格式但未识别) → 尝试Qwen3ASRAdapter
     """
     path = _find_model_root(str(model_path))
@@ -314,7 +354,7 @@ def _create_final_asr_adapter(model_path: Path) -> FinalASRAdapter | Qwen3ASRAda
 
     # FunASR format (Paraformer uses configuration.json; SenseVoice uses config.yaml)
     if has_funasr_config:
-        return FinalASRAdapter(str(path))
+        return SenseVoiceAdapter(str(path))
 
     # Unknown transformers format — try Qwen3 as fallback
     if has_transformers_config:
@@ -332,7 +372,7 @@ class SegmentProcessor:
         speaker: SpeakerEmbeddingAdapter,
         vad_model_id: str,
         voice_profile: VoiceProfileManager,
-        final_asr: FinalASRAdapter | Qwen3ASRAdapter | None = None,
+        final_asr: SenseVoiceAdapter | Qwen3ASRAdapter | None = None,
         output: Callable[[str], None] = print,
         emit: Callable[[str, dict], None] | None = None,
         hotwords: str = "",
@@ -715,6 +755,8 @@ class SegmentWorker:
         emit: Callable[[str, dict], None],
         shared_threshold: dict | None = None,
         final_asr_resolver: Callable[[], Path] | None = None,
+        denoiser: object | None = None,
+        vad_model: object | None = None,
     ):
         self.settings = settings
         self.paths = paths
@@ -726,8 +768,10 @@ class SegmentWorker:
         self._shared_threshold = shared_threshold
         self._final_asr_resolver = final_asr_resolver
         self._final_asr_lock = threading.Lock()
-        self._final_asr: FinalASRAdapter | Qwen3ASRAdapter | None = None
+        self._final_asr: SenseVoiceAdapter | Qwen3ASRAdapter | None = None
         self._reload_final = threading.Event()
+        self._denoiser: object | None = denoiser  # DenoiseAdapter, 可选
+        self._vad_model: object | None = vad_model  # VADAdapter, 用于人声确认
         self.jobs: queue.Queue[SegmentJob | None] = queue.Queue()
         self.thread = threading.Thread(target=self._run, name="ev-segment-worker", daemon=True)
         self.thread.start()
@@ -810,9 +854,7 @@ class SegmentWorker:
                     )
                     duration_ms = round(len(job.audio) * 1000 / self.settings.audio.sample_rate)
 
-                    # --- 音频质量计算 (基于 raw 音频, 防 AGC 污染) ---
-                    _seg = self.settings.segment
-                    _quality_label = "ok"
+                    # --- 计算 RMS 统计 (仅用于日志和 DB 记录) ---
                     _avg_raw_rms = 0.0
                     _peak_raw_rms = 0.0
                     _snr_db = 0.0
@@ -822,41 +864,62 @@ class SegmentWorker:
                         _peak_raw_rms = float(np.max(np.abs(_raw)))
                         _noise_floor = max(job.noise_floor_rms, 1e-7)
                         if _avg_raw_rms > 0 and _noise_floor > 0:
-                            # 用 90 百分位帧 RMS 估算"说话响度", 避免段内大量静音稀释 SNR
-                            # (远场轻声 + 自然停顿 → 全段均值 RMS 会系统性低估真实语音 SNR)
-                            _frame_len = int(self.settings.audio.sample_rate * 0.030)
-                            _n_frames = max(1, len(_raw) // _frame_len)
-                            if _n_frames >= 3:
-                                _frame_rms = np.array([
-                                    float(np.sqrt(np.mean(np.square(_raw[i*_frame_len:(i+1)*_frame_len]))))
-                                    for i in range(_n_frames)
-                                ])
-                                _speech_rms = float(np.percentile(_frame_rms, 90))
-                            else:
-                                _speech_rms = _avg_raw_rms
-                            _snr_db = float(20.0 * np.log10(max(_speech_rms, 1e-10) / _noise_floor))
-                        if not job.is_warmup:
-                            if _avg_raw_rms < _seg.min_audible_rms:
-                                _quality_label = "rejected_low_level"
-                            elif _snr_db < _seg.min_snr_db:
-                                _quality_label = "rejected_low_snr"
-                    # --- 声学特征检测 (非人声过滤: 风扇/键盘/稳态噪声) ---
-                    # 仅在 quality_label 仍为 "ok" 时运行 (SNR/电平已通过的段才做二次检查)
-                    _voice_result = {}
-                    if _quality_label == "ok" and job.raw_audio is not None and job.raw_audio.size > 0:
-                        _voice_result = classify_voice(job.raw_audio, int(self.settings.audio.sample_rate))
-                        if not job.is_warmup and not _voice_result.get("is_voice", True):
+                            _snr_db = float(20.0 * np.log10(max(_avg_raw_rms, 1e-10) / _noise_floor))
+
+                    # --- FSMN 人声确认: 降噪后 + raw 各跑一次, OR 决策 ---
+                    # 替代旧的质量门控 (SNR/电平/voice_check) — 神经网络 VAD 比 DSP 规则更可靠
+                    _quality_label = "ok"
+                    _denoised: np.ndarray | None = None
+                    if job.raw_audio is not None and job.raw_audio.size > 0:
+                        # 降噪 (如果可用)
+                        _denoiser = getattr(self, "_denoiser", None)
+                        if _denoiser is not None and _denoiser.available:
+                            try:
+                                _denoised = _denoiser.enhance(
+                                    job.raw_audio,
+                                    int(self.settings.audio.sample_rate),
+                                )
+                            except Exception:
+                                _denoised = None
+                        # FSMN 人声确认
+                        _raw_has_speech = _check_speech_segment(
+                            self._vad_model if hasattr(self, "_vad_model") else None,
+                            job.raw_audio,
+                            self.settings.segment.voice_confirm_min_speech_ratio,
+                        )
+                        _denoised_has_speech = False
+                        if _denoised is not None and _denoised.size > 0:
+                            _denoised_has_speech = _check_speech_segment(
+                                self._vad_model if hasattr(self, "_vad_model") else None,
+                                _denoised,
+                                self.settings.segment.voice_confirm_min_speech_ratio,
+                            )
+                        _is_voice = _raw_has_speech or _denoised_has_speech
+
+                        if not _is_voice and not job.is_warmup:
+                            # 无人声: voice_check.py 降级为解释信号
+                            _voice_result = classify_voice(
+                                job.raw_audio, int(self.settings.audio.sample_rate)
+                            )
                             _quality_label = "rejected_non_voice"
                             self.output(
-                                f"[{job.segment_id[:8]}] voice check: non-voice → "
-                                f"{_voice_result.get('reasons', [])}"
+                                f"[{job.segment_id[:8]}] rejected: no speech detected "
+                                f"(raw={_raw_has_speech}, denoised={_denoised_has_speech}), "
+                                f"voice_check={_voice_result.get('reasons', [])}"
                             )
+                            # 丢弃，不入库，不跑 ASR
+                            self.emit(
+                                "segment_discarded",
+                                {
+                                    "segment_id": job.segment_id,
+                                    "reason": "no_speech_detected",
+                                    "quality_label": _quality_label,
+                                },
+                            )
+                            self.jobs.task_done()
+                            continue
 
-                    _is_quality_rejected = _quality_label != "ok"
-
-                    # --- final ASR 模型懒加载 (一次性, 不因质量拒绝而跳过) ---
-                    # 模型加载与"是否跑推理"解耦: 质量拒绝段不跑推理,
-                    # 但模型必须加载好, 否则第一个合格段出现时来不及加载.
+                    # --- final ASR 模型懒加载 (一次性) ---
                     with self._final_asr_lock:
                         final = self._final_asr
                     if final is None:
@@ -870,12 +933,16 @@ class SegmentWorker:
                         _log_memory(f"final-asr loaded ({type(final).__name__})")
                     processor.final_asr = final
 
-                    # --- 推理跳过决策 (仅限两类: 极短无内容段 + 质量拒绝段) ---
+                    # --- 推理跳过决策 (仅极短无内容段) ---
+                    # 质量拒绝段已在前面的 FSMN 人声确认中丢弃，此处不再处理
                     _VERY_SHORT_MS = 800
                     partial_clean = job.partial.strip() if job.partial else ""
                     is_very_short = duration_ms < _VERY_SHORT_MS and not job.speaker_turns
                     has_no_content = (not partial_clean) or _is_filler_only(partial_clean)
                     _skip_very_short = is_very_short and has_no_content
+
+                    # 选择 ASR 输入音频: 降噪后 > 原始 (降噪后转写质量更好)
+                    _asr_audio = _denoised if _denoised is not None and _denoised.size > 0 else job.audio
 
                     if _skip_very_short:
                         # 极短无内容段: 临时绕过 final ASR (process() 会 fallback 到 partial)
@@ -884,16 +951,9 @@ class SegmentWorker:
                             f"[{job.segment_id[:8]}] very short no-content "
                             f"({duration_ms}ms), skipping final ASR"
                         )
-                    elif _is_quality_rejected:
-                        # 质量拒绝段: final_asr 保持设置, 但 process() 内部跳过 _final()
-                        self.output(
-                            f"[{job.segment_id[:8]}] quality rejected "
-                            f"({_quality_label}, rms={_avg_raw_rms:.5f}, snr={_snr_db:.1f}dB), "
-                            f"skipping final ASR"
-                        )
 
                     record = processor.process(
-                        job.audio,
+                        _asr_audio,
                         job.started_at,
                         job.ended_at,
                         job.partial,
@@ -901,7 +961,7 @@ class SegmentWorker:
                         raw_audio=job.raw_audio,
                         speaker_turns=job.speaker_turns,
                         end_trigger=job.end_trigger,
-                        quality_label=_quality_label,
+                        quality_label="ok",
                         avg_raw_rms=_avg_raw_rms,
                         peak_raw_rms=_peak_raw_rms,
                         noise_floor_rms=job.noise_floor_rms,
@@ -953,6 +1013,7 @@ async def transcribe_forever(
     emit: Callable[[str, dict], None] | None = None,
     worker_holder: dict | None = None,
     final_asr_resolver: Callable[[], Path] | None = None,
+    env_monitor: object | None = None,
 ) -> None:
     from ..models import resolve_model_paths, verify_models
 
@@ -1246,6 +1307,17 @@ async def transcribe_forever(
                 "channels": settings.audio.channels,
             },
         )
+        # 启动环境监测（YAMNet 定时轮询）
+        if env_monitor is not None and hasattr(env_monitor, "start"):
+            def _on_env_event(ev: object) -> None:
+                send("environment_event", {
+                    "timestamp": getattr(ev, "timestamp", 0),
+                    "category": getattr(ev, "category", "unknown"),
+                    "confidence": getattr(ev, "confidence", 0),
+                    "duration_sec": getattr(ev, "duration_sec", None),
+                })
+            env_monitor.start(_on_env_event)  # type: ignore[union-attr]
+            output("[env] EnvironmentMonitor started")
         try:
             iterator = capture.frames_with_raw().__aiter__()
             try:
@@ -1369,6 +1441,9 @@ async def transcribe_forever(
                     "raw_rms": raw_rms,
                     "gain": _current_gain(),
                 })
+                # 喂原始音频帧给环境监测器 ring buffer
+                if env_monitor is not None and hasattr(env_monitor, "feed"):
+                    env_monitor.feed(raw)  # type: ignore[union-attr]
                 _append_trim(recent_frames, processed, pre_roll_frames)
                 _append_trim(recent_raw_frames, raw, pre_roll_frames)
 

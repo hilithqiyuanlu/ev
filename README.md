@@ -15,12 +15,18 @@ history stay on your device.
 - Wake word "小E" (ASR homophone tolerance, 嗨/hi/hai greeting handling)
 - Local recording history with playback, instant filtering, and one-click correction
 - Personal hotword lexicon (manual + auto-learned) injected into ASR
-- Optional Qwen3-ASR (0.6B/1.7B) for mixed Chinese-English transcription, with anchor-based hotword boosting
+- Multilingual final ASR: SenseVoice Small by default; optional Qwen3-ASR (1.7B) for
+  hotword-boosted mixed Chinese-English transcription
 - Far-field pickup: AGC/pre-emphasis/noise-gate preprocessing, composite FSMN+energy VAD
+- Speech enhancement: DFSMN-ANS denoising before final transcription
+- Human-voice confirmation: FSMN-based check rejects non-speech segments (fan/typing/noise)
+  before they hit storage
+- Environment awareness: YAMNet real-time sound classification (typing / music / traffic /
+  alerts…), logged separately from your voice data
 - Real-time speaker-turn tracking ("second-ear" mode) with dual WAV archive (processed + raw)
 
 What's not here yet (but coming): LLM reasoning, text-to-speech, multi-speaker diarization,
-environment awareness, standalone distribution.
+standalone distribution.
 
 ## Quick Start
 
@@ -48,6 +54,7 @@ to interact.
 ## Documentation
 
 - [audio-flows.md](docs/audio-flows.md) — Audio processing pipeline
+- [voiceprint.md](docs/voiceprint.md) — Voiceprint flow and speaker verification
 - [voice-learning.md](docs/voice-learning.md) — Voice sample tiering, cluster competition, pending confirmation
 
 ## Repository Layout

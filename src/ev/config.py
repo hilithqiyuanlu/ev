@@ -53,7 +53,7 @@ class VADSettings:
     energy_start_frames: int = 2        # 60ms @ 30ms/帧
     energy_hangover_frames: int = 20    # 600ms @ 30ms/帧
     # 复合策略: "or"/"fsmn_only"/"energy_only"
-    combine_start_mode: str = "or"       # 启动放宽松: OR
+    combine_start_mode: str = "fsmn_only"  # 启动仅 FSMN: 扣扳机交给神经网络 VAD
     combine_end_mode: str = "and"        # 结束保守: AND + hangover
 
 
@@ -125,10 +125,9 @@ class SegmentSettings:
     # ASR停滞超时: 流式ASR长时间无新partial结果视为说完
     asr_stall_timeout_ms: int = 2500
     discard_filler_only: bool = True
-    # 音频质量门控 (宽松起步, 数据驱动调优)
-    min_snr_db: float = 3.0            # 段 SNR 低于此值 → 质量拒绝 (宽松起步)
-    min_audible_rms: float = 0.0005    # 段 raw RMS 低于此值 → 质量拒绝 (~-66dBFS)
-    raw_noise_warmup_sec: float = 3.0   # 底噪追踪器启动后前 N 秒不拒绝
+    # 人声确认 (降噪后 FSMN VAD — 替代旧的质量门控)
+    voice_confirm_min_speech_ratio: float = 0.05  # FSMN 判为语音的帧占比阈值 (≥5% = 有人声)
+    raw_noise_warmup_sec: float = 3.0   # 底噪追踪器启动后前 N 秒不拒绝 (仍用于静音检测)
 
 
 @dataclass(frozen=True)
@@ -234,7 +233,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         root=model_root,
         vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
         asr_streaming=str(models_raw.get("asr_streaming", "ev-paraformer-zh-streaming-16k")),
-        asr_final=str(models_raw.get("asr_final", "ev-paraformer-zh-16k")),
+        asr_final=str(models_raw.get("asr_final", "ev-sensevoice-small")),
         speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
     )
 
@@ -245,6 +244,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
         "asr_streaming": "paraformer-zh-streaming",
         "asr_final": "qwen3-asr-1.7b",
         "speaker": "eres2netv2",
+        "speech_enhancement": "dfsmn-ans",
+        "environment": "yamnet",
     }
     slot_configs: dict[str, ModelSlotConfig] = {}
     for slot, default_key in default_slots.items():
@@ -333,8 +334,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
             min_duration_for_relative_silence_ms=int(segment_raw.get("min_duration_for_relative_silence_ms", 6000)),
             asr_stall_timeout_ms=int(segment_raw.get("asr_stall_timeout_ms", 2500)),
             discard_filler_only=bool(segment_raw.get("discard_filler_only", True)),
-            min_snr_db=float(segment_raw.get("min_snr_db", 3.0)),
-            min_audible_rms=float(segment_raw.get("min_audible_rms", 0.0005)),
+            voice_confirm_min_speech_ratio=float(segment_raw.get("voice_confirm_min_speech_ratio", 0.05)),
             raw_noise_warmup_sec=float(segment_raw.get("raw_noise_warmup_sec", 3.0)),
         ),
         voice_learning=VoiceLearningSettings(

@@ -295,10 +295,10 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
     class Stream:
         model_id = "stream"
 
-    monkeypatch.setattr(runtime_module, "FinalASRAdapter", Final)
+    monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     # Create the final model directory so _create_final_asr_adapter doesn't fail
     (tmp_path / "final").mkdir(parents=True, exist_ok=True)
-    # Add a dummy configuration.json (FunASR format) to trigger FinalASRAdapter path
+    # Add a dummy configuration.json (FunASR format) to trigger SenseVoiceAdapter path
     (tmp_path / "final" / "configuration.json").write_text("{}")
     events = []
     now = datetime.now(timezone.utc)
@@ -397,7 +397,7 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
     monkeypatch.setattr(runtime_module, "StreamingASRAdapter", Stream)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
-    monkeypatch.setattr(runtime_module, "FinalASRAdapter", Final)
+    monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
     # Create model directories and monkeypatch _create_final_asr_adapter
     for d in ["vad", "stream", "final", "speaker"]:
@@ -605,7 +605,7 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
     monkeypatch.setattr(runtime_module, "StreamingASRAdapter", Stream)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
-    monkeypatch.setattr(runtime_module, "FinalASRAdapter", Final)
+    monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
     monkeypatch.setattr(
         "ev.models.require_models",
