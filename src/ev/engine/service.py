@@ -27,12 +27,23 @@ from ..models import require_models, verify_models
 from ..pipeline.runtime import transcribe_forever
 from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import build_profile, normalize_embedding
-from ..store.audio import archive_wav
+from ..store.audio import archive_wav, read_wav
 from ..store.db import Store
 from .protocol import EngineRequest, ProtocolWriter
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _resample_np(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
+    if orig_rate == target_rate:
+        return audio
+    if audio.size == 0:
+        return audio
+    duration = len(audio) / orig_rate
+    target_length = max(1, int(duration * target_rate))
+    indices = np.linspace(0, len(audio) - 1, target_length)
+    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
 
 
 class EngineService:
@@ -64,6 +75,7 @@ class EngineService:
 
     def serve(self, input_stream: TextIO = sys.stdin) -> int:
         self.settings.ensure_dirs()
+        self._migrate_sample_audio()
         LOGGER.info("engine service started")
         self._emit_state()
         for line in input_stream:
@@ -102,6 +114,7 @@ class EngineService:
             "delete_voice_sample": self._delete_voice_sample,
             "promote_voice_sample": self._promote_voice_sample,
             "reset_voice_profile": self._reset_voice_profile,
+            "learn_voice_samples": self._learn_voice_samples,
             "set_voice_learning": self._set_voice_learning,
             "capture_manual_sample": self._capture_manual_sample,
             "start_voice_enrollment": self._start_voice_enrollment,
@@ -503,7 +516,10 @@ class EngineService:
         if not sample_id:
             raise ValueError("缺少 sample_id")
         with Store(self.settings.db_path) as store:
+            sample = store.get_voice_sample(sample_id)
             deleted = store.delete_voice_sample(sample_id)
+            if deleted and sample and sample.get("audio_path"):
+                self._unlink_sample_audio(str(sample["audio_path"]))
         self.writer.emit(
             "voice_sample_deleted",
             {"sample_id": sample_id, "deleted": deleted},
@@ -516,12 +532,107 @@ class EngineService:
 
     def _reset_voice_profile(self, request: EngineRequest) -> None:
         with Store(self.settings.db_path) as store:
+            paths = store.list_all_voice_sample_paths()
             count = store.delete_all_voice_samples()
+        for raw in paths:
+            self._unlink_sample_audio(raw)
         self.writer.emit("voice_profile_reset", {"deleted": count}, request.request_id)
         with Store(self.settings.db_path) as store:
             profile = store.profile_status()
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
+
+    def _unlink_sample_audio(self, raw_path: str) -> None:
+        """Delete a voice-sample wav ONLY if it lives in the managed dir.
+
+        Historical auto-samples may still reference archive/ segment wavs —
+        those belong to segment history and must not be removed here.
+        """
+        path = Path(raw_path)
+        target = self.settings.voice_samples_dir.resolve()
+        try:
+            is_managed = path.resolve().is_relative_to(target)
+        except (OSError, ValueError):
+            is_managed = False
+        if is_managed:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("failed to remove sample wav: %s", path)
+
+    def _migrate_sample_audio(self) -> None:
+        """One-time migration: copy sample wavs living outside the managed
+        voice-samples dir into it, so sample audio survives history clears."""
+        try:
+            managed = self.settings.voice_samples_dir.resolve()
+            with Store(self.settings.db_path) as store:
+                for sample in store.list_voice_samples(limit=200):
+                    raw = sample.get("audio_path") or ""
+                    if not raw:
+                        continue
+                    src = Path(raw)
+                    try:
+                        if src.resolve().is_relative_to(managed) or not src.exists():
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                    dest = managed / src.name
+                    if not dest.exists():
+                        dest.write_bytes(src.read_bytes())
+                    store.update_voice_sample_audio_path(sample["id"], str(dest))
+                    LOGGER.info("voice sample audio migrated: %s -> %s", src, dest)
+        except Exception as exc:
+            LOGGER.warning("voice-sample audio migration skipped: %s", exc)
+
+    def _learn_voice_samples(self, request: EngineRequest) -> None:
+        """Re-embed every sample from its wav with the current speaker model,
+        then rebuild centroids. Samples whose wav is missing are skipped."""
+        def run() -> None:
+            try:
+                paths = require_models(self.settings.models, self.settings.models.root)
+                speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
+                updated = 0
+                missing = 0
+                target_sr = self.settings.audio.sample_rate
+                with Store(self.settings.db_path) as store:
+                    for sample in store.list_voice_samples(limit=200):
+                        raw = sample.get("audio_path") or ""
+                        if not raw:
+                            missing += 1
+                            continue
+                        path = Path(raw)
+                        if not path.exists():
+                            missing += 1
+                            continue
+                        try:
+                            audio, sr = read_wav(path)
+                        except Exception as exc:
+                            LOGGER.warning("re-learn skip %s: %s", path, exc)
+                            missing += 1
+                            continue
+                        if sr != target_sr:
+                            audio = _resample_np(audio, sr, target_sr)
+                            sr = target_sr
+                        embedding = speaker.embed(audio, sr)
+                        store.update_voice_sample_embedding(sample["id"], embedding)
+                        updated += 1
+                    vp = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+                    vp._rebuild_centroids()
+                self.writer.emit(
+                    "voice_samples_learned",
+                    {"updated": updated, "missing": missing},
+                    request.request_id,
+                )
+                with Store(self.settings.db_path) as store:
+                    profile = store.profile_status()
+                profile["auto_learn"] = self._voice_auto_learn
+                self.writer.emit("profile_status", profile)
+            except Exception as exc:
+                LOGGER.exception("voice sample re-learn failed")
+                self.writer.error(str(exc), request.request_id, "voice_sample_learn_failed")
+
+        threading.Thread(target=run, name="ev-voice-learn", daemon=True).start()
+        self._ack(request)
 
     def _set_voice_learning(self, request: EngineRequest) -> None:
         enabled = bool(request.payload.get("enabled", True))
@@ -575,7 +686,7 @@ class EngineService:
                 speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
                 embedding = speaker.embed(audio, sample_rate)
                 wav_path = archive_wav(
-                    self.settings.archive_dir,
+                    self.settings.voice_samples_dir,
                     "manual-" + uuid.uuid4().hex[:12],
                     audio,
                     sample_rate,
@@ -676,7 +787,7 @@ class EngineService:
                 speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
                 embedding = speaker.embed(audio, sample_rate)
                 wav_path = archive_wav(
-                    self.settings.archive_dir,
+                    self.settings.voice_samples_dir,
                     "enroll-" + uuid.uuid4().hex[:12],
                     audio,
                     sample_rate,
@@ -766,16 +877,17 @@ class EngineService:
         self.writer.emit("queries_deleted", {"count": count}, request.request_id)
 
     def _broadcast_hotwords(self) -> None:
-        """Rebuild hotwords string from store and push to the active segment worker."""
+        """Rebuild hotwords string + entries from store and push to the active segment worker."""
         with Store(self.settings.db_path) as store:
             hotwords = store.get_hotwords_string()
+            entries = store.get_hotword_entries()
         word_count = len(hotwords.split()) if hotwords else 0
         if word_count > 0:
             logging.getLogger(__name__).info(
                 "Broadcasting %d hotwords: %s", word_count, hotwords[:200]
             )
         if self._segment_worker is not None:
-            self._segment_worker.update_hotwords(hotwords)
+            self._segment_worker.update_hotwords(hotwords, entries)
 
     def _list_lexicon(self, request: EngineRequest) -> None:
         with Store(self.settings.db_path) as store:

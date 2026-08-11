@@ -139,7 +139,8 @@ final class AppModel: ObservableObject {
     @Published var queryOnly = false
     @Published var dateFilter = ""
     @Published var speakerThreshold: Double
-    @Published var autoLearnEnabled = UserDefaults.standard.object(forKey: "autoLearnEnabled") as? Bool ?? true
+    @Published var autoLearnEnabled = true
+    @Published var isLearningSamples = false
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var ctrlTToggleListening = UserDefaults.standard.object(forKey: "ctrlTToggleListening") as? Bool ?? true
     @Published var microphonePermission: MicrophonePermissionState
@@ -238,7 +239,7 @@ final class AppModel: ObservableObject {
         } else if let oldUser = defaults.object(forKey: "userThreshold") as? Double {
             self.speakerThreshold = oldUser
         } else {
-            self.speakerThreshold = 0.50
+            self.speakerThreshold = 0.40
         }
         // 选中设备: 从 UserDefaults 恢复, 默认是空串 = 系统默认
         // 等第一次 device_list 到达后再校验: 如果保存的设备名不在当前列表里 → 回退到 系统默认
@@ -489,6 +490,24 @@ final class AppModel: ObservableObject {
     func resetVoiceProfile() {
         engine.send("reset_voice_profile")
     }
+
+    func learnVoiceSamples() {
+        guard !isLearningSamples else { return }
+        isLearningSamples = true
+        engine.send("learn_voice_samples")
+    }
+
+    /// 手动引导需要录制的样本数量（与后端 voice_learning.onboarding_target 一致）
+    var onboardingTarget: Int { 5 }
+
+    var onboardingCount: Int { min(voiceProfile.coreCount, onboardingTarget) }
+
+    var onboardingProgress: Double {
+        guard onboardingTarget > 0 else { return 0 }
+        return min(Double(onboardingCount) / Double(onboardingTarget), 1.0)
+    }
+
+    var needsVoiceOnboarding: Bool { voiceProfile.coreCount < onboardingTarget }
 
     func setAutoLearn(_ enabled: Bool) {
         autoLearnEnabled = enabled
@@ -765,6 +784,10 @@ final class AppModel: ObservableObject {
             loadVoiceSamples()
         case "voice_samples":
             voiceSamples = event.payload["samples"]?.array?.compactMap(VoiceSample.init) ?? []
+        case "voice_samples_learned":
+            isLearningSamples = false
+            loadVoiceSamples()
+            engine.send("get_status")
         case "voice_sample_added", "voice_sample_promoted", "voice_sample_deleted", "voice_profile_reset":
             loadVoiceSamples()
             // Also refresh profile status after sample changes

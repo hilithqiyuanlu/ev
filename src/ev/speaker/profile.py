@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -135,6 +136,9 @@ class VoiceProfileManager:
     ) -> bool:
         if not self.auto_learn:
             return False
+        # 引导门控：未完成手动引导（核心样本不足）前不自动学习
+        if self._core_count < self.settings.onboarding_target:
+            return False
         if duration_ms < self.settings.min_duration_ms:
             return False
         if duration_ms > self.settings.max_duration_ms:
@@ -219,13 +223,25 @@ class VoiceProfileManager:
                 is_manual=False,
             )
 
-        # Evict oldest cache if over limit
-        evicted = self.store.evict_oldest_cache(max_cache)
+        # Evict oldest cache if over limit; delete evicted sample wavs from the
+        # managed samples dir so disk stays consistent with the DB.
+        evicted_paths = self.store.evict_oldest_cache(max_cache)
+        self._unlink_evicted(evicted_paths, Path(audio_path).parent)
         self._cache_count = self.store.count_voice_samples(tier="cache")
         # Rebuild centroids from core
         self._rebuild_centroids()
         self._last_collect_time = time.monotonic()
         return True, tier
+
+    @staticmethod
+    def _unlink_evicted(evicted_paths: list[str], managed_dir) -> None:
+        for raw in evicted_paths:
+            path = Path(raw)
+            if path.parent == managed_dir:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def promote_sample(self, sample_id: str) -> bool:
         """Promote a cache sample to core. Returns True if promoted."""
@@ -248,7 +264,11 @@ class VoiceProfileManager:
                 return False  # All core are manual, can't evict
             self.store.update_voice_sample_tier(lowest["id"], "cache")
         self.store.update_voice_sample_tier(sample_id, "core")
-        self.store.evict_oldest_cache(max_cache)
+        evicted_paths = self.store.evict_oldest_cache(max_cache)
+        self._unlink_evicted(
+            evicted_paths,
+            Path(sample["audio_path"]).parent if sample.get("audio_path") else None,
+        )
         self._rebuild_centroids()
         return True
 

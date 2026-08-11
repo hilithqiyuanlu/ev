@@ -584,7 +584,39 @@ class Store:
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(min(max(int(limit), 1), 200))
         rows = self.connection.execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        out = []
+        for row in rows:
+            sample = dict(row)
+            sample["audio_available"] = bool(sample["audio_path"]) and sample["audio_path"] is not None and self._path_exists(sample["audio_path"])
+            out.append(sample)
+        return out
+
+    @staticmethod
+    def _path_exists(path: str | None) -> bool:
+        if not path:
+            return False
+        from pathlib import Path
+        return Path(path).exists()
+
+    def list_all_voice_sample_paths(self) -> list[str]:
+        rows = self.connection.execute("SELECT audio_path FROM speaker_samples").fetchall()
+        return [row["audio_path"] for row in rows if row["audio_path"]]
+
+    def update_voice_sample_embedding(self, sample_id: str, embedding: np.ndarray) -> bool:
+        vector = np.asarray(embedding, dtype="<f4").reshape(-1)
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE speaker_samples SET embedding_blob=?, embedding_dim=? WHERE id=?",
+                (vector.tobytes(), vector.size, sample_id),
+            )
+            return cursor.rowcount > 0
+
+    def update_voice_sample_audio_path(self, sample_id: str, audio_path: str) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE speaker_samples SET audio_path=? WHERE id=?", (audio_path, sample_id)
+            )
+            return cursor.rowcount > 0
 
     def count_voice_samples(self, tier: str | None = None) -> int:
         if tier:
@@ -639,22 +671,31 @@ class Store:
             )
             return cursor.rowcount > 0
 
-    def evict_oldest_cache(self, max_cache: int) -> int:
-        """Evict oldest cache samples to keep total cache count <= max_cache. Returns deleted count."""
+    def evict_oldest_cache(self, max_cache: int) -> list[str]:
+        """Evict oldest cache samples to keep total cache count <= max_cache.
+
+        Returns the list of audio_paths of the evicted samples (files are NOT
+        removed here; callers decide based on path ownership).
+        """
+        rows = self.connection.execute(
+            """
+            SELECT id, audio_path FROM speaker_samples
+            WHERE tier='cache'
+            ORDER BY created_at ASC
+            LIMIT MAX(0, (SELECT COUNT(*) FROM speaker_samples WHERE tier='cache') - ?)
+            """,
+            (max_cache,),
+        ).fetchall()
+        paths = [row["audio_path"] for row in rows if row["audio_path"]]
+        ids = [row["id"] for row in rows]
+        if not ids:
+            return []
         with self.connection:
-            cursor = self.connection.execute(
-                """
-                DELETE FROM speaker_samples
-                WHERE tier='cache' AND id IN (
-                    SELECT id FROM speaker_samples
-                    WHERE tier='cache'
-                    ORDER BY created_at ASC
-                    LIMIT MAX(0, (SELECT COUNT(*) FROM speaker_samples WHERE tier='cache') - ?)
-                )
-                """,
-                (max_cache,),
+            placeholders = ",".join("?" for _ in ids)
+            self.connection.execute(
+                f"DELETE FROM speaker_samples WHERE id IN ({placeholders})", ids
             )
-            return cursor.rowcount
+        return paths
 
     def delete_all_voice_samples(self) -> int:
         with self.connection:
@@ -764,6 +805,29 @@ class Store:
             if w and _PUNCT_RE.sub("", w):
                 parts.append(w)
         return " ".join(parts)
+
+    def get_hotword_entries(self, max_words: int = 80) -> list[tuple[str, float]]:
+        """Return (word, weight) pairs for anchor-based logits boosting.
+
+        System words (e.g. 小E) are excluded: wake-word matching is rule-based in
+        vui.py, and injecting the wake word into decode bias would nudge mundane
+        speech toward spurious wake words. Ordering: manual > auto, weight DESC.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT word, weight FROM lexicon
+            WHERE source != 'system'
+            ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END, weight DESC
+            LIMIT ?
+            """,
+            (max_words,),
+        ).fetchall()
+        entries = []
+        for row in rows:
+            w = str(row["word"]).strip()
+            if w and _PUNCT_RE.sub("", w):
+                entries.append((w, float(row["weight"])))
+        return entries
 
     def learn_high_frequency_words(self, min_count: int = 2, max_auto_words: int = 100) -> int:
         """Deprecated: High-frequency word learning is disabled.

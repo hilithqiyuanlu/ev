@@ -703,3 +703,20 @@ def test_correction_manual_add_word_signal(tmp_path):
         )
         assert corr["source"] == "manual_add_word"
         assert store.count_corrections() == 1
+
+
+def test_hotword_entries_order_and_system_exclusion(tmp_path):
+    """get_hotword_entries returns weighted pairs, excludes system, orders weight DESC."""
+    from ev.store.db import Store
+    db = tmp_path / "test.db"
+    with Store(db) as store:
+        # Add manual + auto words
+        store.add_lexicon_word("网易云", 3.0, source="manual")
+        store.add_lexicon_word("张三", 5.0, source="manual")
+        store.add_lexicon_word("vibe coding", 2.5, source="auto")
+        # System words are seeded (小E/小e)
+        entries = store.get_hotword_entries()
+        words = [w for w, _ in entries]
+        assert "小E" not in words  # system excluded
+        assert "小e" not in words
+        assert entries == [("张三", 5.0), ("网易云", 3.0), ("vibe coding", 2.5)]

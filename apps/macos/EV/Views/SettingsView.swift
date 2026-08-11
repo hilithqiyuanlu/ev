@@ -3,7 +3,6 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showLogs = false
-    @State private var showVoiceSamples = false
     @State private var showOnboarding = true
 
     private let modelNames = [
@@ -19,10 +18,6 @@ struct SettingsView: View {
                 onboardingSection
                 Divider()
                 modelsSection
-                Divider()
-                voiceProfileSection
-                Divider()
-                thresholdsSection
                 Divider()
                 storageSection
                 Divider()
@@ -69,7 +64,7 @@ struct SettingsView: View {
                                 detail: model.onboardingChecks.models ? "四个模型均已就绪" : "请在下方下载并校验模型")
                     ChecklistRow("麦克风权限已允许", done: model.onboardingChecks.permission,
                                 detail: permissionDetail)
-                    ChecklistRow("声纹已建立", done: model.voiceProfile.isReady,
+                    ChecklistRow("声纹已建立", done: !model.needsVoiceOnboarding,
                                 detail: voiceProfileDetail)
                 }
             }
@@ -82,6 +77,15 @@ struct SettingsView: View {
         case .denied, .restricted: return "已拒绝，请在系统设置中开启"
         case .notDetermined: return "首次监听时会请求权限"
         }
+    }
+
+    private var voiceProfileDetail: String {
+        if model.needsVoiceOnboarding {
+            return model.voiceProfile.coreCount == 0
+                ? "尚未录入，请在「声纹」页完成引导"
+                : "已录 \(model.onboardingCount)/\(model.onboardingTarget) 段"
+        }
+        return "已建立（核心 \(model.voiceProfile.coreCount)、缓存 \(model.voiceProfile.cacheCount)、\(model.voiceProfile.centroidCount) 质心）"
     }
 
     // MARK: - Models
@@ -152,218 +156,6 @@ struct SettingsView: View {
                 .disabled(model.isVerifyingModels || model.downloadProgress > 0)
             }
             .buttonStyle(.bordered)
-        }
-    }
-
-    // MARK: - Voice Profile
-
-    private var voiceProfileSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                sectionHeader("用户声纹", systemImage: "person.wave.2")
-                Spacer()
-                voiceStatusBadge
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 16) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("核心样本")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text("\(model.voiceProfile.coreCount) / 20")
-                            .font(.title3.monospacedDigit())
-                            .fontWeight(.medium)
-                            .foregroundStyle(.orange)
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("缓存样本")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text("\(model.voiceProfile.cacheCount) / 50")
-                            .font(.title3.monospacedDigit())
-                            .fontWeight(.medium)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if model.voiceProfile.centroidCount > 0 {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("质心数")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text("\(model.voiceProfile.centroidCount)")
-                                .font(.title3.monospacedDigit())
-                                .fontWeight(.medium)
-                                .foregroundStyle(.blue)
-                        }
-                    }
-
-                    Spacer()
-
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text("上次更新")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text(lastUpdatedText)
-                            .font(.caption.monospacedDigit())
-                    }
-                }
-
-                ProgressView(
-                    value: Double(min(model.voiceProfile.coreCount, 20)),
-                    total: 20
-                )
-                .opacity(model.voiceProfile.coreCount > 0 ? 1 : 0.3)
-                .tint(.orange)
-            }
-            .padding(10)
-            .background(Color.secondary.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            HStack(spacing: 10) {
-                Toggle("自动学习", isOn: Binding(
-                    get: { model.autoLearnEnabled },
-                    set: { model.setAutoLearn($0) }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-                Text("自动学习")
-                    .font(.subheadline)
-                Spacer()
-
-                if model.enrollStatus == "recording" {
-                    HStack(spacing: 10) {
-                        enrollWaveform
-                        Button {
-                            model.stopVoiceEnrollment()
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "stop.circle.fill")
-                                Text("完成录入")
-                                    .fontWeight(.medium)
-                            }
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Color.red, in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                } else {
-                    Button {
-                        model.startVoiceEnrollment()
-                    } label: {
-                        Label("添加样本", systemImage: "plus.circle")
-                    }
-                    .tint(.accentColor)
-                    .disabled(model.enrollStatus == "processing")
-                }
-
-                if model.enrollStatus == "done" {
-                    Label("已添加", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                } else if model.enrollStatus == "failed" {
-                    Label("失败，重试", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                }
-
-                Button {
-                    model.loadVoiceSamples()
-                    showVoiceSamples = true
-                } label: {
-                    Label("管理样本", systemImage: "list.bullet.rectangle")
-                }
-            }
-
-            if let error = model.manualEnrollError {
-                Text("录入失败: \(error)")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-        }
-        .sheet(isPresented: $showVoiceSamples) {
-            VoiceSamplesSheet()
-                .environmentObject(model)
-        }
-    }
-
-    private var enrollWaveform: some View {
-        HStack(alignment: .center, spacing: 3) {
-            ForEach(0..<5, id: \.self) { index in
-                let base = max(0.05, model.enrollLevel + Double(index - 2) * 0.15)
-                let height = max(3, min(24, base * 30))
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.red.opacity(0.7))
-                    .frame(width: 4, height: height)
-                    .animation(.easeOut(duration: 0.1), value: model.enrollLevel)
-            }
-        }
-        .frame(width: 32, height: 28)
-    }
-
-    private var voiceStatusBadge: some View {
-        let (text, color, icon): (String, Color, String) = {
-            if model.voiceProfile.isReady {
-                return ("已就绪", .green, "checkmark.circle.fill")
-            } else if model.voiceProfile.sampleCount > 0 {
-                return ("学习中", .orange, "circle.dotted")
-            } else {
-                return ("未建立", .secondary, "circle")
-            }
-        }()
-        return HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 12))
-            Text(text)
-        }
-        .font(.caption.weight(.medium))
-        .foregroundStyle(color)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(color.opacity(0.12))
-        .clipShape(Capsule())
-    }
-
-    private var lastUpdatedText: String {
-        guard let dateStr = model.voiceProfile.lastUpdated else { return "—" }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: dateStr) {
-            let rel = RelativeDateTimeFormatter()
-            rel.unitsStyle = .abbreviated
-            rel.locale = Locale(identifier: "zh_CN")
-            return rel.localizedString(for: date, relativeTo: Date())
-        }
-        return String(dateStr.prefix(10))
-    }
-
-    private var voiceProfileDetail: String {
-        if model.voiceProfile.sampleCount == 0 {
-            return "正常使用时自动收集"
-        }
-        if model.voiceProfile.isReady {
-            return "核心 \(model.voiceProfile.coreCount)、缓存 \(model.voiceProfile.cacheCount)，\(model.voiceProfile.centroidCount) 个质心"
-        }
-        return "学习中（核心 \(model.voiceProfile.coreCount)/3）"
-    }
-
-    // MARK: - Thresholds
-
-    private var thresholdsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("声纹判定阈值", systemImage: "slider.horizontal.3")
-            Text("高于此分数判定为本人，低于则判定为他人。声纹建立前（<3个核心样本）所有语音均接收。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            HStack {
-                Text("阈值")
-                Slider(value: $model.speakerThreshold, in: 0.3...0.8, onEditingChanged: { editing in
-                    if !editing { model.saveThresholds() }
-                })
-                Text(String(format: "%.2f", model.speakerThreshold)).monospacedDigit()
-            }
-            .font(.subheadline)
         }
     }
 

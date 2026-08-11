@@ -38,7 +38,7 @@ from ..speaker.verification import (
     normalize_loudness,
     verify_speaker,
 )
-from ..store.audio import archive_wav
+from ..store.audio import archive_wav, save_voice_sample, read_wav
 from ..store.db import SegmentRecord, Store
 from ..vui import decide_query, decide_query_from_utterances, match_wake_prefix
 from ..vad.adapters import VADAdapter, CompositeVAD
@@ -253,6 +253,7 @@ class SegmentProcessor:
         output: Callable[[str], None] = print,
         emit: Callable[[str, dict], None] | None = None,
         hotwords: str = "",
+        hotword_entries: list[tuple[str, float]] | None = None,
     ):
         self.settings = settings
         self.store = store
@@ -268,13 +269,16 @@ class SegmentProcessor:
         self.threshold: float = settings.speaker.threshold
         # Hotwords for final ASR - can be updated at runtime
         self.hotwords: str = hotwords
+        self.hotword_entries: list[tuple[str, float]] = hotword_entries or []
 
     def update_thresholds(self, threshold: float | None = None) -> None:
         if threshold is not None:
             self.threshold = float(threshold)
 
-    def update_hotwords(self, hotwords: str) -> None:
+    def update_hotwords(self, hotwords: str, hotword_entries: list[tuple[str, float]] | None = None) -> None:
         self.hotwords = hotwords or ""
+        if hotword_entries is not None:
+            self.hotword_entries = hotword_entries or []
 
     def process(
         self,
@@ -421,30 +425,36 @@ class SegmentProcessor:
         self.store.insert_segment(record)
         is_filler = self.settings.segment.discard_filler_only and _is_filler_only(transcript)
 
-        # Sample collection: collect only from user-only segments (score >= threshold).
-        # For multi-speaker segments (contains non-user turns), skip learning since
-        # the full-audio embedding is contaminated.
-        # Cold start (profile not ready): treat all as collectible with high score.
+        # Sample collection: collect only from user-only segments with high
+        # confidence (score >= collect_min_score). Multi-speaker segments are
+        # skipped (full-audio embedding is contaminated). The onboarding gate
+        # (core_count >= onboarding_target) is enforced inside should_collect,
+        # so no cold-start collection happens before manual guidance completes.
         has_non_user_turn = any(t.label == "non-user" for t in speaker_turns)
         should_try_collect = False
-        collect_score = 0.8 if not profile_ready else (score if score is not None else 0.0)
-        if not profile_ready:
-            should_try_collect = True
-            collect_score = 0.8
-        elif speaker_label == "user" and score is not None and not has_non_user_turn:
+        if speaker_label == "user" and score is not None and not has_non_user_turn:
             should_try_collect = score >= self.settings.voice_learning.collect_min_score
 
         if should_try_collect and self.voice_profile.should_collect(
             duration_ms=duration_ms,
-            score=collect_score,
+            score=score,
             transcript=transcript,
             is_filler_only=is_filler,
         ):
+            # Copy the segment audio into the managed voice-samples dir so the
+            # sample's wav is decoupled from segment history (clearing history
+            # won't orphan it) and can be re-embedded by "learn samples".
+            sample_wav = save_voice_sample(
+                self.settings.voice_samples_dir,
+                segment_id,
+                audio,
+                self.settings.audio.sample_rate,
+            )
             added, added_tier = self.voice_profile.add_sample(
                 embedding=embedding,
-                audio_path=str(wav_path),
+                audio_path=str(sample_wav),
                 duration_ms=duration_ms,
-                score=collect_score,
+                score=score,
                 segment_id=segment_id,
             )
             if added:
@@ -478,11 +488,24 @@ class SegmentProcessor:
     def _final(self, audio: np.ndarray) -> TranscriptionResult | None:
         if self.final_asr is None:
             return None
-        result = self.final_asr.transcribe(
-            audio,
-            self.settings.audio.sample_rate,
-            hotword=self.hotwords,
-        )
+        if isinstance(self.final_asr, Qwen3ASRAdapter):
+            asr_cfg = self.settings.asr
+            result = self.final_asr.transcribe(
+                audio,
+                self.settings.audio.sample_rate,
+                hotword=self.hotwords,
+                hotword_entries=self.hotword_entries or None,
+                enable_hotword_boost=asr_cfg.hotword_boosting_enabled,
+                hotword_boost_scale=asr_cfg.hotword_boost_scale,
+                hotword_boost_max=asr_cfg.hotword_boost_max,
+                hotword_min_anchor_len=asr_cfg.hotword_min_anchor_len,
+            )
+        else:
+            result = self.final_asr.transcribe(
+                audio,
+                self.settings.audio.sample_rate,
+                hotword=self.hotwords,
+            )
         if isinstance(result, str):
             return TranscriptionResult(text=result)
         return result
@@ -590,9 +613,9 @@ class SegmentWorker:
     def submit(self, job: SegmentJob) -> None:
         self.jobs.put(job)
 
-    def update_hotwords(self, hotwords: str) -> None:
+    def update_hotwords(self, hotwords: str, hotword_entries: list[tuple[str, float]] | None = None) -> None:
         if self._processor is not None:
-            self._processor.update_hotwords(hotwords)
+            self._processor.update_hotwords(hotwords, hotword_entries)
 
     def reload_final_asr(self) -> None:
         """Signal the worker to reload the final ASR model on next segment.
@@ -626,6 +649,7 @@ class SegmentWorker:
             from ..speaker.profile import VoiceProfileManager
             voice_profile = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
             hotwords_str = store.get_hotwords_string()
+            hotword_entries = store.get_hotword_entries()
             processor = SegmentProcessor(
                 self.settings,
                 store,
@@ -637,6 +661,7 @@ class SegmentWorker:
                 self.output,
                 self.emit,
                 hotwords=hotwords_str,
+                hotword_entries=hotword_entries,
             )
             self._processor = processor
             if self._shared_threshold is not None:

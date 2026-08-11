@@ -43,6 +43,8 @@ class Qwen3ASRAdapter:
         self.torch_dtype: Any | None = None
         self._suppress_tokens: list[int] | None = None
         self._loaded = model is not None and tokenizer is not None
+        self._hotword_text_of_id: dict[int, str] | None = None
+        self._hotword_ids_by_char: dict[str, list[int]] | None = None
         self._detect_variant()
 
     def _detect_variant(self) -> None:
@@ -158,6 +160,11 @@ class Qwen3ASRAdapter:
         sample_rate: int = 16000,
         hotword: str = "",
         return_timestamps: bool = False,
+        hotword_entries: list[tuple[str, float]] | None = None,
+        enable_hotword_boost: bool = True,
+        hotword_boost_scale: float = 2.0,
+        hotword_boost_max: float = 6.0,
+        hotword_min_anchor_len: int = 1,
     ) -> TranscriptionResult:
         import torch
 
@@ -216,6 +223,21 @@ class Qwen3ASRAdapter:
         if self._suppress_tokens:
             gen_kwargs["suppress_tokens"] = self._suppress_tokens
 
+        boost = self._build_hotword_processor(
+            hotword_entries,
+            enable_hotword_boost,
+            hotword_boost_scale,
+            hotword_boost_max,
+            hotword_min_anchor_len,
+        )
+        if boost is not None:
+            try:
+                from transformers import LogitsProcessorList
+
+                gen_kwargs["logits_processor"] = LogitsProcessorList([boost])
+            except ImportError:
+                logger.warning("transformers not importable; hotword logits boost disabled")
+
         with torch.no_grad():
             output_ids = self.model.generate(**model_inputs, **gen_kwargs)
 
@@ -229,6 +251,40 @@ class Qwen3ASRAdapter:
         raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
 
         return self._parse_output(raw_text, return_timestamps)
+
+    def _build_hotword_processor(
+        self,
+        hotword_entries: list[tuple[str, float]] | None,
+        enable: bool,
+        boost_scale: float,
+        boost_max: float,
+        min_anchor_len: int,
+    ):
+        """Build the anchored hotword logits processor, or None when inapplicable.
+
+        Reuses precomputed tokenizer index caches so the (one-time) full-vocab
+        scan in ``build_character_index`` is shared across transcribes.
+        """
+        from .hotword import HotwordLogitsProcessor
+
+        if not enable or not hotword_entries:
+            return None
+        clean = [(str(w).strip(), float(weight)) for w, weight in hotword_entries if str(w).strip()]
+        if not clean:
+            return None
+        processor = HotwordLogitsProcessor(
+            self.tokenizer,
+            clean,
+            boost_scale=boost_scale,
+            boost_max=boost_max,
+            min_anchor_len=min_anchor_len,
+            text_of_id=self._hotword_text_of_id,
+            ids_by_char=self._hotword_ids_by_char,
+        )
+        processor.ensure_index()
+        self._hotword_text_of_id = processor.text_of_id
+        self._hotword_ids_by_char = processor.ids_by_char
+        return processor
 
     def _parse_output(
         self, raw_text: str, with_timestamps: bool,

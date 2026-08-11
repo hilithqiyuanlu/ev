@@ -348,6 +348,7 @@ struct VoiceSample: Identifiable, Hashable {
     let transcriptHint: String?
     let tier: String  // "core" or "cache"
     let isManual: Bool
+    let audioAvailable: Bool
 
     init?(_ value: JSONValue) {
         guard let object = value.object,
@@ -362,6 +363,7 @@ struct VoiceSample: Identifiable, Hashable {
         self.transcriptHint = object["transcript_hint"]?.string
         self.tier = object["tier"]?.string ?? "core"
         self.isManual = object["is_manual"]?.bool ?? (object["is_manual"]?.double == 1)
+        self.audioAvailable = object["audio_available"]?.bool ?? (object["audio_available"]?.double == 1)
     }
 }
 

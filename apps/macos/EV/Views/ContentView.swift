@@ -5,6 +5,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case history = "历史"
     case lexicon = "词典"
     case models = "模型"
+    case voice = "声纹"
     case settings = "设置"
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .history: "clock.arrow.circlepath"
         case .lexicon: "character.book.closed"
         case .models: "cube.box"
+        case .voice: "person.wave.2"
         case .settings: "gearshape"
         }
     }
@@ -35,6 +37,7 @@ struct ContentView: View {
             case .history: HistoryView()
             case .lexicon: LexiconView()
             case .models: ModelsView()
+            case .voice: VoiceView()
             case .settings: SettingsView()
             }
         }

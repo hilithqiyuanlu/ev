@@ -41,7 +41,7 @@ asr_final = "ev-paraformer-zh-16k"
 speaker = "ev-eres2netv2-zh-16k"
 
 [speaker]
-threshold = 0.50
+threshold = 0.40
 max_core_samples = 20
 max_cache_samples = 50
 max_centroids = 3
@@ -56,6 +56,8 @@ auto_learn_enabled = true       # 正常使用中自动学习声纹
 max_samples = 20               # 最多保留最近N个样本
 ema_alpha = 0.05               # 新样本在EMA中的权重（0.05=5%）
 collect_threshold_offset = 0.05 # 收录要求 score ≥ threshold + offset（高置信度）
+collect_min_score = 0.60       # 自动学习收录最低分（高置信度，高于判定阈值）
+onboarding_target = 5          # 手动引导录音次数，达到后才开启自动学习
 min_duration_ms = 1500         # 样本最小时长（1.5秒）
 max_duration_ms = 10000        # 样本最大时长（10秒）
 min_interval_sec = 30          # 两次收录最小间隔（秒）

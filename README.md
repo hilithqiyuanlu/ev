@@ -53,11 +53,15 @@ This is an early development version. The speech input pipeline is working end-t
 - macOS menu bar app with SwiftUI interface
 - Real-time streaming transcription with endpoint detection
 - Automatic speaker recognition — it learns your voice as you use it
-- Wake word "小E" (with ASR homophone tolerance for natural speech)
+- Wake word "小E" (with ASR homophone tolerance, and 嗨/hi/hai greeting handling)
 - Local recording history with playback, instant filtering, and one-click correction
-- Personal hotword lexicon — learns new words from your corrections to improve ASR accuracy
+- Personal hotword lexicon — manual + auto-learned words injected into ASR
 - Ctrl+T global shortcut to toggle listening
 - Adjustable sensitivity threshold
+- Optional Qwen3-ASR (0.6B/1.7B) for mixed Chinese-English transcription, with anchor-based hotword boosting
+- Voice onboarding: guided core-sample enrollment before automatic learning kicks in
+- Far-field pickup: AGC/pre-emphasis/noise-gate preprocessing, composite FSMN+energy VAD
+- Real-time speaker-turn tracking ("second-ear" mode) with dual WAV archive (processed + raw)
 
 What's not here yet (but coming):
 - LLM integration for actually answering queries
@@ -89,17 +93,11 @@ Open the app, go to **Models** to download the required models on first launch,
 select your microphone on **Live**, and start talking. Say "小E" followed by a command
 to interact.
 
-Detailed setup and troubleshooting: [Chinese User Guide](docs/user-guide.md)
-
 ## Documentation
 
 Design notes and implementation details live in [`docs/`](docs/):
 
-- [user-guide.md](docs/user-guide.md) — Complete operation guide in Chinese
-- [phase1a-plan.md](docs/phase1a-plan.md) — Core pipeline architecture
-- [phase1b-gui.md](docs/phase1b-gui.md) — Engine-client protocol
 - [audio-flows.md](docs/audio-flows.md) — Audio processing pipeline
-- [research.md](docs/research.md) — Research notes and references
 
 ## Repository Layout
 

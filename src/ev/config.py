@@ -82,11 +82,27 @@ class ModelRegistrySettings:
 
 @dataclass(frozen=True)
 class SpeakerSettings:
-    threshold: float = 0.50
+    threshold: float = 0.40
     max_core_samples: int = 20
     max_cache_samples: int = 50
     max_centroids: int = 3
     loudness_normalize: bool = True
+
+
+@dataclass(frozen=True)
+class AsrSettings:
+    """Hotword boosting for the final ASR (Qwen3).
+
+    设计原则: 只做"锚定式正增量", 尽量少干扰常见表述。
+    - 仅当已解码文本末尾已命中词典词前缀时, 才对续写该词的 token 加 logits;
+    - 从不抑制任何 token, 匹配常见前缀但不能续写热词时完全不受影响。
+    """
+
+    hotword_boosting_enabled: bool = True
+    hotword_boost_scale: float = 2.0    # 每个权重单位叠加的 logits 增量
+    hotword_boost_max: float = 6.0      # 单 token 叠加上限
+    hotword_min_anchor_len: int = 1     # 触发所需的最少已匹配前缀字符数
+    hotword_inject_max_words: int = 30  # prompt 注入的最大词数
 
 
 @dataclass(frozen=True)
@@ -117,7 +133,8 @@ class VoiceLearningSettings:
     max_samples: int = 20
     ema_alpha: float = 0.05
     collect_threshold_offset: float = 0.05
-    collect_min_score: float = 0.40
+    collect_min_score: float = 0.60
+    onboarding_target: int = 5
     min_duration_ms: int = 1500
     max_duration_ms: int = 10000
     min_interval_sec: float = 30.0
@@ -136,6 +153,7 @@ class Settings:
     vui: VuiSettings
     segment: SegmentSettings
     voice_learning: VoiceLearningSettings
+    asr: AsrSettings
 
     @property
     def models_dir(self) -> Path:
@@ -146,6 +164,10 @@ class Settings:
         return self.data_dir / "archive"
 
     @property
+    def voice_samples_dir(self) -> Path:
+        return self.data_dir / "voice-samples"
+
+    @property
     def logs_dir(self) -> Path:
         return self.data_dir / "logs"
 
@@ -154,7 +176,13 @@ class Settings:
         return self.data_dir / "ev.db"
 
     def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.models_dir, self.archive_dir, self.logs_dir):
+        for d in (
+            self.data_dir,
+            self.models_dir,
+            self.archive_dir,
+            self.voice_samples_dir,
+            self.logs_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -182,6 +210,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
     vui_raw = raw.get("vui", {})
     segment_raw = raw.get("segment", {})
     voice_learning_raw = raw.get("voice_learning", {})
+    asr_raw = raw.get("asr", {})
     data_dir = Path(
         os.environ.get("EV_DATA_DIR", raw.get("paths", {}).get("data_dir", "data"))
     )
@@ -276,7 +305,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         speaker=SpeakerSettings(
             threshold=float(
                 speaker_raw.get("threshold",
-                    speaker_raw.get("user_threshold", 0.50)
+                    speaker_raw.get("user_threshold", 0.40)
                 )
             ),
             max_core_samples=int(speaker_raw.get("max_core_samples", 20)),
@@ -302,9 +331,17 @@ def load_settings(config_path: Path | None = None) -> Settings:
             max_samples=int(voice_learning_raw.get("max_samples", 20)),
             ema_alpha=float(voice_learning_raw.get("ema_alpha", 0.05)),
             collect_threshold_offset=float(voice_learning_raw.get("collect_threshold_offset", 0.05)),
-            collect_min_score=float(voice_learning_raw.get("collect_min_score", 0.40)),
+            collect_min_score=float(voice_learning_raw.get("collect_min_score", 0.60)),
+            onboarding_target=int(voice_learning_raw.get("onboarding_target", 5)),
             min_duration_ms=int(voice_learning_raw.get("min_duration_ms", 1500)),
             max_duration_ms=int(voice_learning_raw.get("max_duration_ms", 10000)),
             min_interval_sec=float(voice_learning_raw.get("min_interval_sec", 30.0)),
+        ),
+        asr=AsrSettings(
+            hotword_boosting_enabled=bool(asr_raw.get("hotword_boosting_enabled", True)),
+            hotword_boost_scale=float(asr_raw.get("hotword_boost_scale", 2.0)),
+            hotword_boost_max=float(asr_raw.get("hotword_boost_max", 6.0)),
+            hotword_min_anchor_len=int(asr_raw.get("hotword_min_anchor_len", 1)),
+            hotword_inject_max_words=int(asr_raw.get("hotword_inject_max_words", 30)),
         ),
     )
