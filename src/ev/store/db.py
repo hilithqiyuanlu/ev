@@ -119,6 +119,7 @@ class Store:
               score REAL NOT NULL,
               tier TEXT NOT NULL DEFAULT 'core' CHECK(tier IN ('core','cache')),
               is_manual INTEGER NOT NULL DEFAULT 0,
+              is_diversity INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS queries (
@@ -158,7 +159,8 @@ class Store:
         self._migrate_end_trigger_v12()
         self._migrate_quality_v13()
         self._migrate_samples_fk_v14()
-        self.connection.execute("PRAGMA user_version=14")
+        self._migrate_diversity_v15()
+        self.connection.execute("PRAGMA user_version=15")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -216,6 +218,16 @@ class Store:
             )
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_speaker_samples_tier ON speaker_samples(tier)"
+            )
+
+    def _migrate_diversity_v15(self) -> None:
+        """Add is_diversity flag to speaker_samples (v14->v15). Auto-collected
+        samples in the [collect_min_score, core_score_min) band are marked as
+        diversity so cache eviction keeps them preferentially."""
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(speaker_samples)").fetchall()}
+        if "is_diversity" not in cols:
+            self.connection.execute(
+                "ALTER TABLE speaker_samples ADD COLUMN is_diversity INTEGER NOT NULL DEFAULT 0"
             )
 
     def _migrate_binary_classification_v5(self) -> None:
@@ -594,7 +606,13 @@ class Store:
         from ..speaker.verification import build_profile
         return build_profile(embeddings)
 
-    def profile_status(self, profile_id: str = "user-v1") -> dict:
+    def profile_status(
+        self,
+        profile_id: str = "user-v1",
+        max_core_samples: int = 30,
+        max_cache_samples: int = 100,
+        max_centroids: int = 5,
+    ) -> dict:
         core_count = self.count_voice_samples(tier="core")
         cache_count = self.count_voice_samples(tier="cache")
         sample_count = core_count + cache_count
@@ -603,28 +621,23 @@ class Store:
         ).fetchone()
         updated_at = updated_row["updated"] if updated_row else None
         from ..speaker.verification import choose_k
-        centroid_count = choose_k(core_count, 3) if core_count > 0 else 0
-        if sample_count == 0:
-            return {
-                "exists": False,
-                "is_ready": False,
-                "sample_count": 0,
-                "core_count": 0,
-                "cache_count": 0,
-                "centroid_count": 0,
-                "updated_at": None,
-                "last_updated": None,
-            }
-        return {
+        centroid_count = choose_k(core_count, max_centroids) if core_count > 0 else 0
+        base = {
             "exists": core_count >= 3,
             "is_ready": core_count >= 3,
             "sample_count": sample_count,
             "core_count": core_count,
             "cache_count": cache_count,
             "centroid_count": centroid_count,
+            "max_core_samples": max_core_samples,
+            "max_cache_samples": max_cache_samples,
+            "max_centroids": max_centroids,
             "updated_at": updated_at,
             "last_updated": updated_at,
         }
+        if sample_count == 0:
+            base.update({"sample_count": 0, "core_count": 0, "cache_count": 0, "centroid_count": 0})
+        return base
 
     def add_voice_sample(
         self,
@@ -636,6 +649,7 @@ class Store:
         score: float,
         tier: str = "core",
         is_manual: bool = False,
+        is_diversity: bool = False,
     ) -> str:
         vector = np.asarray(embedding, dtype="<f4").reshape(-1)
         sample_id = uuid.uuid4().hex
@@ -644,11 +658,11 @@ class Store:
             self.connection.execute(
                 """
                 INSERT INTO speaker_samples
-                  (id, segment_id, audio_path, duration_ms, embedding_blob, embedding_dim, score, tier, is_manual, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (id, segment_id, audio_path, duration_ms, embedding_blob, embedding_dim, score, tier, is_manual, is_diversity, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (sample_id, segment_id, audio_path, duration_ms, vector.tobytes(),
-                 vector.size, score, tier, 1 if is_manual else 0, now),
+                 vector.size, score, tier, 1 if is_manual else 0, 1 if is_diversity else 0, now),
             )
         return sample_id
 
@@ -656,7 +670,7 @@ class Store:
         if tier not in (None, "core", "cache"):
             raise ValueError(f"invalid tier: {tier}")
         sql = """
-            SELECT id, segment_id, audio_path, duration_ms, score, tier, is_manual, created_at
+            SELECT id, segment_id, audio_path, duration_ms, score, tier, is_manual, is_diversity, created_at
             FROM speaker_samples
         """
         params: list = []
@@ -731,6 +745,26 @@ class Store:
             for row in rows
         ]
 
+    def load_voice_sample_detailed(self, tier: str = "cache") -> list[dict]:
+        """Return cache samples with embedding + flags for promotion/pending logic."""
+        rows = self.connection.execute(
+            """
+            SELECT id, audio_path, duration_ms, score, tier, is_manual, is_diversity, created_at,
+                   embedding_blob, embedding_dim
+            FROM speaker_samples WHERE tier=?
+            ORDER BY created_at ASC
+            """,
+            (tier,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            sample = dict(row)
+            sample["embedding"] = np.frombuffer(
+                row["embedding_blob"], dtype="<f4", count=row["embedding_dim"]
+            ).copy()
+            out.append(sample)
+        return out
+
     def get_voice_sample(self, sample_id: str) -> dict | None:
         row = self.connection.execute(
             "SELECT * FROM speaker_samples WHERE id=?", (sample_id,)
@@ -746,6 +780,14 @@ class Store:
             )
             return cursor.rowcount > 0
 
+    def update_voice_sample_diversity(self, sample_id: str, is_diversity: bool) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE speaker_samples SET is_diversity=? WHERE id=?",
+                (1 if is_diversity else 0, sample_id),
+            )
+            return cursor.rowcount > 0
+
     def delete_voice_sample(self, sample_id: str) -> bool:
         with self.connection:
             cursor = self.connection.execute(
@@ -756,22 +798,45 @@ class Store:
     def evict_oldest_cache(self, max_cache: int) -> list[str]:
         """Evict oldest cache samples to keep total cache count <= max_cache.
 
+        Diversity samples (is_diversity=1) are retained preferentially: plain
+        cache samples are evicted first, and only if the pool is still over
+        limit are the oldest diversity samples evicted.
+
         Returns the list of audio_paths of the evicted samples (files are NOT
         removed here; callers decide based on path ownership).
         """
-        rows = self.connection.execute(
-            """
-            SELECT id, audio_path FROM speaker_samples
-            WHERE tier='cache'
-            ORDER BY created_at ASC
-            LIMIT MAX(0, (SELECT COUNT(*) FROM speaker_samples WHERE tier='cache') - ?)
-            """,
-            (max_cache,),
-        ).fetchall()
-        paths = [row["audio_path"] for row in rows if row["audio_path"]]
-        ids = [row["id"] for row in rows]
+        count = self.connection.execute(
+            "SELECT COUNT(*) as c FROM speaker_samples WHERE tier='cache'"
+        ).fetchone()["c"]
+        need = count - max_cache
+        if need <= 0:
+            return []
+        ids: list[str] = []
+        for select_diversity in (0, 1):
+            if need <= 0:
+                break
+            rows = self.connection.execute(
+                """
+                SELECT id FROM speaker_samples
+                WHERE tier='cache' AND is_diversity=?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (select_diversity, need),
+            ).fetchall()
+            if rows:
+                ids += [row["id"] for row in rows]
+                need -= len(rows)
         if not ids:
             return []
+        paths = [
+            row["audio_path"]
+            for row in self.connection.execute(
+                f"SELECT audio_path FROM speaker_samples WHERE id IN ({','.join('?' for _ in ids)})",
+                ids,
+            ).fetchall()
+            if row["audio_path"]
+        ]
         with self.connection:
             placeholders = ",".join("?" for _ in ids)
             self.connection.execute(

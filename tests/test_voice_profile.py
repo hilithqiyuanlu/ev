@@ -56,8 +56,9 @@ def test_auto_learn_gated_until_onboarding_complete(tmp_path, monkeypatch):
             duration_ms=2000, score=0.95, transcript="你好", is_filler_only=False
         ) is True
         # Low-confidence still rejected even after onboarding
+        # (collect_min_score=0.40; 0.4 is the boundary, 0.39 is below it)
         assert vp.should_collect(
-            duration_ms=2000, score=0.4, transcript="你好", is_filler_only=False
+            duration_ms=2000, score=0.39, transcript="你好", is_filler_only=False
         ) is False
         # Too short still rejected
         assert vp.should_collect(
@@ -236,3 +237,195 @@ def test_delete_segment_keeps_sample_after_v14_migration(tmp_path, monkeypatch):
         sample = store.get_voice_sample("smp-old")
         assert sample is not None, "迁移后样本不应被级联删除"
         assert sample["segment_id"] is None
+
+
+def test_add_sample_three_tier_grading(tmp_path, monkeypatch):
+    """三档分级: >=core_score_min→core; collect_min~core→cache+diversity; <collect_min→不收."""
+    settings = _settings(tmp_path, monkeypatch)
+    with Store(settings.db_path) as store:
+        vp = VoiceProfileManager(store, settings.voice_learning, settings.speaker)
+        # 手动样本凑够 onboarding (引导门控需要 core >= onboarding_target)
+        for i in range(settings.voice_learning.onboarding_target):
+            vp.add_sample(
+                embedding=np.array([1.0, 0.01 * i], dtype=np.float32),
+                audio_path=f"/onboard{i}.wav", duration_ms=2000,
+                score=0.95, is_manual=True,
+            )
+        assert vp.state.core_count >= settings.voice_learning.onboarding_target
+        vp._last_collect_time = 0.0
+
+        # score >= core_score_min (0.70) → core
+        ok, tier = vp.add_sample(
+            embedding=np.array([1.0, 0.05], dtype=np.float32),
+            audio_path="/high.wav", duration_ms=2000, score=0.80,
+        )
+        assert ok and tier == "core"
+
+        # collect_min(0.40) <= score < core_score_min → cache + diversity
+        vp._last_collect_time = 0.0  # 重置采集冷却
+        ok, tier = vp.add_sample(
+            embedding=np.array([1.0, 0.02], dtype=np.float32),
+            audio_path="/mid.wav", duration_ms=2000, score=0.50,
+        )
+        assert ok and tier == "cache"
+        mid = [s for s in store.list_voice_samples(tier="cache") if s["audio_path"] == "/mid.wav"]
+        assert mid and mid[0]["is_diversity"] == 1
+
+        # score < collect_min → 不收
+        vp._last_collect_time = 0.0
+        ok, tier = vp.add_sample(
+            embedding=np.array([1.0, 0.01], dtype=np.float32),
+            audio_path="/low.wav", duration_ms=2000, score=0.30,
+        )
+        assert ok is False and tier == ""
+
+
+def test_core_overflow_demotes_lowest_non_manual(tmp_path, monkeypatch):
+    """核心超限时簇内竞争: 降级最低分非手动 core, 手动样本永不淘汰."""
+    settings = _settings(tmp_path, monkeypatch)
+    settings = replace(settings, speaker=replace(settings.speaker, max_core_samples=3))
+    with Store(settings.db_path) as store:
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/a.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.1], dtype=np.float32),
+            score=0.90, tier="core", is_manual=False,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/b.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.2], dtype=np.float32),
+            score=0.80, tier="core", is_manual=False,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/c.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.3], dtype=np.float32),
+            score=0.75, tier="core", is_manual=False,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/m.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.4], dtype=np.float32),
+            score=0.95, tier="core", is_manual=True,
+        )
+        vp = VoiceProfileManager(store, settings.voice_learning, settings.speaker)
+        vp._trim_core_overflow(3)
+        core = store.list_voice_samples(tier="core")
+        assert len(core) <= 3
+        assert any(s["is_manual"] == 1 for s in core), "手动样本不应被淘汰"
+        cache = store.list_voice_samples(tier="cache")
+        assert any(s["score"] == 0.75 for s in cache), "最低分非手动 core 应降级到 cache"
+
+
+def test_auto_promote_fills_undersized_cluster(tmp_path, monkeypatch):
+    """自动补位: 簇成员 < promote_min_members 时从缓存晋升该簇最高分样本."""
+    settings = _settings(tmp_path, monkeypatch)
+    with Store(settings.db_path) as store:
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/core.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+            score=0.95, tier="core", is_manual=True,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/cache.wav", duration_ms=2000,
+            embedding=np.array([0.98, 0.02], dtype=np.float32),
+            score=0.90, tier="cache", is_manual=False,
+        )
+        vp = VoiceProfileManager(store, settings.voice_learning, settings.speaker)
+        vp._last_promote_time = -100.0  # 绕过冷却
+        vp._auto_promote()
+        core_paths = [s["audio_path"] for s in store.list_voice_samples(tier="core")]
+        assert "/cache.wav" in core_paths, "缓存中与质心相似的样本应被自动晋升"
+
+
+def test_pending_samples_confirm(tmp_path, monkeypatch):
+    """待确认: 缓存中与质心距离过大的样本进入 pending, 确认后晋升核心."""
+    settings = _settings(tmp_path, monkeypatch)
+    with Store(settings.db_path) as store:
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/core.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+            score=0.95, tier="core", is_manual=True,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/far.wav", duration_ms=2000,
+            embedding=np.array([0.0, 1.0], dtype=np.float32),
+            score=0.50, tier="cache", is_manual=False,
+        )
+        vp = VoiceProfileManager(store, settings.voice_learning, settings.speaker)
+        pending = vp.pending_samples(0.30)
+        assert len(pending) == 1
+        assert pending[0]["audio_path"] == "/far.wav"
+        assert vp.promote_sample(pending[0]["id"]) is True
+        core_paths = [s["audio_path"] for s in store.list_voice_samples(tier="core")]
+        assert "/far.wav" in core_paths
+
+
+def test_pending_reject_removes_sample(tmp_path, monkeypatch):
+    """待确认删除: remove_sample 从库中移除样本."""
+    settings = _settings(tmp_path, monkeypatch)
+    with Store(settings.db_path) as store:
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/core.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+            score=0.95, tier="core", is_manual=True,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/far.wav", duration_ms=2000,
+            embedding=np.array([0.0, 1.0], dtype=np.float32),
+            score=0.50, tier="cache", is_manual=False,
+        )
+        vp = VoiceProfileManager(store, settings.voice_learning, settings.speaker)
+        pending = vp.pending_samples(0.30)
+        assert len(pending) == 1
+        sid = pending[0]["id"]
+        assert vp.remove_sample(sid) is True
+        assert store.get_voice_sample(sid) is None
+
+
+def test_cache_eviction_preserves_diversity(tmp_path, monkeypatch):
+    """缓存 FIFO: 普通样本先淘汰, diversity 样本优先保留."""
+    settings = _settings(tmp_path, monkeypatch)
+    with Store(settings.db_path) as store:
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/d1.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+            score=0.50, tier="cache", is_manual=False, is_diversity=True,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/p1.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.1], dtype=np.float32),
+            score=0.60, tier="cache", is_manual=False, is_diversity=False,
+        )
+        store.add_voice_sample(
+            segment_id=None,
+            audio_path="/p2.wav", duration_ms=2000,
+            embedding=np.array([1.0, 0.2], dtype=np.float32),
+            score=0.60, tier="cache", is_manual=False, is_diversity=False,
+        )
+        evicted = [Path(p).name for p in store.evict_oldest_cache(2)]
+        assert "d1.wav" not in evicted, "diversity 样本不应先被淘汰"
+        assert len(evicted) == 1
+
+
+def test_choose_k_tiers():
+    """choose_k 档位: ≤5→1, 6-10→2, 11-18→3, 19-26→4, ≥27→5."""
+    from ev.speaker.verification import choose_k
+    assert choose_k(5, 5) == 1
+    assert choose_k(6, 5) == 2
+    assert choose_k(10, 5) == 2
+    assert choose_k(11, 5) == 3
+    assert choose_k(18, 5) == 3
+    assert choose_k(19, 5) == 4
+    assert choose_k(26, 5) == 4
+    assert choose_k(27, 5) == 5
+    assert choose_k(3, 3) == 1

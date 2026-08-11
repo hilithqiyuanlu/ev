@@ -113,6 +113,9 @@ class EngineService:
             "list_voice_samples": self._list_voice_samples,
             "delete_voice_sample": self._delete_voice_sample,
             "promote_voice_sample": self._promote_voice_sample,
+            "list_pending_voice_samples": self._list_pending_voice_samples,
+            "confirm_voice_sample": self._confirm_voice_sample,
+            "reject_voice_sample": self._reject_voice_sample,
             "reset_voice_profile": self._reset_voice_profile,
             "learn_voice_samples": self._learn_voice_samples,
             "set_voice_learning": self._set_voice_learning,
@@ -161,9 +164,17 @@ class EngineService:
             request.request_id,
         )
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
-        profile["auto_learn"] = self._voice_auto_learn
+            profile = self._profile_status(store)
         self.writer.emit("profile_status", profile, request.request_id)
+
+    def _profile_status(self, store: Store) -> dict:
+        profile = store.profile_status(
+            max_core_samples=self.settings.speaker.max_core_samples,
+            max_cache_samples=self.settings.speaker.max_cache_samples,
+            max_centroids=self.settings.speaker.max_centroids,
+        )
+        profile["auto_learn"] = self._voice_auto_learn
+        return profile
 
     def _list_devices(self, request: EngineRequest) -> None:
         devices = [asdict(device) for device in list_input_devices()]
@@ -482,7 +493,7 @@ class EngineService:
             self._emit_state()
         elif event_type == "voice_sample_added":
             with Store(self.settings.db_path) as store:
-                profile = store.profile_status()
+                profile = self._profile_status(store)
             profile["auto_learn"] = self._voice_auto_learn
             self.writer.emit("profile_status", profile)
         self.writer.emit(event_type, payload)
@@ -507,7 +518,57 @@ class EngineService:
             request.request_id,
         )
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
+        self._ack(request)
+
+    def _list_pending_voice_samples(self, request: EngineRequest) -> None:
+        with Store(self.settings.db_path) as store:
+            vp = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+            pending = vp.pending_samples(
+                self.settings.voice_learning.pending_distance_threshold
+            )
+        self.writer.emit(
+            "pending_voice_samples", {"samples": pending}, request.request_id
+        )
+
+    def _confirm_voice_sample(self, request: EngineRequest) -> None:
+        """确认待确认样本：晋升为核心样本。"""
+        sample_id = str(request.payload.get("sample_id", ""))
+        if not sample_id:
+            raise ValueError("缺少 sample_id")
+        with Store(self.settings.db_path) as store:
+            vp = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
+            promoted = vp.promote_sample(sample_id)
+        self.writer.emit(
+            "voice_sample_confirmed",
+            {"sample_id": sample_id, "promoted": promoted},
+            request.request_id,
+        )
+        with Store(self.settings.db_path) as store:
+            profile = self._profile_status(store)
+        profile["auto_learn"] = self._voice_auto_learn
+        self.writer.emit("profile_status", profile)
+        self._ack(request)
+
+    def _reject_voice_sample(self, request: EngineRequest) -> None:
+        """删除待确认样本（用户确认不是自己）。"""
+        sample_id = str(request.payload.get("sample_id", ""))
+        if not sample_id:
+            raise ValueError("缺少 sample_id")
+        with Store(self.settings.db_path) as store:
+            sample = store.get_voice_sample(sample_id)
+            deleted = store.delete_voice_sample(sample_id)
+            if deleted and sample and sample.get("audio_path"):
+                self._unlink_sample_audio(str(sample["audio_path"]))
+        self.writer.emit(
+            "voice_sample_rejected",
+            {"sample_id": sample_id, "deleted": deleted},
+            request.request_id,
+        )
+        with Store(self.settings.db_path) as store:
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
         self._ack(request)
@@ -527,7 +588,7 @@ class EngineService:
             request.request_id,
         )
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
 
@@ -539,7 +600,7 @@ class EngineService:
             self._unlink_sample_audio(raw)
         self.writer.emit("voice_profile_reset", {"deleted": count}, request.request_id)
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
 
@@ -629,7 +690,7 @@ class EngineService:
                     request.request_id,
                 )
                 with Store(self.settings.db_path) as store:
-                    profile = store.profile_status()
+                    profile = self._profile_status(store)
                 profile["auto_learn"] = self._voice_auto_learn
                 self.writer.emit("profile_status", profile)
             except Exception as exc:
@@ -644,7 +705,7 @@ class EngineService:
         self._voice_auto_learn = enabled
         self._ack(request)
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
 
@@ -713,7 +774,7 @@ class EngineService:
                     "tier": added_tier,
                 }, request.request_id)
                 with Store(self.settings.db_path) as store:
-                    profile = store.profile_status()
+                    profile = self._profile_status(store)
                 profile["auto_learn"] = self._voice_auto_learn
                 self.writer.emit("profile_status", profile)
             except Exception as exc:
@@ -814,7 +875,7 @@ class EngineService:
                     "tier": added_tier,
                 }, request.request_id)
                 with Store(self.settings.db_path) as store:
-                    profile = store.profile_status()
+                    profile = self._profile_status(store)
                 profile["auto_learn"] = self._voice_auto_learn
                 self.writer.emit("profile_status", profile)
             except Exception as exc:
@@ -848,7 +909,7 @@ class EngineService:
         self.writer.emit("segment_deleted", {"segment_id": segment_id, "deleted": deleted}, request.request_id)
         # 历史删除与声纹解耦：样本保留，segment_id 置空（schema v14 ON DELETE SET NULL）
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
 
@@ -858,7 +919,7 @@ class EngineService:
         self.writer.emit("segments_deleted", {"count": count}, request.request_id)
         # 同上：清空历史不影响声纹样本
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
 
@@ -871,7 +932,7 @@ class EngineService:
             request.request_id,
         )
         with Store(self.settings.db_path) as store:
-            profile = store.profile_status()
+            profile = self._profile_status(store)
         profile["auto_learn"] = self._voice_auto_learn
         self.writer.emit("profile_status", profile)
 

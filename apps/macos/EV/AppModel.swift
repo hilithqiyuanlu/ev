@@ -129,6 +129,7 @@ final class AppModel: ObservableObject {
     @Published var downloadSourceByKey: [String: String] = [:]
     @Published var voiceProfile = VoiceProfileState.empty
     @Published var voiceSamples: [VoiceSample] = []
+    @Published var pendingSamples: [VoiceSample] = []
     @Published var lexiconWords: [LexiconItem] = []
     @Published var manualEnrollStatus = "idle" // idle, recording, processing, done, failed
     @Published var manualEnrollError: String?
@@ -494,6 +495,18 @@ final class AppModel: ObservableObject {
         engine.send("promote_voice_sample", payload: ["sample_id": id])
     }
 
+    func loadPendingVoiceSamples() {
+        engine.send("list_pending_voice_samples")
+    }
+
+    func confirmPendingVoiceSample(_ id: String) {
+        engine.send("confirm_voice_sample", payload: ["sample_id": id])
+    }
+
+    func rejectPendingVoiceSample(_ id: String) {
+        engine.send("reject_voice_sample", payload: ["sample_id": id])
+    }
+
     func resetVoiceProfile() {
         engine.send("reset_voice_profile")
     }
@@ -810,12 +823,17 @@ final class AppModel: ObservableObject {
             loadVoiceSamples()
         case "voice_samples":
             voiceSamples = event.payload["samples"]?.array?.compactMap(VoiceSample.init) ?? []
+        case "pending_voice_samples":
+            pendingSamples = event.payload["samples"]?.array?.compactMap(VoiceSample.init) ?? []
         case "voice_samples_learned":
             isLearningSamples = false
             loadVoiceSamples()
             engine.send("get_status")
         case "voice_sample_added", "voice_sample_promoted", "voice_sample_deleted", "voice_profile_reset":
             loadVoiceSamples()
+        case "voice_sample_confirmed", "voice_sample_rejected":
+            loadVoiceSamples()
+            loadPendingVoiceSamples()
             // Also refresh profile status after sample changes
             engine.send("get_status")
         case "manual_sample_status":

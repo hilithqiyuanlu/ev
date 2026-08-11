@@ -83,9 +83,9 @@ class ModelRegistrySettings:
 @dataclass(frozen=True)
 class SpeakerSettings:
     threshold: float = 0.40
-    max_core_samples: int = 20
-    max_cache_samples: int = 50
-    max_centroids: int = 3
+    max_core_samples: int = 30
+    max_cache_samples: int = 100
+    max_centroids: int = 5
     loudness_normalize: bool = True
 
 
@@ -137,7 +137,11 @@ class VoiceLearningSettings:
     max_samples: int = 20
     ema_alpha: float = 0.05
     collect_threshold_offset: float = 0.05
-    collect_min_score: float = 0.60
+    collect_min_score: float = 0.40
+    core_score_min: float = 0.70
+    pending_distance_threshold: float = 0.30
+    promote_min_members: int = 2
+    promote_cooldown_sec: float = 60.0
     onboarding_target: int = 5
     min_duration_ms: int = 1500
     max_duration_ms: int = 10000
@@ -312,9 +316,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
                     speaker_raw.get("user_threshold", 0.40)
                 )
             ),
-            max_core_samples=int(speaker_raw.get("max_core_samples", 20)),
-            max_cache_samples=int(speaker_raw.get("max_cache_samples", 50)),
-            max_centroids=int(speaker_raw.get("max_centroids", 3)),
+            max_core_samples=int(speaker_raw.get("max_core_samples", 30)),
+            max_cache_samples=int(speaker_raw.get("max_cache_samples", 100)),
+            max_centroids=int(speaker_raw.get("max_centroids", 5)),
             loudness_normalize=bool(speaker_raw.get("loudness_normalize", True)),
         ),
         vui=VuiSettings(tuple(str(x) for x in vui_raw.get("wake_words", ["小E"]))),
@@ -338,7 +342,11 @@ def load_settings(config_path: Path | None = None) -> Settings:
             max_samples=int(voice_learning_raw.get("max_samples", 20)),
             ema_alpha=float(voice_learning_raw.get("ema_alpha", 0.05)),
             collect_threshold_offset=float(voice_learning_raw.get("collect_threshold_offset", 0.05)),
-            collect_min_score=float(voice_learning_raw.get("collect_min_score", 0.60)),
+            collect_min_score=float(voice_learning_raw.get("collect_min_score", 0.40)),
+            core_score_min=float(voice_learning_raw.get("core_score_min", 0.70)),
+            pending_distance_threshold=float(voice_learning_raw.get("pending_distance_threshold", 0.30)),
+            promote_min_members=int(voice_learning_raw.get("promote_min_members", 2)),
+            promote_cooldown_sec=float(voice_learning_raw.get("promote_cooldown_sec", 60.0)),
             onboarding_target=int(voice_learning_raw.get("onboarding_target", 5)),
             min_duration_ms=int(voice_learning_raw.get("min_duration_ms", 1500)),
             max_duration_ms=int(voice_learning_raw.get("max_duration_ms", 10000)),

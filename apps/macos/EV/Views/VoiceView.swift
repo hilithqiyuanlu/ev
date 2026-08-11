@@ -13,6 +13,10 @@ struct VoiceView: View {
             VStack(alignment: .leading, spacing: 18) {
                 fingerprintCard
                 Divider()
+                if !model.pendingSamples.isEmpty {
+                    pendingSection
+                    Divider()
+                }
                 sampleList
                 Divider()
                 thresholdSection
@@ -24,6 +28,7 @@ struct VoiceView: View {
         .navigationTitle("声纹")
         .onAppear {
             model.loadVoiceSamples()
+            model.loadPendingVoiceSamples()
         }
         .alert("重置声纹", isPresented: $showResetConfirm) {
             Button("取消", role: .cancel) {}
@@ -182,6 +187,42 @@ struct VoiceView: View {
     }
 
     // MARK: - Sample list
+
+    private var pendingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("待确认样本")
+                    .font(.headline)
+                Spacer()
+                Text("与声纹距离较大的缓存样本，确认后晋升核心")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(model.pendingSamples) { sample in
+                HStack(spacing: 10) {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.orange)
+                    Text(URL(fileURLWithPath: sample.audioPath).lastPathComponent)
+                        .lineLimit(1)
+                    Spacer()
+                    Text("置信度 \(String(format: "%.2f", sample.score))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("确认") {
+                        model.confirmPendingVoiceSample(sample.id)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    Button("删除", role: .destructive) {
+                        model.rejectPendingVoiceSample(sample.id)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(.vertical, 6)
+            }
+        }
+    }
 
     private var sampleList: some View {
         VStack(alignment: .leading, spacing: 8) {

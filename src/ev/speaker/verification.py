@@ -146,11 +146,13 @@ def kmeans_cluster(
     return centroids, labels
 
 
-def choose_k(n_samples: int, max_k: int = 3) -> int:
+def choose_k(n_samples: int, max_k: int = 5) -> int:
     """Choose number of clusters based on sample count.
     - 1~5 samples: k=1 (single centroid)
     - 6~10 samples: k=2
-    - 11+ samples: k=3 (or max_k if lower)
+    - 11~18 samples: k=3
+    - 19~26 samples: k=4
+    - 27+ samples: k=5 (or max_k if lower)
     """
     if n_samples < 1:
         return 0
@@ -158,4 +160,8 @@ def choose_k(n_samples: int, max_k: int = 3) -> int:
         return 1
     if n_samples <= 10:
         return min(2, max_k)
-    return min(3, max_k)
+    if n_samples <= 18:
+        return min(3, max_k)
+    if n_samples <= 26:
+        return min(4, max_k)
+    return min(5, max_k)
