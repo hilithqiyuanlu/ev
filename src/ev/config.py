@@ -125,6 +125,10 @@ class SegmentSettings:
     # ASR停滞超时: 流式ASR长时间无新partial结果视为说完
     asr_stall_timeout_ms: int = 2500
     discard_filler_only: bool = True
+    # 音频质量门控 (宽松起步, 数据驱动调优)
+    min_snr_db: float = 3.0            # 段 SNR 低于此值 → 质量拒绝 (宽松起步)
+    min_audible_rms: float = 0.0005    # 段 raw RMS 低于此值 → 质量拒绝 (~-66dBFS)
+    raw_noise_warmup_sec: float = 3.0   # 底噪追踪器启动后前 N 秒不拒绝
 
 
 @dataclass(frozen=True)
@@ -280,20 +284,20 @@ def load_settings(config_path: Path | None = None) -> Settings:
         preprocess=PreprocessSettings(
             enabled=bool(preprocess_raw.get("enabled", True)),
             preemphasis_coeff=float(preprocess_raw.get("preemphasis_coeff", 0.97)),
-            agc_target_rms=float(preprocess_raw.get("agc_target_rms", 0.05)),
+            agc_target_rms=float(preprocess_raw.get("agc_target_rms", 0.08)),
             agc_min_gain=float(preprocess_raw.get("agc_min_gain", 0.1)),
-            agc_max_gain=float(preprocess_raw.get("agc_max_gain", 20.0)),
+            agc_max_gain=float(preprocess_raw.get("agc_max_gain", 40.0)),
             agc_attack_ms=float(preprocess_raw.get("agc_attack_ms", 10.0)),
-            agc_release_ms=float(preprocess_raw.get("agc_release_ms", 100.0)),
+            agc_release_ms=float(preprocess_raw.get("agc_release_ms", 400.0)),
             noisegate_enabled=bool(preprocess_raw.get("noisegate_enabled", True)),
-            noisegate_snr_db=float(preprocess_raw.get("noisegate_snr_db", 3.0)),
+            noisegate_snr_db=float(preprocess_raw.get("noisegate_snr_db", 1.5)),
             noisegate_floor_track_sec=float(preprocess_raw.get("noisegate_floor_track_sec", 3.0)),
         ),
         vad=VADSettings(
             fsmn_threshold=fsmn_threshold,
             energy_vad_enabled=bool(vad_raw.get("energy_vad_enabled", True)),
-            energy_snr_linear=float(vad_raw.get("energy_snr_linear", 2.5)),
-            energy_abs_min_rms=float(vad_raw.get("energy_abs_min_rms", 0.001)),
+            energy_snr_linear=float(vad_raw.get("energy_snr_linear", 1.8)),
+            energy_abs_min_rms=float(vad_raw.get("energy_abs_min_rms", 0.0003)),
             energy_start_frames=int(vad_raw.get("energy_start_frames", 2)),
             energy_hangover_frames=int(vad_raw.get("energy_hangover_frames", 20)),
             combine_start_mode=str(vad_raw.get("combine_start_mode", "or")).lower(),
@@ -325,6 +329,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
             min_duration_for_relative_silence_ms=int(segment_raw.get("min_duration_for_relative_silence_ms", 6000)),
             asr_stall_timeout_ms=int(segment_raw.get("asr_stall_timeout_ms", 2500)),
             discard_filler_only=bool(segment_raw.get("discard_filler_only", True)),
+            min_snr_db=float(segment_raw.get("min_snr_db", 3.0)),
+            min_audible_rms=float(segment_raw.get("min_audible_rms", 0.0005)),
+            raw_noise_warmup_sec=float(segment_raw.get("raw_noise_warmup_sec", 3.0)),
         ),
         voice_learning=VoiceLearningSettings(
             auto_learn_enabled=bool(voice_learning_raw.get("auto_learn_enabled", True)),

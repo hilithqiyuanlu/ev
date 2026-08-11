@@ -116,6 +116,10 @@ struct Segment: Identifiable, Hashable {
     let dominantSpeaker: String
     let containsUser: Bool
     let sourceType: String
+    // 音频质量元数据 (v13)
+    let qualityLabel: String
+    let avgRawRms: Double?
+    let snrDb: Double?
 
     var isDialogue: Bool {
         // Mixed dialogue if there are utterances from both speakers
@@ -189,6 +193,9 @@ struct Segment: Identifiable, Hashable {
             self.containsUser = self.speakerLabel == "user"
         }
         self.sourceType = object["source_type"]?.string ?? "voice"
+        self.qualityLabel = object["quality_label"]?.string ?? "ok"
+        self.avgRawRms = object["avg_raw_rms"]?.double
+        self.snrDb = object["snr_db"]?.double
     }
 }
 

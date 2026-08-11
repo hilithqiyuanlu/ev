@@ -76,14 +76,27 @@ struct ModelsView: View {
                     .frame(width: 8, height: 8)
                 Text(model.allModelsReady ? "已就绪" : "待配置")
                     .font(.title3.bold())
+                if model.isVerifyingModels || model.downloadProgress > 0 {
+                    ProgressView().controlSize(.small)
+                }
             }
             Spacer()
             Button {
                 model.reloadRegistry()
+                model.verifyModels()
             } label: {
-                Label("刷新", systemImage: "arrow.triangle.2.circlepath")
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("刷新校验")
+                        .font(.subheadline.weight(.medium))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(CapsuleButtonStyle())
+            .disabled(model.isVerifyingModels || model.downloadProgress > 0)
         }
     }
 
@@ -200,28 +213,50 @@ struct ModelsView: View {
                 Spacer()
 
                 if isDownloading {
-                    Button("取消") {
+                    Button {
                         model.cancelDownload()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("取消")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(CapsuleButtonStyle())
                 } else if isInstalled {
                     Button {
                         modelToDelete = item
                     } label: {
-                        Label("卸载", systemImage: "trash")
-                            .foregroundStyle(.red)
+                        HStack(spacing: 6) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("卸载")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(CapsuleButtonStyle(isDestructive: true))
                 } else {
                     Button {
                         model.installModel(key: item.key)
                     } label: {
-                        Label("下载", systemImage: "arrow.down.circle")
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.circle")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("下载")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .buttonStyle(CapsuleButtonStyle())
                 }
             }
 

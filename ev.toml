@@ -50,6 +50,10 @@ loudness_normalize = true
 [segment]
 min_duration_ms = 500          # 短于此时长的段直接丢弃（咳嗽/敲击/噪声）
 discard_filler_only = true     # 终稿仅为语气词时丢弃
+# 音频质量门控 (宽松起步, 数据驱动调优; 注释掉用代码默认值)
+# min_snr_db = 3.0             # 段 SNR 低于此值 → 跳过 ASR (warm-up 期后生效)
+# min_audible_rms = 0.0005     # 段 raw RMS 低于此值 → 跳过 ASR (~-66dBFS)
+# raw_noise_warmup_sec = 3.0   # 底噪追踪器启动后前 N 秒不拒绝
 
 [voice_learning]
 auto_learn_enabled = true       # 正常使用中自动学习声纹

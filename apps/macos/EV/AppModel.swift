@@ -78,28 +78,30 @@ final class AppModel: ObservableObject {
     @Published var rawRmsDb: Double = -100.0   // 原始(预处理前) RMS dBFS, 调试远场用
     @Published var agcGain: Double = 1.0       // 当前 AGC 增益倍数
 
-    /// 设备选择 Picker 显示用: 「系统默认」 + 真实设备列表
+    /// 设备选择 Menu 显示用: 所有真实设备，系统默认设备标注「（默认）」
     var devicePickerItems: [(tag: String, label: String, isDefault: Bool)] {
         typealias Item = (tag: String, label: String, isDefault: Bool)
-        var items: [Item] = []
-        // 1) 固定首位: 使用系统默认
-        let defaultDeviceName = devices.first(where: \.isDefault)?.name ?? "（无默认设备）"
-        let defaultItem: Item = (
-            tag: Self.systemDefaultDeviceTag,
-            label: "使用系统默认（当前：\(defaultDeviceName)）",
-            isDefault: true
-        )
-        items += [defaultItem]
-        // 2) 真实设备
-        for dev in devices {
-            let devItem: Item = (
+        return devices.map { dev in
+            (
                 tag: dev.name,
                 label: dev.isDefault ? "\(dev.name)（默认）" : dev.name,
                 isDefault: dev.isDefault
             )
-            items += [devItem]
         }
-        return items
+    }
+
+    /// 当前选中设备的折叠显示名；未选中（空串 = 系统默认）时显示默认设备名并标记「默认」
+    var selectedDeviceLabel: String {
+        if selectedDevice.isEmpty {
+            if let def = devices.first(where: \.isDefault) {
+                return "\(def.name)（默认）"
+            }
+            return devices.first?.name ?? "无可用设备"
+        }
+        if let dev = devices.first(where: { $0.name == selectedDevice }) {
+            return dev.isDefault ? "\(dev.name)（默认）" : dev.name
+        }
+        return selectedDevice
     }
 
     @Published var partialText = ""
@@ -852,6 +854,7 @@ final class AppModel: ObservableObject {
             if engineState == .loading || engineState == .stopping {
                 engineState = .error
             }
+            isLearningSamples = false
             errorMessage = event.payload["message"]?.string ?? "未知错误"
         default:
             break

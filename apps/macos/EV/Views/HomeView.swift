@@ -21,18 +21,7 @@ struct HomeView: View {
 
     private var topBar: some View {
         HStack(spacing: 14) {
-            Picker("输入设备", selection: $model.selectedDevice) {
-                ForEach(model.devicePickerItems, id: \.tag) { item in
-                    Text(item.label).tag(item.tag)
-                }
-            }
-            .frame(width: 340)
-            .disabled(model.isListening)
-            .help(
-                model.isListening
-                    ? "监听中无法切换设备，请先停止监听"
-                    : "选择麦克风输入源；默认跟随系统设置（插上 DJI Mic Mini 时会自动切换）"
-            )
+            deviceMenu
 
             if model.microphonePermission != .authorized {
                 HStack(spacing: 6) {
@@ -51,21 +40,76 @@ struct HomeView: View {
 
             Spacer()
 
-            Button {
-                model.toggleListening()
-            } label: {
-                Label(
-                    model.isListening ? "停止监听" : "开始监听",
-                    systemImage: model.isListening ? "stop.fill" : "mic.fill"
-                )
-            }
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.space, modifiers: [.command])
-            .disabled(
-                model.engineState == .loading || model.engineState == .stopping ||
-                (!model.isListening && !model.canStartListening)
-            )
+            listeningButton
         }
+    }
+
+    private var deviceMenu: some View {
+        Menu {
+            if model.devicePickerItems.isEmpty {
+                Text("无可用设备")
+            }
+            ForEach(model.devicePickerItems, id: \.tag) { item in
+                Button {
+                    model.selectedDevice = item.tag
+                } label: {
+                    HStack {
+                        Text(item.label)
+                        Spacer()
+                        if model.selectedDevice == item.tag || (model.selectedDevice.isEmpty && item.isDefault) {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(model.selectedDeviceLabel)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(model.devices.isEmpty ? .tertiary : .primary)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(model.isListening || model.devices.isEmpty)
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.06))
+                .contentShape(Rectangle())
+        )
+        .help(
+            model.isListening
+                ? "监听中无法切换设备，请先停止监听"
+                : "选择麦克风输入源；默认跟随系统设置（插上 DJI Mic Mini 时会自动切换）"
+        )
+    }
+
+    private var listeningButton: some View {
+        Button {
+            model.toggleListening()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: model.isListening ? "stop.fill" : "mic.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(model.isListening ? "停止监听" : "开始监听")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(CapsuleButtonStyle())
+        .keyboardShortcut(.space, modifiers: [.command])
+        .disabled(
+            model.engineState == .loading || model.engineState == .stopping ||
+            (!model.isListening && !model.canStartListening)
+        )
     }
 
     // MARK: - Query Section

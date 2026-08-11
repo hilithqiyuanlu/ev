@@ -5,19 +5,10 @@ struct SettingsView: View {
     @State private var showLogs = false
     @State private var showOnboarding = true
 
-    private let modelNames = [
-        "vad": "FSMN-VAD",
-        "asr_streaming": "Paraformer Streaming",
-        "asr_final": "Paraformer Large",
-        "speaker": "ERes2NetV2",
-    ]
-
     var body: some View {
         CenteredPage(maxWidth: 720) {
             VStack(alignment: .leading, spacing: 22) {
                 onboardingSection
-                Divider()
-                modelsSection
                 Divider()
                 storageSection
                 Divider()
@@ -61,11 +52,19 @@ struct SettingsView: View {
                 }
                 VStack(spacing: 6) {
                     ChecklistRow("模型已下载并校验", done: model.onboardingChecks.models,
-                                detail: model.onboardingChecks.models ? "四个模型均已就绪" : "请在下方下载并校验模型")
+                                detail: model.onboardingChecks.models ? "四个模型均已就绪" : "请到「模型」页下载并校验")
                     ChecklistRow("麦克风权限已允许", done: model.onboardingChecks.permission,
                                 detail: permissionDetail)
                     ChecklistRow("声纹已建立", done: !model.needsVoiceOnboarding,
                                 detail: voiceProfileDetail)
+                }
+                if !model.onboardingChecks.models {
+                    Button {
+                        model.goToModels()
+                    } label: {
+                        Label("前往模型页", systemImage: "cube.box")
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
         }
@@ -86,77 +85,6 @@ struct SettingsView: View {
                 : "已录 \(model.onboardingCount)/\(model.onboardingTarget) 段"
         }
         return "已建立（核心 \(model.voiceProfile.coreCount)、缓存 \(model.voiceProfile.cacheCount)、\(model.voiceProfile.centroidCount) 质心）"
-    }
-
-    // MARK: - Models
-
-    private var modelsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                sectionHeader("模型", systemImage: "cube.box")
-                Spacer()
-                if model.isVerifyingModels {
-                    ProgressView().controlSize(.small)
-                    Text("校验中...").font(.caption).foregroundStyle(.secondary)
-                } else if model.showVerificationDone {
-                    HStack(spacing: 4) {
-                        statusIcon("checkmark.circle.fill", color: .green)
-                        Text("校验完成")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.green)
-                    }
-                }
-            }
-            Text(model.allModelsReady ? "四个模型均已就绪" : (model.models.isEmpty ? "正在检查模型..." : "部分模型尚未下载"))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if model.downloadProgress > 0 && model.downloadProgress < 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    ProgressView(value: model.downloadProgress)
-                    Text("正在下载 \(model.downloadLabel)… \(Int(model.downloadProgress * 100))%")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(model.models) { ms in
-                    HStack(spacing: 10) {
-                        statusIcon(
-                            ms.ready ? "checkmark.circle.fill" : (!ms.path.isEmpty ? "exclamationmark.triangle.fill" : "circle"),
-                            color: ms.ready ? .green : (!ms.path.isEmpty ? .orange : .secondary)
-                        )
-                        Text(modelNames[ms.key] ?? ms.key)
-                            .font(.subheadline)
-                        Spacer()
-                        if ms.path.isEmpty && model.downloadProgress == 0 {
-                            Text("未下载").font(.caption).foregroundStyle(.secondary)
-                        } else if !ms.ready {
-                            Text("校验失败").font(.caption).foregroundStyle(.orange)
-                        }
-                    }
-                }
-            }
-
-            HStack(spacing: 12) {
-                if model.downloadProgress > 0 && model.downloadProgress < 1 {
-                    Button(role: .destructive) { model.cancelDownload() } label: {
-                        Label("取消下载", systemImage: "xmark.circle")
-                    }
-                } else {
-                    Button { model.downloadModels() } label: {
-                        Label("下载模型", systemImage: "arrow.down.circle")
-                    }
-                    .disabled(model.allModelsReady)
-                }
-                Button { model.verifyModels() } label: {
-                    Label("重新校验", systemImage: "arrow.clockwise")
-                }
-                .disabled(model.isVerifyingModels || model.downloadProgress > 0)
-            }
-            .buttonStyle(.bordered)
-        }
     }
 
     // MARK: - Storage
@@ -230,12 +158,5 @@ struct SettingsView: View {
     private func sectionHeader(_ title: String, systemImage: String) -> some View {
         Label(title, systemImage: systemImage)
             .font(.headline)
-    }
-
-    private func statusIcon(_ name: String, color: Color) -> some View {
-        Image(systemName: name)
-            .font(.system(size: 16))
-            .foregroundStyle(color)
-            .frame(width: 18, alignment: .center)
     }
 }

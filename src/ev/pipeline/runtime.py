@@ -96,6 +96,58 @@ class SpeakerTurn:
     score: float = 0.0
 
 
+class RawNoiseTracker:
+    """常驻 raw 底噪追踪器 — 跨段持久, 门控 EMA, 不被 AGC/语音帧/数字静音污染.
+
+    设计原则:
+    - 输入为 raw (未经过 AGC) 帧 RMS, 避免 AGC 归一化后底噪失真
+    - 仅在 VAD 非活跃 + RMS > floor_min_rms 时更新 floor (语音帧/数字静音冻结)
+    - 不对称 EMA: 底噪下降快 (attack=3s), 上升慢 (release=10s)
+    - warm-up: 启动后前 N 秒 floor 不稳定, is_warmup=True 时质量决策不拒绝
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        frame_ms: int = 30,
+        floor_track_down_sec: float = 3.0,
+        floor_track_up_sec: float = 10.0,
+        floor_min_rms: float = 1e-7,
+        warmup_sec: float = 3.0,
+    ):
+        self._frame_samples = int(sample_rate * frame_ms / 1000)
+        self._floor_rms: float = 0.0
+        self._frame_count: int = 0
+        self._floor_min_rms = floor_min_rms
+        self._warmup_frames = max(1, int(warmup_sec * 1000 / frame_ms))
+        # EMA coefficients: per-frame alpha = 1 - exp(-frame_duration / time_constant)
+        self._floor_alpha_down = 1.0 - np.exp(-frame_ms / 1000.0 / floor_track_down_sec)
+        self._floor_alpha_up = 1.0 - np.exp(-frame_ms / 1000.0 / floor_track_up_sec)
+
+    @property
+    def floor_rms(self) -> float:
+        return self._floor_rms
+
+    @property
+    def is_warmup(self) -> bool:
+        return self._frame_count < self._warmup_frames
+
+    def accept_frame(self, rms: float, is_speech_active: bool) -> None:
+        """每帧调用一次: 更新底噪追踪状态."""
+        self._frame_count += 1
+        if is_speech_active:
+            return  # 语音帧: 冻结 floor, 防止语音抬高底噪
+        if rms <= self._floor_min_rms:
+            return  # 数字静音: 冻结 floor, 防止把 floor 拖到 -∞
+        if self._floor_rms <= 0.0:
+            self._floor_rms = rms
+            return
+        # 门控 EMA: 底噪下降快 (attack), 上升慢 (release)
+        alpha = self._floor_alpha_down if rms < self._floor_rms else self._floor_alpha_up
+        self._floor_rms = alpha * rms + (1.0 - alpha) * self._floor_rms
+        self._floor_rms = max(self._floor_rms, self._floor_min_rms)
+
+
 def _align_utterances(
     transcript: str,
     speaker_turns: tuple,
@@ -290,9 +342,15 @@ class SegmentProcessor:
         raw_audio: np.ndarray | None = None,
         speaker_turns: tuple = (),
         end_trigger: str | None = None,
+        quality_label: str = "ok",
+        avg_raw_rms: float = 0.0,
+        peak_raw_rms: float = 0.0,
+        noise_floor_rms: float = 0.0,
+        snr_db: float = 0.0,
     ) -> SegmentRecord | None:
         segment_id = segment_id or uuid.uuid4().hex
         duration_ms = round(len(audio) * 1000 / self.settings.audio.sample_rate)
+        _is_quality_rejected = quality_label != "ok"
 
         # Compute multi-speaker metadata
         dominant_speaker, contains_user = _compute_dominant_speaker(speaker_turns)
@@ -300,29 +358,42 @@ class SegmentProcessor:
         # Loudness normalize before embedding for robustness to mic distance/volume
         audio_for_embedding = normalize_loudness(audio) if self.settings.speaker.loudness_normalize else audio
 
-        final_result = self._final(audio)
-        final_text = final_result.text if final_result else ""
-        # Defensive fallback: if final ASR output is dramatically shorter than the
-        # streaming partial (e.g. the model was token-truncated), prefer the fuller
-        # partial text instead of storing a broken half-transcript.
-        if (
-            final_text
-            and partial
-            and len(final_text.strip()) < int(len(partial.strip()) * 0.6)
-        ):
+        # Quality-rejected segments: skip ASR entirely (no final, no partial fallback).
+        # Still archive WAV + write DB with quality metadata for later analysis.
+        if _is_quality_rejected:
+            final_result = None
+            final_text = ""
+            partial = ""
             self.output(
-                f"[{segment_id[:8]}] final ASR truncated: final={len(final_text.strip())}ch "
-                f"vs partial={len(partial.strip())}ch; falling back to partial text"
+                f"[{segment_id[:8]}] quality rejected: {quality_label} "
+                f"(rms={avg_raw_rms:.5f}, snr={snr_db:.1f}dB, floor={noise_floor_rms:.5f})"
             )
-            final_text = partial
+        else:
+            final_result = self._final(audio)
+            final_text = final_result.text if final_result else ""
+            # Defensive fallback: if final ASR output is dramatically shorter than the
+            # streaming partial (e.g. the model was token-truncated), prefer the fuller
+            # partial text instead of storing a broken half-transcript.
+            if (
+                final_text
+                and partial
+                and len(final_text.strip()) < int(len(partial.strip()) * 0.6)
+            ):
+                self.output(
+                    f"[{segment_id[:8]}] final ASR truncated: final={len(final_text.strip())}ch "
+                    f"vs partial={len(partial.strip())}ch; falling back to partial text"
+                )
+                final_text = partial
         transcript = final_text or partial
         # Empty or filler-only segments are discarded (no WAV, no DB, no speaker check).
-        if not transcript.strip():
-            self.output(f"[{segment_id[:8]}] discarded: empty transcript ({duration_ms}ms)")
-            return None
-        if self.settings.segment.discard_filler_only and _is_filler_only(transcript):
-            self.output(f"[{segment_id[:8]}] discarded: filler-only {transcript!r} ({duration_ms}ms)")
-            return None
+        # Quality-rejected segments bypass this — always archive.
+        if not _is_quality_rejected:
+            if not transcript.strip():
+                self.output(f"[{segment_id[:8]}] discarded: empty transcript ({duration_ms}ms)")
+                return None
+            if self.settings.segment.discard_filler_only and _is_filler_only(transcript):
+                self.output(f"[{segment_id[:8]}] discarded: filler-only {transcript!r} ({duration_ms}ms)")
+                return None
 
         # Utterance alignment: use ASR timestamps if available, otherwise proportional mapping
         asr_segments = final_result.segments if final_result and final_result.has_timestamps else None
@@ -421,6 +492,11 @@ class SegmentProcessor:
             source_type="voice",
             dominant_speaker=dominant_speaker,
             contains_user=contains_user,
+            quality_label=quality_label,
+            avg_raw_rms=avg_raw_rms,
+            peak_raw_rms=peak_raw_rms,
+            noise_floor_rms=noise_floor_rms,
+            snr_db=snr_db,
         )
         self.store.insert_segment(record)
         is_filler = self.settings.segment.discard_filler_only and _is_filler_only(transcript)
@@ -572,6 +648,8 @@ class SegmentJob:
     speaker_turns: tuple = ()
     raw_audio: np.ndarray | None = None  # raw (unprocessed) audio → archived as .raw.wav for future SE/context
     end_trigger: str | None = None       # vad_endpoint/max_duration/silence_timeout/... → 落库可观测
+    noise_floor_rms: float = 0.0         # raw 底噪 RMS 快照 (段开始时)
+    is_warmup: bool = True               # 底噪追踪器是否仍在 warm-up 期
 
 
 class SegmentWorker:
@@ -682,14 +760,35 @@ class SegmentWorker:
                     )
                     duration_ms = round(len(job.audio) * 1000 / self.settings.audio.sample_rate)
 
+                    # --- 音频质量计算 (基于 raw 音频, 防 AGC 污染) ---
+                    _seg = self.settings.segment
+                    _quality_label = "ok"
+                    _avg_raw_rms = 0.0
+                    _peak_raw_rms = 0.0
+                    _snr_db = 0.0
+                    if job.raw_audio is not None and job.raw_audio.size > 0:
+                        _raw = np.asarray(job.raw_audio, dtype=np.float64).reshape(-1)
+                        _avg_raw_rms = float(np.sqrt(np.mean(np.square(_raw))))
+                        _peak_raw_rms = float(np.max(np.abs(_raw)))
+                        _noise_floor = max(job.noise_floor_rms, 1e-7)
+                        if _avg_raw_rms > 0 and _noise_floor > 0:
+                            _snr_db = float(20.0 * np.log10(_avg_raw_rms / _noise_floor))
+                        if not job.is_warmup:
+                            if _avg_raw_rms < _seg.min_audible_rms:
+                                _quality_label = "rejected_low_level"
+                            elif _snr_db < _seg.min_snr_db:
+                                _quality_label = "rejected_low_snr"
+                    _is_quality_rejected = _quality_label != "ok"
+
                     # Very short segments (< 800ms) with no speaker turns AND empty/meaningless partial
                     # skip final ASR to save inference cost. Final ASR provides hotword boosting
                     # and higher accuracy, so we only skip for truly tiny/no-content segments.
+                    # Quality-rejected segments also skip final ASR (audio too poor to transcribe).
                     _VERY_SHORT_MS = 800
                     partial_clean = job.partial.strip() if job.partial else ""
                     is_very_short = duration_ms < _VERY_SHORT_MS and not job.speaker_turns
                     has_no_content = (not partial_clean) or _is_filler_only(partial_clean)
-                    skip_final = is_very_short and has_no_content
+                    skip_final = (is_very_short and has_no_content) or _is_quality_rejected
 
                     if not skip_final:
                         with self._final_asr_lock:
@@ -721,6 +820,11 @@ class SegmentWorker:
                         raw_audio=job.raw_audio,
                         speaker_turns=job.speaker_turns,
                         end_trigger=job.end_trigger,
+                        quality_label=_quality_label,
+                        avg_raw_rms=_avg_raw_rms,
+                        peak_raw_rms=_peak_raw_rms,
+                        noise_floor_rms=job.noise_floor_rms,
+                        snr_db=_snr_db,
                     )
 
                     # Restore final_asr on processor after short-segment skip
@@ -920,6 +1024,13 @@ async def transcribe_forever(
         last_partial_samples = 0  # samples count when partial was last updated
         local_stop = asyncio.Event()
 
+        # 常驻 raw 底噪追踪器 — 跨段持久, IDLE 也在跑, 段间不重置
+        raw_noise_tracker = RawNoiseTracker(
+            sample_rate=sr,
+            frame_ms=frame_ms_default,
+            warmup_sec=settings.segment.raw_noise_warmup_sec,
+        )
+
         def _score_window(buf_audio: np.ndarray) -> float:
             """Score a window of audio against profile centroids. Returns 0.0 if no profile."""
             if not profile_centroids:
@@ -1018,6 +1129,8 @@ async def transcribe_forever(
                         segment_id=current_segment_id,
                         speaker_turns=tuple(speaker_turns),
                         end_trigger=trigger_reason,
+                        noise_floor_rms=raw_noise_tracker.floor_rms,
+                        is_warmup=raw_noise_tracker.is_warmup,
                     )
                 )
             else:
@@ -1178,6 +1291,9 @@ async def transcribe_forever(
                 })
                 _append_trim(recent_frames, processed, pre_roll_frames)
                 _append_trim(recent_raw_frames, raw, pre_roll_frames)
+
+                # 驱动常驻 raw 底噪追踪器 (所有帧, 包括 IDLE)
+                raw_noise_tracker.accept_frame(raw_rms, vad.active)
 
                 if state == PipelineState.IDLE:
                     # Check for VAD start
@@ -1403,6 +1519,8 @@ async def transcribe_forever(
                             segment_id=current_segment_id,
                             speaker_turns=tuple(speaker_turns),
                             end_trigger="stop",
+                            noise_floor_rms=raw_noise_tracker.floor_rms,
+                            is_warmup=raw_noise_tracker.is_warmup,
                         )
                     )
             capture.stop()

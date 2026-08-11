@@ -1,5 +1,27 @@
 import SwiftUI
 
+/// 一级按钮规范：icon + 文本、等高胶囊背景（圆角 12、浅灰底）。
+/// 参照历史页「清空」/词典页「添加词语」，用于各页右上角的操作按钮。
+struct CapsuleButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    var isDestructive = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        let base: Color = isDestructive ? .red : .primary
+        let tint = configuration.isPressed
+            ? base.opacity(0.6)
+            : (isEnabled ? base : base.opacity(0.4))
+        return configuration.label
+            .foregroundStyle(tint)
+            .contentShape(Rectangle())
+            .padding(4)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.secondary.opacity(configuration.isPressed ? 0.10 : 0.06))
+            )
+    }
+}
+
 struct EmptyStateView: View {
     let text: String
     let systemImage: String
@@ -200,6 +222,18 @@ struct SegmentRow: View {
                     if let score = segment.speakerScore {
                         Text(String(format: "声纹 %.3f", score))
                     }
+                    // 音频质量标签
+                    if let snr = segment.snrDb {
+                        Text(String(format: "SNR %.1f dB", snr))
+                            .foregroundStyle(snrColor(snr))
+                    }
+                    if segment.qualityLabel != "ok" {
+                        Label(
+                            qualityLabelText(segment.qualityLabel),
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .foregroundStyle(.orange)
+                    }
                     if segment.queryCandidate {
                         Label(segment.queryText.isEmpty ? "Query" : segment.queryText, systemImage: "bolt.fill")
                             .foregroundStyle(.green)
@@ -291,6 +325,18 @@ struct HistoryRow: View {
                     Text(String(format: "%.1f 秒", Double(segment.durationMS) / 1000))
                     if let score = segment.speakerScore {
                         Text(String(format: "声纹 %.3f", score))
+                    }
+                    // 音频质量标签
+                    if let snr = segment.snrDb {
+                        Text(String(format: "SNR %.1f dB", snr))
+                            .foregroundStyle(snrColor(snr))
+                    }
+                    if segment.qualityLabel != "ok" {
+                        Label(
+                            qualityLabelText(segment.qualityLabel),
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .foregroundStyle(.orange)
                     }
                     if segment.wasCorrected {
                         Label("已修正", systemImage: "pencil.and.outline")
@@ -447,6 +493,20 @@ struct ChecklistRow: View {
             Spacer()
         }
     }
+}
+
+private func qualityLabelText(_ label: String) -> String {
+    switch label {
+    case "rejected_low_snr": return "信噪比低"
+    case "rejected_low_level": return "音量过低"
+    default: return label
+    }
+}
+
+private func snrColor(_ snr: Double) -> Color {
+    if snr >= 10 { return .green }
+    if snr >= 3 { return .orange }
+    return .red
 }
 
 private func cleanPrefix(from text: String) -> String {

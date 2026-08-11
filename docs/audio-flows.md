@@ -1,6 +1,6 @@
 # EV 音频处理 Flow
 
-> 更新时间: 2026-08-10 (三态状态机 / "第二人耳模式" 重构后, Phase 1a/1b.2)
+> 更新时间: 2026-08-11 (三态状态机 / "第二人耳模式" Phase 1a/1b.2 / 端点触发参数校正)
 >
 > 本文档以 `src/ev/pipeline/runtime.py` 为准, 描述麦克风输入 → ASR → 声纹 → 落库
 > 的完整输入链路。输出侧 (LLM/TTS/播放) 尚未实现, 见文末目标架构。
@@ -43,7 +43,7 @@
 │   (processed, raw) 帧对, 每帧:                                               │
 │     ├─ audio_level 事件: {rms=processed_rms, raw_rms, gain=AGC倍数}          │
 │     │    (GUI 调试显示: raw dBFS + AGC 增益)                                 │
-│     ├─ recent_frames / recent_raw_frames 滑窗 (pre-roll 20帧=600ms)         │
+│     ├─ recent_frames / recent_raw_frames 滑窗 (pre-roll 40帧=1200ms)        │
 │     └─ 按当前状态喂给三态状态机 (见 ④)                                       │
 │                                                                             │
 │   CompositeVAD (vad/adapters.py), start=OR / end=AND:                       │
@@ -60,7 +60,7 @@
 │                                                                             │
 │  IDLE (只跑 VAD, 不录音不分析):                                             │
 │    VAD started 边沿 →                                                       │
-│      · 声纹 profile 已就绪 (core≥3): → OBSERVING (带 pre-roll 600ms 进入)   │
+│      · 声纹 profile 已就绪 (core≥3): → OBSERVING (带 pre-roll 1200ms 进入)  │
 │      · 冷启动 (profile 未就绪): → 直接 RECORDING, 初始 label=user (攒样本)  │
 │                                                                             │
 │  OBSERVING (观察门, 900ms, 只分析不落盘):                                   │
@@ -95,14 +95,26 @@
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ ⑤ 段结束 — 6 触发器 (优先级从高到低, 先触发先赢) → force_segment_end        │
+│                                                                             │
+│   所有静音类触发器 (3/4/5) 有最小段长门槛:                                   │
+│     · silence_timeout / energy_silent: total ≥ 3000ms 才生效                │
+│     · relative_silence: total ≥ 6000ms 才生效                               │
+│     · 短段 (<门槛) 不会被短暂停顿过早切掉                                    │
+│                                                                             │
 │   1) vad_endpoint:     CompositeVAD ended (FSMN end AND Energy hangover完) │
 │   2) max_duration:     段长 ≥ 20s 硬上限 (安全网)                           │
-│   3) silence_timeout:  raw RMS < 0.003 (~-50dBFS) 持续 1200ms (绝对静音)   │
-│   4) relative_silence: 峰值>-50dBFS 后 raw RMS 跌破峰值30% 持续 1500ms     │
+│   3) silence_timeout:  raw RMS < 0.003 (~-50dBFS) 持续 1600ms (绝对静音)   │
+│                        门槛: total ≥ 3000ms                                 │
+│   4) relative_silence: 峰值>-50dBFS×3 后 raw RMS 跌破峰值30% 持续 1900ms   │
 │                        (有底噪环境下"人说完了"; 用 raw 防 AGC 失真)         │
-│   5) energy_silent:    EnergyVAD 判无声累计 ≥ 1400ms                        │
-│                        (hangover 600ms 耗尽后继续计时; 专治 FSMN 卡住)      │
-│   6) asr_stall:        流式 partial 2500ms 无更新 且段长 ≥ 1000ms          │
+│                        门槛: total ≥ 6000ms                                 │
+│   5) energy_silent:    EnergyVAD 判无声累计 ≥ 2100ms                        │
+│                        (= silence_timeout 1600ms + 500ms 余量)              │
+│                        hangover 600ms 耗尽后继续计时; 专治 FSMN 卡住        │
+│                        门槛: total ≥ 3000ms                                 │
+│   6) asr_stall:        流式 partial 2500ms 无更新 且 total ≥ 1000ms        │
+│                        且 raw RMS < 0.003 (静音门控: 说话中 ASR 延迟       │
+│                        不触发, 只在确实安静时才切段)                        │
 │                                                                             │
 │   force_segment_end(trigger):                                               │
 │     ├─ 关闭最后一个 speaker turn                                            │
@@ -110,7 +122,7 @@
 │     ├─ 发 speech_ended {segment_id, ended_at, trigger}                     │
 │     ├─ frames 拼接 → seg_audio (processed); raw_frames → seg_raw           │
 │     ├─ < 500ms → discard (too_short, 咳嗽/敲击/噪声), 发 segment_discarded │
-│     ├─ ≥ 500ms → SegmentJob(audio+raw+partial+speaker_turns)               │
+│     ├─ ≥ 500ms → SegmentJob(audio+raw+partial+speaker_turns+end_trigger)   │
 │     │           送入 SegmentWorker 后台队列 (不阻塞采集线程)                │
 │     └─ 状态复位 (VAD/stream reset) + 重新加载声纹质心 (拣到新样本)          │
 └──────────────────────────────┬──────────────────────────────────────────────┘
@@ -125,7 +137,10 @@
 │  6.1 终稿 ASR (懒加载, 首个非跳过段才加载; 可插拔, 运行时热切换):           │
 │      按模型目录自动检测 (config.json 的 model_type 优先于 FunASR 配置):     │
 │      ├─ Qwen3-ASR 0.6B/1.7B (transformers, MPS/CUDA fp16) [默认槽位]        │
-│      │   · 热词: prompt 注入 ("请准确转写，注意以下词：...")                │
+│      │   · 热词: anchor-based 锚定式正增量 (config: [asr] 节)              │
+│      │     - hotword_boost_scale=2.0, hotword_boost_max=6.0                │
+│      │     - 仅当已解码文本末尾命中热词前缀时对续写 token 加 logits         │
+│      │     - 从不抑制任何 token, 不匹配前缀时完全不受影响                   │
 │      │   · 输出 language <lang><asr_text>... 解析; 贪心解码 max 256 tokens │
 │      │   · 支持 <|x.xx|> 时间戳 → 句级 segments (供 utterance 对齐)        │
 │      └─ Paraformer Large (FunASR): hotword 参数注入, use_itn,              │
@@ -133,7 +148,9 @@
 │      GUI 切换 asr_final 槽位 → reload_final_asr: 立即卸载旧模型,           │
 │      下一个段到来时加载新模型 (省内存)                                      │
 │                                                                             │
-│  6.2 段过滤: final 为空 → 降级用 partial → 仍为空 → discard (empty)         │
+│  6.2 段过滤: final 为空 → 降级用 partial →                                 │
+│      若 final 明显短于 partial (<60%) 且 partial 非空 → 用 partial 回退    │
+│      → 仍为空 → discard (empty)                                             │
 │      纯语气词 (嗯/啊/呃/那个/就是等, 17词表) → discard (filler)             │
 │      (丢弃即无 WAV 无 DB, 发 segment_discarded reason=empty_or_filler)      │
 │                                                                             │
@@ -162,21 +179,22 @@
 │                                                                             │
 │  6.6 自动声纹学习:                                                          │
 │      · 仅 user-only 段 (无任何 non-user turn, 全段 embedding 不被污染)      │
-│      · 门槛: 1.5-10s / 非语气词 / ≥30s 间隔 / score ≥ 0.40                 │
-│      · 冷启动: 全收 (score 记 0.8)                                          │
+│      · 门槛: 1.5-10s / 非语气词 / ≥30s 间隔 / score ≥ 0.60                │
+│      · 冷启动: 需完成 onboarding_target=5 次手动引导录入后才开启自动学习    │
 │      · CORE 层 (最多20条) → K-means 质心 (1-5样本→1, 6-10→2, 11+→3)        │
 │      · CACHE 层 (最多50条) → 仅记录不建模, FIFO 淘汰                        │
 │      · 手动样本 (录入命令) 永远在 CORE, 不被自动淘汰                        │
 │                                                                             │
 │  6.7 个人词典 (热词): system(小E 5.0) > manual > auto 优先级,              │
 │      最多 80 词拼成空格分隔字符串 (无权重后缀, 防 FunASR 解析失败),         │
-│      词典变更时 broadcast 给运行中的 worker                                 │
+│      词典变更时 broadcast 给运行中的 worker;                                 │
+│      Qwen3 模式下用 prompt 注入 (最多30词), 配合 anchor-based logits 增强   │
 │                                                                             │
-│  6.8 双 WAV 存档 + SQLite:                                                  │
+│  6.8 双 WAV 存档 + SQLite (DB v12):                                         │
 │      · {id}.wav     → processed 增强音频 (回放/ASR重转写用, 默认)           │
 │      · {id}.raw.wav → raw 原始音频 (为后续人声增强/环境声分析/SE保留)       │
 │      · segments 表: speaker_turns / utterances / dominant_speaker /        │
-│        contains_user / source_type 等字段                                   │
+│        contains_user / end_trigger / source_type 等字段                     │
 │      · 删除 segment 时两个 WAV 先移 trash, DB 删除成功后才真删              │
 │        (失败回滚), 级联删关联 voice samples                                 │
 └──────────────────────────────┬──────────────────────────────────────────────┘
@@ -217,6 +235,17 @@
                      (状态复位, 重载质心)
 ```
 
+## 端点触发详解
+
+| 优先级 | 触发器 | 条件 | 门槛 |
+|--------|--------|------|------|
+| 1 | `vad_endpoint` | CompositeVAD ended (FSMN end AND Energy hangover 完) | 无 |
+| 2 | `max_duration` | 段长 ≥ 20s | 无 |
+| 3 | `silence_timeout` | raw RMS < 0.003 (~-50dBFS) 持续 1600ms | total ≥ 3s |
+| 4 | `relative_silence` | raw RMS < peak×30% 持续 1900ms (peak > 0.009 时启用) | total ≥ 6s |
+| 5 | `energy_silent` | EnergyVAD 无声累计 ≥ 2100ms (含 hangover 600ms) | total ≥ 3s |
+| 6 | `asr_stall` | 流式 partial 2500ms 无更新 + raw RMS < 0.003 (静音箱) | total ≥ 1s |
+
 ## Phase 1b 客户端 (macOS SwiftUI)
 
 ```text
@@ -236,6 +265,15 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
 终稿 ASR 模型可在 GUI 模型页热切换 (Qwen3-ASR 0.6B/1.7B 或 Paraformer)，无需重启监听。
 声纹录入有独立命令 (`start_voice_enrollment` / `stop_voice_enrollment` /
 `capture_manual_sample`)，复用同一 speaker embedding 模型，手动样本永远在 CORE 层。
+
+### SC-01 会话测试 (C1 远场麦克风)
+
+对于 C1 硬件, 客户端暴露额外的测试控件:
+- **开始测试** → engine stdin: `{"command": "sc01_test", "action": "start", "test_id": "<uuid>"}`
+- **停止测试** → engine stdin: `{"command": "sc01_test", "action": "stop"}`
+
+测试期间 engine 产出的事件加 `_sc01_test_id` 字段, 会话记录写入 `sc01_sessions` 表
+(独立于 `segments`), 供后续分析。
 
 ### 调试 UI (远场调参用)
 
@@ -259,7 +297,7 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
 | `segment_discarded` | 段被丢弃 | segment_id, reason (too_short/empty_or_filler), duration_ms |
 | `segment_processing` | 后台处理开始 | segment_id, phase, queue_depth |
 | `speaker_result` | 声纹融合判决 | segment_id, label, score |
-| `segment_committed` | WAV 与 SQLite 已提交 | 完整 SegmentRecord (含 speaker_turns/utterances/dominant_speaker/contains_user) |
+| `segment_committed` | WAV 与 SQLite 已提交 | 完整 SegmentRecord (含 speaker_turns/utterances/dominant_speaker/contains_user/end_trigger) |
 | `segment_failed` | 段级错误 | segment_id, code, message |
 | `query_candidate` | 预留给 GUI/LLM 的 query | segment_id, source, text |
 | `voice_sample_added` | 声纹样本收录 | segment_id, tier, core_count, cache_count, centroid_count, is_ready |
@@ -274,8 +312,10 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
    现改为段内 turn 标记 (不截断) + 段末全段 embedding 融合判决
 3. ✅ **他人短促声音开段** → OBSERVING 门内 VAD 结束 (<900ms) 直接静默丢弃
 4. ✅ **闭合时机单一** (只依赖 FSMN 报 end, 卡住就不收尾) → 6 触发器兜底
-   (绝对静音/相对静音/EnergyVAD无声/ASR停滞/20s硬上限)
+   (绝对静音/相对静音/EnergyVAD无声/ASR停滞/20s硬上限), 各有最小段长门槛防误切
 5. ✅ **"只入我一句还标错人"** → 全段融合策略: fullseg 与 turns 任一判 user 即 user
+6. ✅ **端点参数过时** → 绝对静音 1600ms、相对静音 1900ms、ASR stall 加静音箱,
+   所有静音类触发器有 min_duration 门槛
 
 仍存在 (下一阶段重点):
 1. **VAD 仍是"哑巴守门人"**: FSMN 只分人声/非人声, EnergyVAD 只看能量,
@@ -286,6 +326,10 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
    靠融合判决保证不产生 query、不参与学习
 4. **utterance 对齐精度依赖 final ASR**: Qwen3 有真实时间戳较准;
    Paraformer 无时间戳时退化为字符比例映射 (P0)
+5. **缺少音频质量门控**: 无 RawNoiseTracker / 段级 SNR 评估 / 质量拒绝机制,
+   远处轻声或稳态噪声仍会全量录入跑 ASR (下一步优先实现)
+6. **底噪追踪器仅 EnergyVAD/NoiseGate 各维护一份**: 段间重置, 无跨段持久化,
+   启动后冷启动期无底噪参考
 
 ### 分层演进路线
 
@@ -294,6 +338,7 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
 | P0 | 说话人门控逻辑修复 | OBSERVING 门控 + turn 标记 + 融合判决 | ✅ 已完成 |
 | P1 | 智能VAD替换能量VAD | Silero VAD (400KB, CPU实时) 替代EnergyVAD | 待做 |
 | P2 | 帧级说话人标记 | 600ms 滑动窗口 embedding + USER/NON_USER 实时标签 | ✅ 已完成 |
+| P2.5 | 音频质量门控 | RawNoiseTracker 常驻底噪追踪 + 段末 SNR/电平检查 + 质量拒绝 | 待做 |
 | P3 | 音频事件检测(SED) | PANNs小模型/MobileNet变种, 分类敲门/咀嚼/走路/键盘等 | 待做 |
 | P4 | 语义VAD | ASR partial + 意图分类, 判断"是不是在跟我说话" | 待做 |
 | P5 | 多人分离(Diarization) | pyannote/ERes2Net 聚类, 多人对话区分说话人A/B/C | 待做 |

@@ -201,7 +201,7 @@ def test_sqlite_segment_and_profile(tmp_path):
             )
         )
         assert store.connection.execute("select count(*) from segments").fetchone()[0] == 1
-        assert store.connection.execute("pragma user_version").fetchone()[0] == 12
+        assert store.connection.execute("pragma user_version").fetchone()[0] == 13
         assert store.connection.execute("select count(*) from speaker_samples").fetchone()[0] == 0
 
 

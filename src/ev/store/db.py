@@ -57,6 +57,12 @@ class SegmentRecord:
     dominant_speaker: str | None = None
     contains_user: bool = True
     end_trigger: str | None = None
+    # 音频质量元数据 (v13)
+    quality_label: str = "ok"
+    avg_raw_rms: float | None = None
+    peak_raw_rms: float | None = None
+    noise_floor_rms: float | None = None
+    snr_db: float | None = None
 
 
 @dataclass(frozen=True)
@@ -150,7 +156,8 @@ class Store:
         self._migrate_raw_audio_path_v10()
         self._migrate_speaker_turns_v11()
         self._migrate_end_trigger_v12()
-        self.connection.execute("PRAGMA user_version=12")
+        self._migrate_quality_v13()
+        self.connection.execute("PRAGMA user_version=13")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -279,6 +286,24 @@ class Store:
         cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
         if "end_trigger" not in cols:
             self.connection.execute("ALTER TABLE segments ADD COLUMN end_trigger TEXT")
+
+    def _migrate_quality_v13(self) -> None:
+        """Add audio quality columns to segments table (v12->v13).
+
+        Stores per-segment audio quality metrics computed from raw (unprocessed)
+        audio for post-hoc analysis and quality-gating threshold tuning.
+        """
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        if "quality_label" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN quality_label TEXT NOT NULL DEFAULT 'ok'")
+        if "avg_raw_rms" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN avg_raw_rms REAL")
+        if "peak_raw_rms" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN peak_raw_rms REAL")
+        if "noise_floor_rms" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN noise_floor_rms REAL")
+        if "snr_db" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN snr_db REAL")
 
     def _migrate_legacy_profile(self) -> None:
         """Migrate legacy single-embedding profile to a sample entry if samples table is empty."""

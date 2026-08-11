@@ -589,7 +589,11 @@ class EngineService:
         then rebuild centroids. Samples whose wav is missing are skipped."""
         def run() -> None:
             try:
-                paths = require_models(self.settings.models, self.settings.models.root)
+                paths = require_models(
+                    self.settings.models,
+                    self.settings.models.root,
+                    skip_keys=frozenset({"asr_final"}),
+                )
                 speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
                 updated = 0
                 missing = 0
