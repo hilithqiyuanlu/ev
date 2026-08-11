@@ -81,13 +81,6 @@ struct HomeView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Button {
-                    model.loadHistory()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("刷新")
             }
 
             if model.queries.isEmpty {

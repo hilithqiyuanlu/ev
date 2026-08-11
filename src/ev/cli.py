@@ -148,7 +148,7 @@ def _cmd_voice_enroll(settings: Settings, device: str | None, segments: int, mod
 
     settings = _settings_with_model_root(settings, model_root)
     settings.ensure_dirs()
-    paths = require_models(settings.models)
+    paths = require_models(settings.models, skip_keys=frozenset({"asr_final"}))
     adapter = SpeakerEmbeddingAdapter(str(paths["speaker"]))
     embeddings = []
     print(f"将录制 {segments} 段，每段约 4 秒；请按提示自然说话。Ctrl-C 可停止。")

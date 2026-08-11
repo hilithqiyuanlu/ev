@@ -98,11 +98,14 @@ class VuiSettings:
 class SegmentSettings:
     min_duration_ms: int = 500
     max_duration_ms: int = 20000        # 硬上限: 超过20s强制切分
-    silence_timeout_ms: int = 1200      # 尾部绝对静音超时: 1.2s
+    silence_timeout_ms: int = 1600      # 尾部绝对静音超时: 1.6s
     silence_rms_threshold: float = 0.003  # 绝对静音RMS阈值（raw音频，~-50dBFS）
     # 相对静音检测: RMS从说话峰值下降到该比例以下视为静音
     relative_silence_ratio: float = 0.30  # 峰值的30%以下
-    relative_silence_timeout_ms: int = 1500  # 相对静音持续1.5s强制切分
+    relative_silence_timeout_ms: int = 1900  # 相对静音持续1.9s强制切分
+    # 静音类触发器的最小段长门槛: 短段(刚开始说话)不在静音时被过早切掉
+    min_duration_for_silence_ms: int = 3000   # silence_timeout/energy_silent 生效所需最小段长
+    min_duration_for_relative_silence_ms: int = 6000  # relative_silence 生效所需最小段长
     # ASR停滞超时: 流式ASR长时间无新partial结果视为说完
     asr_stall_timeout_ms: int = 2500
     discard_filler_only: bool = True
@@ -285,10 +288,12 @@ def load_settings(config_path: Path | None = None) -> Settings:
         segment=SegmentSettings(
             min_duration_ms=int(segment_raw.get("min_duration_ms", 500)),
             max_duration_ms=int(segment_raw.get("max_duration_ms", 20000)),
-            silence_timeout_ms=int(segment_raw.get("silence_timeout_ms", 1200)),
+            silence_timeout_ms=int(segment_raw.get("silence_timeout_ms", 1600)),
             silence_rms_threshold=float(segment_raw.get("silence_rms_threshold", 0.003)),
             relative_silence_ratio=float(segment_raw.get("relative_silence_ratio", 0.30)),
-            relative_silence_timeout_ms=int(segment_raw.get("relative_silence_timeout_ms", 1500)),
+            relative_silence_timeout_ms=int(segment_raw.get("relative_silence_timeout_ms", 1900)),
+            min_duration_for_silence_ms=int(segment_raw.get("min_duration_for_silence_ms", 3000)),
+            min_duration_for_relative_silence_ms=int(segment_raw.get("min_duration_for_relative_silence_ms", 6000)),
             asr_stall_timeout_ms=int(segment_raw.get("asr_stall_timeout_ms", 2500)),
             discard_filler_only=bool(segment_raw.get("discard_filler_only", True)),
         ),

@@ -203,8 +203,14 @@ class Qwen3ASRAdapter:
             else:
                 model_inputs[k] = v
 
+        # Token budget scales with audio duration: Chinese speech ~3-4 chars/sec
+        # and ~1 token per char, so a fixed cap truncates long recordings mid-utterance.
+        # Clamp to [256, 1024]; 256 floor keeps short-segment latency low.
+        duration_sec = len(audio_arr) / float(sample_rate)
+        max_new_tokens = max(256, min(1024, int(duration_sec * 20)))
+
         gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": 256,
+            "max_new_tokens": max_new_tokens,
             "do_sample": False,
         }
         if self._suppress_tokens:
@@ -214,6 +220,12 @@ class Qwen3ASRAdapter:
             output_ids = self.model.generate(**model_inputs, **gen_kwargs)
 
         new_tokens = output_ids[0][input_len:]
+        if len(new_tokens) >= max_new_tokens:
+            logger.warning(
+                "Qwen3-ASR output truncated at %d tokens (audio=%.1fs, variant=%s); "
+                "consider raising the token budget for long recordings",
+                max_new_tokens, duration_sec, self._model_variant,
+            )
         raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
 
         return self._parse_output(raw_text, return_timestamps)
@@ -222,7 +234,9 @@ class Qwen3ASRAdapter:
         self, raw_text: str, with_timestamps: bool,
     ) -> TranscriptionResult:
         # Expected format: language <lang><asr_text>...<|im_end|>
-        # Extract content after <asr_text>, before <|im_end|>
+        # For long audio the model may emit MULTIPLE <asr_text>...</asr_text>
+        # blocks; collect all of them (old code kept only the first, dropping
+        # everything after it).
         text = raw_text
 
         # Strip language tag
@@ -230,15 +244,30 @@ class Qwen3ASRAdapter:
         if lang_match:
             text = text[lang_match.end():]
 
-        # Extract content inside <asr_text>...</asr_text> or after <asr_text>
-        asr_start = text.find(_ASR_TEXT_TAG)
-        if asr_start >= 0:
-            text = text[asr_start + len(_ASR_TEXT_TAG):]
-
-        # Cut at end marker
-        im_end_pos = text.find(_IM_END)
-        if im_end_pos >= 0:
-            text = text[:im_end_pos]
+        if _ASR_TEXT_TAG in text:
+            # Collect content from every <asr_text>...</asr_text> block.
+            parts: list[str] = []
+            pos = 0
+            while True:
+                start = text.find(_ASR_TEXT_TAG, pos)
+                if start < 0:
+                    break
+                start += len(_ASR_TEXT_TAG)
+                end = text.find(_IM_END, start)
+                if end < 0:
+                    # No closing tag: take up to the next block or end of text
+                    nxt = text.find(_ASR_TEXT_TAG, start)
+                    end = nxt if nxt >= 0 else len(text)
+                chunk = text[start:end]
+                if chunk.strip():
+                    parts.append(chunk)
+                pos = max(end, start)
+            text = "".join(parts)
+        else:
+            # No <asr_text> tag (malformed output): fall back to old behavior.
+            im_end_pos = text.find(_IM_END)
+            if im_end_pos >= 0:
+                text = text[:im_end_pos]
 
         text = self._clean_text(text)
 

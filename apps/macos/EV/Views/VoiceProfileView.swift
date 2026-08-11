@@ -58,20 +58,6 @@ struct VoiceSamplesSheet: View {
                 }
             }
             Spacer()
-            Button {
-                model.loadVoiceSamples()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .disabled(playingSampleId != nil)
-            Button {
-                dismiss()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.borderless)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -242,8 +228,9 @@ struct VoiceSamplesSheet: View {
             Button(role: .destructive) {
                 showResetConfirm = true
             } label: {
-                Label("重置声纹", systemImage: "arrow.counterclockwise")
+                Text("重置声纹")
             }
+            .tint(.red)
             .disabled(model.voiceSamples.isEmpty)
             Spacer()
             Button("完成") { dismiss() }

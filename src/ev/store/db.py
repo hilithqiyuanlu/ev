@@ -56,6 +56,7 @@ class SegmentRecord:
     source_type: str = "voice"
     dominant_speaker: str | None = None
     contains_user: bool = True
+    end_trigger: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,8 @@ class Store:
         self._migrate_cleanup_high_freq_v9()
         self._migrate_raw_audio_path_v10()
         self._migrate_speaker_turns_v11()
-        self.connection.execute("PRAGMA user_version=11")
+        self._migrate_end_trigger_v12()
+        self.connection.execute("PRAGMA user_version=12")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -266,6 +268,17 @@ class Store:
                 """,
                 (uuid.uuid4().hex, word, weight, now, now),
             )
+
+    def _migrate_end_trigger_v12(self) -> None:
+        """Add end_trigger column to segments table (v11->v12).
+
+        Records which endpoint trigger closed each segment
+        (vad_endpoint/max_duration/silence_timeout/relative_silence/energy_silent/
+        asr_stall/stop) so endpoint misbehavior can be diagnosed from the DB alone.
+        """
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        if "end_trigger" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN end_trigger TEXT")
 
     def _migrate_legacy_profile(self) -> None:
         """Migrate legacy single-embedding profile to a sample entry if samples table is empty."""

@@ -58,12 +58,18 @@ def resolve_model_paths(
 
 
 def verify_models(
-    settings: ModelSettings, root: Path | None = None
+    settings: ModelSettings, root: Path | None = None,
+    skip_keys: frozenset[str] = frozenset(),
 ) -> tuple[ModelCheck, ...]:
-    """旧 API — 校验硬编码的4个模型。保留用于向后兼容。"""
+    """旧 API — 校验硬编码的4个模型。保留用于向后兼容。
+
+    skip_keys: 跳过指定 key 的校验（如注册表管理的 asr_final 槽位）。
+    """
     paths = resolve_model_paths(settings, root)
     checks: list[ModelCheck] = []
     for spec in specs(settings):
+        if spec.key in skip_keys:
+            continue
         path = paths[spec.key]
         errors: list[str] = []
         if not path.is_dir():
@@ -83,9 +89,12 @@ def verify_models(
     return tuple(checks)
 
 
-def require_models(settings: ModelSettings, root: Path | None = None) -> dict[str, Path]:
-    """旧 API — 要求4个模型全部就绪。"""
-    checks = verify_models(settings, root)
+def require_models(
+    settings: ModelSettings, root: Path | None = None,
+    skip_keys: frozenset[str] = frozenset(),
+) -> dict[str, Path]:
+    """旧 API — 要求模型全部就绪（可跳过指定 key）。"""
+    checks = verify_models(settings, root, skip_keys=skip_keys)
     failed = [f"{item.key}: {', '.join(item.errors)} ({item.path})" for item in checks if not item.ok]
     if failed:
         raise RuntimeError("本地模型校验失败:\n" + "\n".join(failed))

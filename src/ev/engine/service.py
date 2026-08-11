@@ -331,7 +331,8 @@ class EngineService:
     def _start_listening(self, request: EngineRequest) -> None:
         if self._listen_thread and self._listen_thread.is_alive():
             raise RuntimeError("监听已经启动")
-        require_models(self.settings.models)
+        # asr_final 由 registry 动态管理，不通过旧 toml 路径校验
+        require_models(self.settings.models, skip_keys=frozenset({"asr_final"}))
         if not list_input_devices():
             raise RuntimeError("未发现可用输入设备，请检查麦克风权限和系统输入设置")
         self.device_selector = request.payload.get("device") or None
@@ -373,10 +374,9 @@ class EngineService:
         def resolve_final_asr_path() -> Path:
             model = self._registry.get_active_model("asr_final")
             if model is None:
-                # Fallback: use old settings path
-                from ..models import require_models
-                paths = require_models(self.settings.models, None)
-                return paths["asr_final"]
+                # Fallback: registry 未配置 asr_final 时用旧 toml 路径
+                # （不做 require_models 严格校验，交给下层适配器在真正加载时报错）
+                return self.settings.models.root / self.settings.models.asr_final
             return Path(model.local_path)
 
         def run() -> None:
@@ -571,7 +571,7 @@ class EngineService:
                 if len(audio) < total_samples * 0.5:
                     raise RuntimeError("录制音频过短")
                 self.writer.emit("manual_sample_status", {"status": "processing"})
-                paths = require_models(self.settings.models, self.settings.models.root)
+                paths = require_models(self.settings.models, self.settings.models.root, skip_keys=frozenset({"asr_final"}))
                 speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
                 embedding = speaker.embed(audio, sample_rate)
                 wav_path = archive_wav(
@@ -615,7 +615,7 @@ class EngineService:
         if self.state in ("loading", "listening", "speech"):
             self._stop_listening(request)
             self._listen_thread.join(timeout=2.0)
-        require_models(self.settings.models)
+        require_models(self.settings.models, skip_keys=frozenset({"asr_final"}))
         device = resolve_device(self.device_selector)
         self._enroll_device = request.payload.get("device") or self.device_selector
         self._enroll_frames = []
@@ -672,7 +672,7 @@ class EngineService:
                 sample_rate = self.settings.audio.sample_rate
                 if len(audio) < int(sample_rate * 0.5):
                     raise RuntimeError("录入音频过短（至少需要0.5秒）")
-                paths = require_models(self.settings.models, self.settings.models.root)
+                paths = require_models(self.settings.models, self.settings.models.root, skip_keys=frozenset({"asr_final"}))
                 speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
                 embedding = speaker.embed(audio, sample_rate)
                 wav_path = archive_wav(

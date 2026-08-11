@@ -285,6 +285,7 @@ class SegmentProcessor:
         segment_id: str | None = None,
         raw_audio: np.ndarray | None = None,
         speaker_turns: tuple = (),
+        end_trigger: str | None = None,
     ) -> SegmentRecord | None:
         segment_id = segment_id or uuid.uuid4().hex
         duration_ms = round(len(audio) * 1000 / self.settings.audio.sample_rate)
@@ -297,6 +298,19 @@ class SegmentProcessor:
 
         final_result = self._final(audio)
         final_text = final_result.text if final_result else ""
+        # Defensive fallback: if final ASR output is dramatically shorter than the
+        # streaming partial (e.g. the model was token-truncated), prefer the fuller
+        # partial text instead of storing a broken half-transcript.
+        if (
+            final_text
+            and partial
+            and len(final_text.strip()) < int(len(partial.strip()) * 0.6)
+        ):
+            self.output(
+                f"[{segment_id[:8]}] final ASR truncated: final={len(final_text.strip())}ch "
+                f"vs partial={len(partial.strip())}ch; falling back to partial text"
+            )
+            final_text = partial
         transcript = final_text or partial
         # Empty or filler-only segments are discarded (no WAV, no DB, no speaker check).
         if not transcript.strip():
@@ -390,9 +404,10 @@ class SegmentProcessor:
             wake_detected=decision.wake_detected, query_candidate=decision.query_candidate,
             query_text=decision.query_text, vad_model=self.vad_model_id,
             asr_stream_model=self.settings.models.asr_streaming,
-            asr_final_model=self.settings.models.asr_final if self.final_asr else "unavailable",
+            asr_final_model=self._final_model_label(),
             speaker_model=self.settings.models.speaker,
             created_at=datetime.now(timezone.utc).isoformat(),
+            end_trigger=end_trigger,
             speaker_turns=json.dumps([
                 {"start_ms": t.start_offset_ms, "end_ms": t.end_offset_ms,
                  "label": t.label, "score": t.score}
@@ -472,6 +487,22 @@ class SegmentProcessor:
             return TranscriptionResult(text=result)
         return result
 
+    def _final_model_label(self) -> str:
+        """Record the ACTUAL loaded final-ASR model dir name, not the config default.
+
+        The config default (settings.models.asr_final) can differ from what's
+        actually loaded (the registry slot decides at runtime), which made the
+        old asr_final_model column misleading.
+        """
+        if self.final_asr is None:
+            return "unavailable"
+        raw = getattr(self.final_asr, "model_path", None)
+        if not raw:
+            raw = getattr(self.final_asr, "model_id", None)
+        if not raw:
+            return type(self.final_asr).__name__
+        return Path(str(raw)).name
+
 
 def _safe_unload(model_obj: Any) -> None:
     """Safely call unload() on a model adapter, swallowing any exceptions."""
@@ -517,6 +548,7 @@ class SegmentJob:
     segment_id: str
     speaker_turns: tuple = ()
     raw_audio: np.ndarray | None = None  # raw (unprocessed) audio → archived as .raw.wav for future SE/context
+    end_trigger: str | None = None       # vad_endpoint/max_duration/silence_timeout/... → 落库可观测
 
 
 class SegmentWorker:
@@ -663,6 +695,7 @@ class SegmentWorker:
                         job.segment_id,
                         raw_audio=job.raw_audio,
                         speaker_turns=job.speaker_turns,
+                        end_trigger=job.end_trigger,
                     )
 
                     # Restore final_asr on processor after short-segment skip
@@ -833,7 +866,7 @@ async def transcribe_forever(
         worker_holder["worker"] = worker
 
     try:
-        pre_roll_frames = max(1, 600 // 30)
+        pre_roll_frames = max(1, 1200 // 30)
         frame_size = int(sr * frame_ms_default / 1000)
 
         # --- State machine variables ---
@@ -959,6 +992,7 @@ async def transcribe_forever(
                         partial=final_partial,
                         segment_id=current_segment_id,
                         speaker_turns=tuple(speaker_turns),
+                        end_trigger=trigger_reason,
                     )
                 )
             else:
@@ -1247,23 +1281,42 @@ async def transcribe_forever(
                         force_segment_end("max_duration")
                         return
                     # 3) Absolute silence timeout (very quiet)
-                    if silence_ms >= settings.segment.silence_timeout_ms:
+                    #    Gate on a minimum segment length so a freshly-started
+                    #    segment isn't cut by a brief pause right at the onset.
+                    if (
+                        silence_ms >= settings.segment.silence_timeout_ms
+                        and total_duration_ms >= settings.segment.min_duration_for_silence_ms
+                    ):
                         output(f"[{current_segment_id[:8]}] force_end: silence_timeout ({silence_ms}ms silent, peak={peak_rms:.4f}, total={total_duration_ms}ms)")
                         force_segment_end("silence_timeout")
                         return
                     # 4) Relative silence (noise floor present but RMS dropped from speech level)
-                    if relative_silence_ms >= settings.segment.relative_silence_timeout_ms:
+                    #    Longer gate: only cuts long segments, never short ones.
+                    if (
+                        relative_silence_ms >= settings.segment.relative_silence_timeout_ms
+                        and total_duration_ms >= settings.segment.min_duration_for_relative_silence_ms
+                    ):
                         output(f"[{current_segment_id[:8]}] force_end: relative_silence ({relative_silence_ms}ms, peak={peak_rms:.4f}, rms={raw_rms:.4f}, ratio={raw_rms/peak_rms:.2f}, total={total_duration_ms}ms)")
                         force_segment_end("relative_silence")
                         return
                     # 5) EnergyVAD says silent for long enough (adaptive SNR-based, beats stuck FSMN)
-                    if energy_total_silent_ms >= settings.segment.silence_timeout_ms + 200:
+                    if (
+                        energy_total_silent_ms >= settings.segment.silence_timeout_ms + 500
+                        and total_duration_ms >= settings.segment.min_duration_for_silence_ms
+                    ):
                         output(f"[{current_segment_id[:8]}] force_end: energy_silent ({energy_total_silent_ms:.0f}ms, total={total_duration_ms}ms)")
                         force_segment_end("energy_silent")
                         return
-                    # 6) ASR stall: streaming model stopped producing new text
-                    if ms_since_last_partial >= settings.segment.asr_stall_timeout_ms and total_duration_ms >= min_dur + 500:
-                        output(f"[{current_segment_id[:8]}] force_end: asr_stall ({ms_since_last_partial}ms since partial, total={total_duration_ms}ms)")
+                    # 6) ASR stall: streaming model stopped producing new text.
+                    #    Only fire when audio is genuinely quiet too — if the speaker is
+                    #    still talking (raw RMS above the silence floor) while ASR lags,
+                    #    that's a model stall, not the end of speech; don't cut early.
+                    if (
+                        ms_since_last_partial >= settings.segment.asr_stall_timeout_ms
+                        and total_duration_ms >= min_dur + 500
+                        and raw_rms < settings.segment.silence_rms_threshold
+                    ):
+                        output(f"[{current_segment_id[:8]}] force_end: asr_stall ({ms_since_last_partial}ms since partial, rms={raw_rms:.4f}, total={total_duration_ms}ms)")
                         force_segment_end("asr_stall")
                         return
 
@@ -1324,6 +1377,7 @@ async def transcribe_forever(
                             partial=partial,
                             segment_id=current_segment_id,
                             speaker_turns=tuple(speaker_turns),
+                            end_trigger="stop",
                         )
                     )
             capture.stop()
