@@ -31,6 +31,7 @@ from ..audio.capture import AudioCapture
 from ..audio.preprocess import AudioPreprocessor, PreprocessParams
 from ..audio.energy_vad import EnergyVAD, EnergyVADParams
 from ..audio.denoise import DenoiseAdapter
+from ..audio.environment import EnvironmentMonitor, EnvEvent
 from ..audio.voice_check import classify_voice
 from ..config import Settings
 from ..speaker.profile import VoiceProfileManager
@@ -80,7 +81,7 @@ def _is_filler_only(text: str) -> bool:
 
 
 def _check_speech_segment(
-    vad_model: object | None,
+    vad_model: VADAdapter | None,
     audio: np.ndarray,
     speech_ratio_threshold: float = 0.05,
 ) -> bool:
@@ -755,8 +756,8 @@ class SegmentWorker:
         emit: Callable[[str, dict], None],
         shared_threshold: dict | None = None,
         final_asr_resolver: Callable[[], Path] | None = None,
-        denoiser: object | None = None,
-        vad_model: object | None = None,
+        denoiser: DenoiseAdapter | None = None,
+        vad_model: VADAdapter | None = None,
     ):
         self.settings = settings
         self.paths = paths
@@ -770,8 +771,8 @@ class SegmentWorker:
         self._final_asr_lock = threading.Lock()
         self._final_asr: SenseVoiceAdapter | Qwen3ASRAdapter | None = None
         self._reload_final = threading.Event()
-        self._denoiser: object | None = denoiser  # DenoiseAdapter, 可选
-        self._vad_model: object | None = vad_model  # VADAdapter, 用于人声确认
+        self._denoiser: DenoiseAdapter | None = denoiser
+        self._vad_model: VADAdapter | None = vad_model  # 用于人声确认
         self.jobs: queue.Queue[SegmentJob | None] = queue.Queue()
         self.thread = threading.Thread(target=self._run, name="ev-segment-worker", daemon=True)
         self.thread.start()
@@ -872,7 +873,7 @@ class SegmentWorker:
                     _denoised: np.ndarray | None = None
                     if job.raw_audio is not None and job.raw_audio.size > 0:
                         # 降噪 (如果可用)
-                        _denoiser = getattr(self, "_denoiser", None)
+                        _denoiser = self._denoiser
                         if _denoiser is not None and _denoiser.available:
                             try:
                                 _denoised = _denoiser.enhance(
@@ -883,14 +884,14 @@ class SegmentWorker:
                                 _denoised = None
                         # FSMN 人声确认
                         _raw_has_speech = _check_speech_segment(
-                            self._vad_model if hasattr(self, "_vad_model") else None,
+                            self._vad_model,
                             job.raw_audio,
                             self.settings.segment.voice_confirm_min_speech_ratio,
                         )
                         _denoised_has_speech = False
                         if _denoised is not None and _denoised.size > 0:
                             _denoised_has_speech = _check_speech_segment(
-                                self._vad_model if hasattr(self, "_vad_model") else None,
+                                self._vad_model,
                                 _denoised,
                                 self.settings.segment.voice_confirm_min_speech_ratio,
                             )
@@ -1013,7 +1014,8 @@ async def transcribe_forever(
     emit: Callable[[str, dict], None] | None = None,
     worker_holder: dict | None = None,
     final_asr_resolver: Callable[[], Path] | None = None,
-    env_monitor: object | None = None,
+    env_monitor: EnvironmentMonitor | None = None,
+    denoiser_path: str | None = None,
 ) -> None:
     from ..models import resolve_model_paths, verify_models
 
@@ -1128,9 +1130,13 @@ async def transcribe_forever(
 
     profile_centroids = load_centroids()
 
+    # 实例化降噪适配器 — 用于 SegmentWorker 的人声确认
+    denoiser_adapter = DenoiseAdapter(model_path=denoiser_path)
     worker = SegmentWorker(
         settings, paths, stream, speaker, output, send, shared_threshold,
         final_asr_resolver=final_asr_resolver,
+        vad_model=vad_model,
+        denoiser=denoiser_adapter,
     )
     if worker_holder is not None:
         worker_holder["worker"] = worker
@@ -1309,7 +1315,7 @@ async def transcribe_forever(
         )
         # 启动环境监测（YAMNet 定时轮询）
         if env_monitor is not None and hasattr(env_monitor, "start"):
-            def _on_env_event(ev: object) -> None:
+            def _on_env_event(ev: EnvEvent) -> None:
                 send("environment_event", {
                     "timestamp": getattr(ev, "timestamp", 0),
                     "category": getattr(ev, "category", "unknown"),
@@ -1479,7 +1485,7 @@ async def transcribe_forever(
                         _reset_observing()
                         vad.reset()
                         return
-                    if obs_samples >= gate_samples:
+                    if obs_samples - observe_start_samples >= gate_samples:
                         obs_audio = np.concatenate(observing_frames)
                         score = _score_window(obs_audio)
                         # Generous threshold for initial gate: scores within

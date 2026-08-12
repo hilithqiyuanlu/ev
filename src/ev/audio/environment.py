@@ -156,13 +156,12 @@ class TemporalAggregator:
             return events
 
         # 简单多数投票
-        cat_counts: dict[str, int] = {}
+        cat_counts = collections.Counter(frame_categories)
         cat_confs: dict[str, list[float]] = {}
         for cat, conf in zip(frame_categories, frame_confidences):
-            cat_counts[cat] = cat_counts.get(cat, 0) + 1
             cat_confs.setdefault(cat, []).append(conf)
 
-        dominant = max(cat_counts, key=lambda k: cat_counts[k])
+        dominant = cat_counts.most_common(1)[0][0]
         conf = float(np.mean(cat_confs[dominant]))
 
         if conf < self.min_confidence or dominant == "silence":
@@ -178,32 +177,8 @@ class TemporalAggregator:
         elif self._current_category is not None:
             self._inactive_frames += 1
             if self._inactive_frames >= self.min_frames_inactive:
-                # 状态结束
-                avg_conf = (
-                    self._confidence_sum / max(self._active_frame_count, 1)
-                    if self._active_frame_count > 0
-                    else conf
-                )
-                duration = (
-                    now - self._category_start_time
-                    if self._category_start_time
-                    else None
-                )
-                events.append(
-                    EnvEvent(
-                        timestamp=now,
-                        category=self._current_category,
-                        confidence=round(avg_conf, 3),
-                        duration_sec=round(duration, 1) if duration else None,
-                    )
-                )
-                # 重置，准备新状态
-                self._current_category = None
-                self._active_frames = 0
-                self._inactive_frames = 0
-                self._confidence_sum = 0.0
-                self._active_frame_count = 0
-                self._category_start_time = None
+                events.append(self._build_event(now))
+                self._reset_state()
 
         # 检查是否有新状态开始
         if self._current_category is None and dominant != "silence":
@@ -222,33 +197,39 @@ class TemporalAggregator:
     def flush(self) -> list[EnvEvent]:
         """强制产出当前活跃状态的事件（用于停止时）。"""
         if self._current_category and self._active_frames > 0:
-            avg_conf = (
-                self._confidence_sum / max(self._active_frame_count, 1)
-                if self._active_frame_count > 0
-                else 0.0
-            )
-            duration = (
-                time.time() - self._category_start_time
-                if self._category_start_time
-                else None
-            )
-            return [
-                EnvEvent(
-                    timestamp=time.time(),
-                    category=self._current_category,
-                    confidence=round(avg_conf, 3),
-                    duration_sec=round(duration, 1) if duration else None,
-                )
-            ]
+            return [self._build_event(time.time())]
         return []
 
-    def reset(self) -> None:
+    def _build_event(self, now: float) -> EnvEvent:
+        """构建当前状态的 EnvEvent（不修改内部状态）。"""
+        avg_conf = (
+            self._confidence_sum / max(self._active_frame_count, 1)
+            if self._active_frame_count > 0
+            else 0.0
+        )
+        duration = (
+            now - self._category_start_time
+            if self._category_start_time
+            else None
+        )
+        return EnvEvent(
+            timestamp=now,
+            category=self._current_category or "unknown",
+            confidence=round(avg_conf, 3),
+            duration_sec=round(duration, 1) if duration else None,
+        )
+
+    def _reset_state(self) -> None:
+        """重置内部聚合状态。"""
         self._current_category = None
         self._active_frames = 0
         self._inactive_frames = 0
         self._category_start_time = None
         self._confidence_sum = 0.0
         self._active_frame_count = 0
+
+    def reset(self) -> None:
+        self._reset_state()
 
 
 def load_yamnet_labels(label_path: str | Path) -> list[str]:
@@ -325,6 +306,8 @@ class EnvironmentMonitor:
         self._emit_callback: Callable[[EnvEvent], None] | None = None
         self._category_map: dict[int, str] = {}
         self._interpreter: object | None = None  # tflite.Interpreter
+        self._input_details: list = []
+        self._output_details: list = []
 
     def _load_model(self) -> None:
         """加载 YAMNet TFLite 模型和标签。
@@ -358,6 +341,9 @@ class EnvironmentMonitor:
         self._interpreter_module = tflite
         self._interpreter = tflite.Interpreter(model_path=self.model_path)
         self._interpreter.allocate_tensors()
+        # Cache static I/O details — avoid per-inference TFLite round-trips
+        self._input_details = self._interpreter.get_input_details()
+        self._output_details = self._interpreter.get_output_details()
         LOGGER.info("YAMNet TFLite model loaded from %s", self.model_path)
 
     # ── 公开接口 ──────────────────────────────────────────────────────
@@ -430,33 +416,26 @@ class EnvironmentMonitor:
             window_samples = int(self.window_sec * self.sample_rate)
             with self._lock:
                 if len(self._buffer) < window_samples:
-                    self._schedule_next()
                     return
                 buf_list = list(self._buffer)
                 window_data = np.array(
                     buf_list[-window_samples:], dtype=np.float32
                 )
-        except Exception:
-            LOGGER.debug("EnvironmentMonitor poll error", exc_info=True)
-            self._schedule_next()
-            return
 
-        # 极低能量时跳过推理（绝对静音）
-        rms = float(np.sqrt(np.mean(np.square(window_data))))
-        if rms < 1e-6:
-            self._schedule_next()
-            return
+            # 极低能量时跳过推理（绝对静音）
+            rms = float(np.sqrt(np.mean(np.square(window_data))))
+            if rms < 1e-6:
+                return
 
-        try:
             frame_categories, frame_confs = self._classify_window(window_data)
             events = self._aggregator.update(frame_categories, frame_confs)
             for event in events:
                 if self._emit_callback:
                     self._emit_callback(event)
         except Exception:
-            LOGGER.debug("EnvironmentMonitor classification error", exc_info=True)
-
-        self._schedule_next()
+            LOGGER.warning("EnvironmentMonitor poll error", exc_info=True)
+        finally:
+            self._schedule_next()
 
     def _classify_window(self, audio: np.ndarray) -> tuple[list[str], list[float]]:
         """对一段音频窗口做 YAMNet 分类。
@@ -471,9 +450,8 @@ class EnvironmentMonitor:
             return [], []
 
         tflite = self._interpreter
-
-        input_details = tflite.get_input_details()
-        output_details = tflite.get_output_details()
+        input_details = self._input_details
+        output_details = self._output_details
 
         # YAMNet 输入: (1, 15600) float32 = 0.975s @ 16kHz
         chunk_size = self._yamnet_input_samples
@@ -487,19 +465,17 @@ class EnvironmentMonitor:
             if len(chunk) < chunk_size:
                 chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
 
-            chunk_input = chunk.reshape(1, chunk_size).astype(np.float32)
+            chunk_input = chunk.astype(np.float32)
             tflite.set_tensor(input_details[0]["index"], chunk_input)
             tflite.invoke()
 
-            # scores: (1, N_frames, 521)
-            scores = tflite.get_tensor(output_details[0]["index"])[0]  # (N_frames, 521)
+            # scores: (1, 521) — 单帧分类，521 个 AudioSet 类别的置信度
+            scores = tflite.get_tensor(output_details[0]["index"])[0]  # (521,)
 
-            for frame_scores in scores:
-                # frame_scores: (521,)
-                best_idx = int(np.argmax(frame_scores))
-                best_conf = float(np.max(frame_scores))
-                cat = self._category_map.get(best_idx, "other")
-                categories.append(cat)
-                confidences.append(best_conf)
+            best_idx = int(np.argmax(scores))
+            best_conf = float(np.max(scores))
+            cat = self._category_map.get(best_idx, "other")
+            categories.append(cat)
+            confidences.append(best_conf)
 
         return categories, confidences

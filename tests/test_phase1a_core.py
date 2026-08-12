@@ -407,15 +407,15 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
         runtime_module, "_create_final_asr_adapter",
         lambda path: Final(path),
     )
-    monkeypatch.setattr(
-        "ev.models.require_models",
-        lambda settings, root=None: {
-            "vad": tmp_path / "vad",
-            "asr_streaming": tmp_path / "stream",
-            "asr_final": tmp_path / "final",
-            "speaker": tmp_path / "speaker",
-        },
-    )
+    def _fake_verify_1(settings, root=None, skip_keys=frozenset()):
+        from ev.models import ModelCheck
+        return (
+            ModelCheck("vad", tmp_path / "vad", ()),
+            ModelCheck("asr_streaming", tmp_path / "stream", ()),
+            ModelCheck("asr_final", tmp_path / "final", ()),
+            ModelCheck("speaker", tmp_path / "speaker", ()),
+        )
+    monkeypatch.setattr("ev.models.verify_models", _fake_verify_1)
     events = []
     asyncio.run(
         runtime_module.transcribe_forever(
@@ -607,15 +607,15 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
     monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
-    monkeypatch.setattr(
-        "ev.models.require_models",
-        lambda settings, root=None: {
-            "vad": tmp_path / "vad",
-            "asr_streaming": tmp_path / "stream",
-            "asr_final": tmp_path / "final",
-            "speaker": tmp_path / "speaker",
-        },
-    )
+    def _fake_verify_2(settings, root=None, skip_keys=frozenset()):
+        from ev.models import ModelCheck
+        return (
+            ModelCheck("vad", tmp_path / "vad", ()),
+            ModelCheck("asr_streaming", tmp_path / "stream", ()),
+            ModelCheck("asr_final", tmp_path / "final", ()),
+            ModelCheck("speaker", tmp_path / "speaker", ()),
+        )
+    monkeypatch.setattr("ev.models.verify_models", _fake_verify_2)
     events = []
     asyncio.run(
         runtime_module.transcribe_forever(

@@ -7,13 +7,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from ..audio.utils import resample as _audio_resample
 
 from .adapters import TranscriptionResult, TranscriptionSegment
 
@@ -46,19 +47,8 @@ class Qwen3ASRAdapter:
         self._detect_variant()
 
     def _detect_variant(self) -> None:
-        config_path = Path(self.model_path) / "config.json"
-        if not config_path.exists():
-            self._model_variant = "unknown"
-            return
-        try:
-            config = json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            self._model_variant = "unknown"
-            return
         self._model_variant = "1.7b"
-        logger.info(
-            "Qwen3-ASR loaded at %s", self.model_path,
-        )
+        logger.info("Qwen3-ASR loaded at %s", self.model_path)
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
@@ -167,7 +157,7 @@ class Qwen3ASRAdapter:
         if audio_arr.ndim > 1:
             audio_arr = audio_arr.mean(axis=-1)
         if sample_rate != 16000:
-            audio_arr = self._resample_np(audio_arr, sample_rate, 16000)
+            audio_arr = _audio_resample(audio_arr, sample_rate, 16000)
             sample_rate = 16000
 
         # Build prompt with hotword injection if provided
@@ -404,15 +394,6 @@ class Qwen3ASRAdapter:
             i += 1
 
         return segments
-
-    @staticmethod
-    def _resample_np(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
-        if orig_rate == target_rate:
-            return audio
-        duration = len(audio) / orig_rate
-        target_length = int(duration * target_rate)
-        indices = np.linspace(0, len(audio) - 1, target_length)
-        return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
 
     @staticmethod
     def _clean_text(text: str) -> str:

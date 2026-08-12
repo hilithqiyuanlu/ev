@@ -11,22 +11,13 @@ from typing import Any
 
 import numpy as np
 
+from ..store.audio import read_wav
+from .utils import resample
+
 LOGGER = logging.getLogger(__name__)
 
 # DFSMN 模型原生采样率
 _DFSMN_NATIVE_SR = 48000
-
-
-def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """简单线性插值重采样。"""
-    if orig_sr == target_sr:
-        return audio.copy()
-    if audio.size < 2:
-        return audio.copy()
-    duration = len(audio) / orig_sr
-    target_len = max(1, int(duration * target_sr))
-    indices = np.linspace(0, len(audio) - 1, target_len)
-    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
 
 
 class DenoiseAdapter:
@@ -39,8 +30,9 @@ class DenoiseAdapter:
     若 modelscope/speechbrain 未安装，enhance() 静默回退到原始音频。
     """
 
-    def __init__(self, model_id: str = "damo/speech_dfsmn_ans_psm_48k_causal") -> None:
-        self.model_id = model_id
+    def __init__(self, model_id: str | None = None, model_path: str | None = None) -> None:
+        # model_path 优先（本地模型），否则回退到 model_id（ModelScope 云端）
+        self.model_id = model_path or model_id or "damo/speech_dfsmn_ans_psm_48k_causal"
         self._pipeline: Any = None
         self._load_attempted = False
 
@@ -98,11 +90,10 @@ class DenoiseAdapter:
 
         try:
             # 重采样到 48kHz (DFSMN 原生采样率)
-            arr_48k = _resample(arr, sample_rate, _DFSMN_NATIVE_SR)
+            arr_48k = resample(arr, sample_rate, _DFSMN_NATIVE_SR)
 
             # ModelScope pipeline 返回: {"output_pcm": np.ndarray}
             # 需要先写成临时 WAV 再处理（pipeline 接受文件路径或 PCM bytes）
-            import io
             import wave
             import tempfile
             from pathlib import Path
@@ -139,8 +130,9 @@ class DenoiseAdapter:
 
             # 输出可能是 np.ndarray (float32 PCM) 或文件路径
             if isinstance(output, (str, Path)):
-                # 从文件读取
-                output_arr = _read_wav_mono(output, _DFSMN_NATIVE_SR)
+                output_arr, file_sr = read_wav(Path(output))
+                if file_sr != _DFSMN_NATIVE_SR:
+                    output_arr = resample(output_arr, file_sr, _DFSMN_NATIVE_SR)
             elif isinstance(output, np.ndarray):
                 output_arr = np.asarray(output, dtype=np.float32).reshape(-1)
             else:
@@ -149,7 +141,7 @@ class DenoiseAdapter:
             # 重采样回原始采样率
             if len(output_arr) == 0:
                 return arr.copy()
-            enhanced = _resample(output_arr, _DFSMN_NATIVE_SR, sample_rate)
+            enhanced = resample(output_arr, _DFSMN_NATIVE_SR, sample_rate)
 
             # 对齐长度
             if len(enhanced) < len(arr):
@@ -176,16 +168,3 @@ class DenoiseAdapter:
         self._load_attempted = False
         gc.collect()
         LOGGER.info("DFSMN denoiser unloaded")
-
-
-def _read_wav_mono(path: str | Path, expected_sr: int) -> np.ndarray:
-    """读取 WAV 文件的单声道 float32 PCM。"""
-    import wave
-
-    with wave.open(str(path), "rb") as wf:
-        frames = wf.readframes(wf.getnframes())
-        sr = wf.getframerate()
-        data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    if sr != expected_sr:
-        data = _resample(data, sr, expected_sr)
-    return data

@@ -6,7 +6,7 @@ import pytest
 
 def test_resample_identity():
     """_resample 对同采样率应返回相同数据。"""
-    from ev.audio.denoise import _resample
+    from ev.audio.utils import resample as _resample
 
     audio = np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
     result = _resample(audio, 16000, 16000)
@@ -17,7 +17,7 @@ def test_resample_identity():
 
 def test_resample_upsample():
     """_resample 上采样 8kHz→16kHz 长度翻倍。"""
-    from ev.audio.denoise import _resample
+    from ev.audio.utils import resample as _resample
 
     audio = np.sin(np.linspace(0, 2 * np.pi, 100, dtype=np.float32))
     result = _resample(audio, 8000, 16000)
@@ -26,7 +26,7 @@ def test_resample_upsample():
 
 def test_resample_downsample():
     """_resample 下采样 48kHz→16kHz 长度缩小。"""
-    from ev.audio.denoise import _resample
+    from ev.audio.utils import resample as _resample
 
     audio = np.random.randn(4800).astype(np.float32)
     result = _resample(audio, 48000, 16000)
@@ -35,7 +35,7 @@ def test_resample_downsample():
 
 def test_resample_short_audio():
     """_resample 极短音频（<2 样本）不动。"""
-    from ev.audio.denoise import _resample
+    from ev.audio.utils import resample as _resample
 
     audio = np.array([0.5], dtype=np.float32)
     result = _resample(audio, 16000, 48000)

@@ -233,7 +233,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         root=model_root,
         vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
         asr_streaming=str(models_raw.get("asr_streaming", "ev-paraformer-zh-streaming-16k")),
-        asr_final=str(models_raw.get("asr_final", "ev-sensevoice-small")),
+        asr_final=str(models_raw.get("asr_final", "qwen3-asr-1.7b")),
         speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
     )
 
@@ -305,7 +305,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
             energy_abs_min_rms=float(vad_raw.get("energy_abs_min_rms", 0.0003)),
             energy_start_frames=int(vad_raw.get("energy_start_frames", 2)),
             energy_hangover_frames=int(vad_raw.get("energy_hangover_frames", 20)),
-            combine_start_mode=str(vad_raw.get("combine_start_mode", "or")).lower(),
+            combine_start_mode=str(vad_raw.get("combine_start_mode", "fsmn_only")).lower(),
             combine_end_mode=str(vad_raw.get("combine_end_mode", "and")).lower(),
         ),
         data_dir=data_dir,

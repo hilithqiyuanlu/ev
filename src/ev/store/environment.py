@@ -55,7 +55,6 @@ class EnvironmentLog:
             ensure_ascii=False,
         )
         path = self._path()
-        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
@@ -121,10 +120,8 @@ class EnvironmentLog:
         confidences = [r.get("confidence", 0) for r in records]
 
         # 主导类别 = 出现最多
-        cat_counts: dict[str, int] = {}
-        for c in categories:
-            cat_counts[c] = cat_counts.get(c, 0) + 1
-        dominant = max(cat_counts, key=lambda k: cat_counts[k])
+        from collections import Counter
+        dominant = Counter(categories).most_common(1)[0][0]
 
         return {
             "dominant_category": dominant,

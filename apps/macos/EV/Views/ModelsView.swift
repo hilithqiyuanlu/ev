@@ -108,11 +108,14 @@ struct ModelsView: View {
 
                 ForEach(sortedTypes, id: \.self) { type in
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(typeNames[type, default: type])
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
-
-                        slotSwitch(for: type)
+                        HStack(alignment: .center, spacing: 12) {
+                            Text(typeNames[type, default: type])
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            slotSwitch(for: type)
+                        }
+                        slotIssue(for: type)
 
                         ForEach(grouped[type] ?? []) { item in
                             modelRow(for: item, isInstalled: installedKeys.contains(item.key))
@@ -123,7 +126,8 @@ struct ModelsView: View {
         }
     }
 
-    /// 类型头下方的槽位切换：该类型已安装 ≥2 个模型时才显示（当前仅终稿识别有 SenseVoice/Qwen3 两个候选）。
+    /// 类型标题行右侧的槽位切换：该类型已安装 ≥2 个模型时才显示（当前仅终稿识别有 SenseVoice/Qwen3 两个候选）。
+    /// 样式参考输入页麦克风设备选择器；未分配时默认显示 Qwen3-ASR。
     @ViewBuilder
     private func slotSwitch(for type: String) -> some View {
         let compatible = model.installedModels.filter { installed in
@@ -132,64 +136,39 @@ struct ModelsView: View {
         }
         if compatible.count >= 2,
            let assignment = model.slotAssignments.first(where: { $0.slot == type }) {
-            let currentName = assignment.modelKey.flatMap { key in
-                model.availableModels.first(where: { $0.key == key })?.name
-            } ?? "未分配"
-            HStack(spacing: 8) {
-                Text("当前模型")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Menu {
-                    Button {
-                        model.setActiveModel(slot: assignment.slot, modelKey: nil)
-                    } label: {
-                        HStack {
-                            Text("未分配")
-                            Spacer()
-                            if assignment.modelKey == nil {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                    ForEach(compatible) { installed in
-                        let name = model.availableModels.first(where: { $0.key == installed.key })?.name ?? installed.key
-                        Button {
-                            model.setActiveModel(slot: assignment.slot, modelKey: installed.key)
-                        } label: {
-                            HStack {
-                                Text(name)
-                                Spacer()
-                                if assignment.modelKey == installed.key {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(currentName)
-                            .font(.subheadline.weight(.medium))
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.secondary.opacity(0.1))
-                    )
+            Picker("", selection: Binding(
+                get: { assignment.modelKey ?? "qwen3-asr-1.7b" },
+                set: { model.setActiveModel(slot: type, modelKey: $0) }
+            )) {
+                ForEach(compatible) { installed in
+                    let name = model.availableModels.first(where: { $0.key == installed.key })?.name ?? installed.key
+                    Text(name).tag(installed.key)
                 }
-                .menuStyle(.borderlessButton)
             }
-            .padding(.top, 2)
+            .pickerStyle(.menu)
+            .controlSize(.small)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("切换 \(typeNames[type, default: type]) 使用的模型")
+        }
+    }
+
+    /// 已分配模型但校验未通过时，在标题行下方给出具体原因。
+    @ViewBuilder
+    private func slotIssue(for type: String) -> some View {
+        if let assignment = model.slotAssignments.first(where: { $0.slot == type }),
+           assignment.modelKey != nil,
+           !assignment.status.ready {
+            let reasons = assignment.status.errors
+            Text(reasons.isEmpty ? "校验失败，请点击「刷新校验」" : reasons.joined(separator: "，"))
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .padding(.leading, 2)
         }
     }
 
     private func modelRow(for item: AvailableModel, isInstalled: Bool) -> some View {
         let isDownloading = model.downloadingKey == item.key
         let progress = model.downloadProgressByKey[item.key] ?? 0
-        let stage = model.downloadStageByKey[item.key] ?? "downloading"
         let message = model.downloadMessageByKey[item.key] ?? "正在下载..."
         let totalSize = model.downloadSizeByKey[item.key] ?? Int64(item.estimatedSizeBytes)
         let downloadedBytes = Int64(Double(totalSize) * progress)
@@ -327,16 +306,6 @@ struct ModelsView: View {
                         .stroke(isDownloading ? Color.blue.opacity(0.2) : Color.primary.opacity(0.04), lineWidth: 0.5)
                 )
         )
-    }
-
-    private func stageDisplayName(_ stage: String) -> String {
-        switch stage {
-        case "listing": return "正在连接..."
-        case "downloading": return "正在下载..."
-        case "installing": return "正在安装..."
-        case "done": return "下载完成"
-        default: return "处理中..."
-        }
     }
 
     private func formatSpeed(_ bytesPerSec: Double) -> String {

@@ -39,7 +39,7 @@ struct LiveView: View {
                         systemImage: model.isListening ? "stop.fill" : "mic.fill"
                     )
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(CapsuleButtonStyle())
                 .keyboardShortcut(.space, modifiers: [.command])
                 .disabled(
                     model.engineState == .loading || model.engineState == .stopping ||

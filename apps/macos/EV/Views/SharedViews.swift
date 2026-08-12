@@ -7,7 +7,7 @@ struct CapsuleButtonStyle: ButtonStyle {
     var isDestructive = false
 
     func makeBody(configuration: Configuration) -> some View {
-        let base: Color = isDestructive ? .red : .primary
+        let base: Color = isDestructive ? .red : .secondary
         let tint = configuration.isPressed
             ? base.opacity(0.6)
             : (isEnabled ? base : base.opacity(0.4))

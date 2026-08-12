@@ -404,10 +404,17 @@ class EngineService:
         self._env_log = EnvironmentLog(self.settings.logs_dir)
         self._env_monitor = None
         env_model = self._registry.get_active_model("environment")
+        if env_model is None:
+            # Fallback: registry 未分配 environment 槽位时，直接查找已安装的 yamnet
+            env_model = self._registry.state.installed.get("yamnet")
         if env_model is not None:
             env_path = Path(env_model.local_path)
             yamnet_model = env_path / "yamnet.tflite"
             yamnet_labels = env_path / "yamnet_class_map.csv"
+            # tar.gz 解压可能多嵌套一层目录
+            if not yamnet_model.exists():
+                yamnet_model = env_path / "yamnet" / "yamnet.tflite"
+                yamnet_labels = env_path / "yamnet" / "yamnet_class_map.csv"
             if yamnet_model.exists() and yamnet_labels.exists():
                 self._env_monitor = EnvironmentMonitor(
                     model_path=str(yamnet_model),
@@ -428,6 +435,14 @@ class EngineService:
                 return self.settings.models.root / self.settings.models.asr_final
             return Path(model.local_path)
 
+        # 解析降噪模型路径: registry → fallback installed → None
+        denoiser_path: str | None = None
+        denoise_model = self._registry.get_active_model("speech_enhancement")
+        if denoise_model is None:
+            denoise_model = self._registry.state.installed.get("dfsmn-ans")
+        if denoise_model is not None:
+            denoiser_path = denoise_model.local_path
+
         def run() -> None:
             try:
                 asyncio.run(
@@ -440,6 +455,7 @@ class EngineService:
                         worker_holder=worker_holder,
                         final_asr_resolver=resolve_final_asr_path,
                         env_monitor=self._env_monitor,
+                        denoiser_path=denoiser_path,
                     )
                 )
                 self.state = "stopped"

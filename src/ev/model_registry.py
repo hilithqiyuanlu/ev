@@ -772,7 +772,7 @@ def def_key_to_model_key(slot: str) -> str | None:
     mapping = {
         "vad": "fsmn-vad",
         "asr_streaming": "paraformer-zh-streaming",
-        "asr_final": "sensevoice-small",
+        "asr_final": "qwen3-asr-1.7b",
         "speaker": "eres2netv2",
     }
     return mapping.get(slot)

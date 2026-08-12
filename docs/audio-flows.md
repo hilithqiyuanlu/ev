@@ -1,6 +1,6 @@
 # EV 音频处理 Flow
 
-> 更新时间: 2026-08-12 (声纹学习三档分级 + Qwen3 热词增强 + 降噪/人声确认/环境感知接入中)
+> 更新时间: 2026-08-12 (声纹学习三档分级 + Qwen3 热词增强 + 降噪/人声确认/环境感知已接线)
 >
 > 本文档以 `src/ev/pipeline/runtime.py` 为准, 描述麦克风输入 → ASR → 声纹 → 落库
 > 的完整输入链路。声纹细节见 [voiceprint.md](./voiceprint.md),
@@ -128,10 +128,8 @@
 │        有人声; raw 与 denoised 各跑一次, OR 决策                            │
 │      · 无人声且过 warm-up → segment_discarded reason=no_speech_detected,    │
 │        不入库不跑 ASR (voice_check.py 声学规则降级为日志解释信号)           │
-│      ⚠️ 接线状态: 截至本次更新, transcribe_forever 构造 worker 时未传入     │
-│         denoiser/vad_model (两者=None) — 该路径会把所有段判为无人声丢弃,    │
-│         属重构进行中的已知中断态, 接线: worker 构造处传 vad_model 与         │
-│         speech_enhancement 槽位的 DenoiseAdapter 实例                       │
+│      ✅ 接线: transcribe_forever 构造 worker 时传入 vad_model 与            │
+│         speech_enhancement 槽位的 DenoiseAdapter (denoiser_path)            │
 │                                                                             │
 │  6.2 终稿 ASR (懒加载, 首个非跳过段才加载; 运行时热切换):                   │
 │      按模型目录自动检测 (config.json 的 model_type 优先于 FunASR 配置):     │
@@ -148,7 +146,7 @@
 │          CJK 字符间空格清理 (保留英文空格); 无时间戳                        │
 │      GUI 切换 asr_final 槽位 → reload_final_asr: 立即卸载旧模型,           │
 │      下一个段到来时加载新模型 (省内存)                                      │
-│      ※ ASR 输入音频: 降噪后 denoised 优先, 否则用 processed (接线生效后)    │
+│      ※ ASR 输入音频: 降噪后 denoised 优先, 否则用 processed                │
 │                                                                             │
 │  6.3 终稿后处理与回退:                                                      │
 │      · 热词幻觉检测 (仅 Qwen3+热词+boosting 开启时):                        │
@@ -203,14 +201,15 @@
 │   · 手动输入的 query 直接进 queries 表, source="manual"                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-┌─ 旁路: 环境感知 (脚手架, 未接线) ──────────────────────────────────────────┐
+┌─ 旁路: 环境感知 (已接线) ───────────────────────────────────────────────────┐
 │ EnvironmentMonitor (audio/environment.py): YAMNet tflite (AudioSet 521     │
 │ 类映射 ~15 个有意义类别: typing/background_speech/music/background_noise/  │
 │ alert/animal/...), 10s ring buffer, 每 2s 取最近 5s 推理, 时序聚合成       │
 │ 持续状态 → environment_event → EnvironmentLog (logs/ 下 jsonl, 不入        │
 │ WAV/SQLite)。独立于语音路径, 不依赖 FSMN 触发。                            │
-│ ⚠️ 当前 service.py 仅构造实例并传入 transcribe_forever, 但 runtime 未使    │
-│    用该参数, .feed()/.start() 均无人调用 — 不产生任何事件                  │
+│ ✅ 接线: service.py 经 registry (或已安装 yamnet fallback) 解析模型路径    │
+│    构造实例 → 传入 transcribe_forever; runtime 对每帧调用 .feed(raw),      │
+│    监听启动时 .start() 定时轮询, 停止时 .stop()                           │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -248,8 +247,8 @@
 | `asr_streaming` | paraformer-zh-streaming | GitHub release | 600ms 增量 partial |
 | `asr_final` | qwen3-asr-1.7B [默认] / sensevoice-small | ModelScope / GitHub | 终稿, 可热切换 |
 | `speaker` | eres2netv2 (ev-eres2netv2-zh-16k) | GitHub release | 声纹 embedding |
-| `speech_enhancement` | dfsmn-ans (ModelScope 48k causal) | ModelScope | 段级降噪 (未接线) |
-| `environment` | yamnet (tflite, AudioSet) | GitHub release | 环境声分类 (未接线) |
+| `speech_enhancement` | dfsmn-ans (ModelScope 48k causal) | ModelScope | 段级降噪 + 人声确认输入 |
+| `environment` | yamnet (tflite, AudioSet) | GitHub release | 环境声分类 (旁路, 实时) |
 
 注: paraformer-zh (终稿) 与 qwen3-asr-0.6b 已从 catalog 移除。
 
@@ -301,7 +300,7 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
 | `query_candidate` | 预留给 GUI/LLM 的 query | segment_id, source, text |
 | `voice_sample_added` | 声纹样本收录 | segment_id, tier, core/cache/centroid_count, is_ready |
 | `voice_profile_ready` | 冷启动完成 (core≥3) | sample_count, core_count |
-| `environment_event` | 环境声分类状态变化 (未接线) | timestamp, category, confidence, duration_sec |
+| `environment_event` | 环境声分类状态变化 | timestamp, category, confidence, duration_sec |
 
 ## 本次重构已解决 / 仍存在的架构问题
 
@@ -311,7 +310,7 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
 2. ✅ **说话人切换截断段** → 段内 turn 标记 (不截断) + 段末全段 embedding 融合判决
 3. ⚠️→↩ **他人短促声音开段**: OBSERVING 门内丢弃曾解决, 但 pre-roll 提到
    1200ms 后门控首帧即满, 该路径失效 (见"仍存在"#3); 目前靠 ≥500ms 最小时长、
-   人声确认 (接线后)、empty/filler 过滤兜住短噪声
+   人声确认、empty/filler 过滤兜住短噪声
 4. ✅ **闭合时机单一** → 6 触发器兜底, 且静音类触发器带最小段长门槛防误切短段,
    asr_stall 需同时满足音频真静音 (说话中 ASR 滞后不提前切)
 5. ✅ **"只入我一句还标错人"** → 全段融合: fullseg 与 turns 任一判 user 即 user
@@ -321,12 +320,11 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
    max_new_tokens 按时长伸缩
 
 仍存在 / 进行中:
-1. ⚠️ **人声确认接线中断**: worker 的 FSMN 人声确认 + DFSMN 降噪已写好,
-   但 transcribe_forever 构造 worker 时未传 vad_model/denoiser (=None),
-   当前工作区状态下所有段会在 warm-up 后被 no_speech_detected 丢弃 ——
-   重构进行中的 P0 级断点
-2. ⚠️ **环境感知未接线**: EnvironmentMonitor 已构造但无人 feed/start,
-   不产生 environment_event
+1. ✅→ **人声确认已接线**: worker 的 FSMN 人声确认 + DFSMN 降噪已连通
+   (transcribe_forever 传 vad_model/denoiser_path, 引擎经 registry 解析路径),
+   段级降噪与人声过滤已生效
+2. ✅→ **环境感知已接线**: EnvironmentMonitor 由 runtime .feed(raw)/.start() 驱动,
+   environment_event 正常产生并写入 EnvironmentLog
 3. ⚠️ **OBSERVING 门控失效**: pre-roll 1200ms > 门控 900ms, 门控首帧即触发,
    "门内 VAD 结束即丢弃短促声"的设计路径不再生效 (短噪声后移由
    min_duration/人声确认/empty-filler 过滤); 要么调大门控要么接受现状
@@ -346,9 +344,9 @@ worker 串行完成，采集/VAD 不等待这些计算。语音 `query_candidate
 | 阶段 | 能力 | 技术方案 | 状态 |
 |---|---|---|---|
 | P0 | 说话人门控逻辑修复 | OBSERVING 门控 + turn 标记 + 融合判决 | ✅ 已完成 |
-| P1 | 智能VAD/人声确认 | FSMN 段级人声确认 (raw∨降噪, ≥5%占比) + DFSMN 降噪 | 🚧 代码就绪, 接线中断 |
+| P1 | 智能VAD/人声确认 | FSMN 段级人声确认 (raw∨降噪, ≥5%占比) + DFSMN 降噪 | ✅ 已接线 |
 | P2 | 帧级说话人标记 | 600ms 滑动窗口 embedding + USER/NON_USER 实时标签 | ✅ 已完成 |
-| P3 | 音频事件检测(SED) | YAMNet (AudioSet 521→~15类), 独立旁路轮询 | 🚧 脚手架已建, 未接线 |
+| P3 | 音频事件检测(SED) | YAMNet (AudioSet 521→~15类), 独立旁路轮询 | ✅ 已接线 |
 | P4 | 语义VAD | ASR partial + 意图分类, 判断"是不是在跟我说话" | 待做 |
 | P5 | 多人分离(Diarization) | pyannote/ERes2Net 聚类, 多人对话区分说话人A/B/C | 待做 |
 | P6 | 音源分离 | Conv-TasNet/Demucs (可选), 信号层面人声/噪音/多说话人分离 | 待做 |
