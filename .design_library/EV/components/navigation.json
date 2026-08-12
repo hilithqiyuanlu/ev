@@ -1,0 +1,64 @@
+{
+  "slug": "navigation",
+  "schemaVersion": "2",
+  "name": "Navigation",
+  "category": "navigation",
+  "sourceKind": "from-scratch",
+  "confidence": "high",
+  "semanticTypeCandidates": [
+    {
+      "type": "Sidebar",
+      "evidence": "NavigationSplitView with AppSection list: 输入/历史/词典/模型/声纹/设置"
+    }
+  ],
+  "variantDimensions": {
+    "style": [
+      "sidebar"
+    ],
+    "state": [
+      "default",
+      "selected"
+    ]
+  },
+  "representativeVariants": [
+    {
+      "variantId": "sidebar-item",
+      "whySelected": "macOS sidebar navigation item with SF Symbol and Chinese label",
+      "traits": {
+        "backgroundSelected": "var(--color-primary)",
+        "foregroundSelected": "var(--color-primary-foreground)",
+        "foregroundDefault": "var(--color-foreground)",
+        "icon": "leading system symbol"
+      },
+      "childrenDigest": [
+        "icon",
+        "label"
+      ]
+    }
+  ],
+  "anatomy": [
+    "navigation container",
+    "item row",
+    "icon",
+    "label",
+    "selection highlight"
+  ],
+  "structurePatterns": [
+    "vertical list",
+    "leading icon + text",
+    "selection-driven detail pane"
+  ],
+  "usageHints": {
+    "priorityHint": "high",
+    "placement": "app-level primary navigation"
+  },
+  "doNotInvent": [
+    "top nav bar",
+    "bottom tab bar",
+    "breadcrumbs"
+  ],
+  "unknowns": [
+    "selected item background color on macOS"
+  ],
+  "keyInsightSeed": "A compact macOS sidebar with symbol icons and Chinese labels drives app navigation"
+}

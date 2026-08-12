@@ -346,7 +346,10 @@ class EngineService:
         """刷新注册表状态（从磁盘重新加载）。"""
         self._registry._lock.acquire()
         try:
-            self._registry.state = self._registry._load_state()
+            loaded = self._registry._load_state()
+            self._registry.state = loaded.state
+            if loaded.migrated:
+                self._registry._save_state()
         finally:
             self._registry._lock.release()
         statuses = self._registry.get_all_slot_status()
@@ -1172,7 +1175,6 @@ class EngineService:
                     self._registry,
                     old_slots={
                         "vad": self.settings.models.vad,
-                        "asr_streaming": self.settings.models.asr_streaming,
                         "asr_final": self.settings.models.asr_final,
                         "speaker": self.settings.models.speaker,
                     },

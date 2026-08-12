@@ -1,0 +1,71 @@
+{
+  "slug": "input",
+  "schemaVersion": "2",
+  "name": "Input",
+  "category": "form",
+  "sourceKind": "from-scratch",
+  "confidence": "high",
+  "semanticTypeCandidates": [
+    {
+      "type": "TextField",
+      "evidence": "Manual query input bar with keyboard icon and submit button"
+    }
+  ],
+  "variantDimensions": {
+    "style": [
+      "inline",
+      "rounded-border"
+    ],
+    "size": [
+      "md"
+    ],
+    "state": [
+      "default",
+      "focused",
+      "disabled"
+    ]
+  },
+  "representativeVariants": [
+    {
+      "variantId": "inline-query",
+      "whySelected": "Primary text entry pattern at bottom of HomeView",
+      "traits": {
+        "background": "var(--color-card)",
+        "foreground": "var(--color-foreground)",
+        "border": "1px solid var(--color-border)",
+        "radius": "var(--radius-md)",
+        "icon": "leading keyboard",
+        "action": "trailing submit"
+      },
+      "childrenDigest": [
+        "leading icon",
+        "text field",
+        "trailing submit button"
+      ]
+    }
+  ],
+  "anatomy": [
+    "leading icon",
+    "text field",
+    "trailing action",
+    "border/background"
+  ],
+  "structurePatterns": [
+    "horizontal flex row",
+    "text field expands",
+    "action button anchored right"
+  ],
+  "usageHints": {
+    "priorityHint": "high",
+    "placement": "bottom input bars, query entry, settings forms"
+  },
+  "doNotInvent": [
+    "textarea",
+    "search with filters",
+    "autocomplete dropdown"
+  ],
+  "unknowns": [
+    "focus ring color on macOS"
+  ],
+  "keyInsightSeed": "Input bars combine a leading icon, rounded border, and a circular submit action"
+}

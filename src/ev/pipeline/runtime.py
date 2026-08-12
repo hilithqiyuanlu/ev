@@ -21,7 +21,6 @@ import numpy as np
 from ..asr.adapters import (
     SenseVoiceAdapter,
     SpeakerEmbeddingAdapter,
-    StreamingASRAdapter,
     TranscriptionResult,
     TranscriptionSegment,
     _find_model_root,
@@ -32,7 +31,6 @@ from ..audio.preprocess import AudioPreprocessor, PreprocessParams
 from ..audio.energy_vad import EnergyVAD, EnergyVADParams
 from ..audio.denoise import DenoiseAdapter
 from ..audio.environment import EnvironmentMonitor, EnvEvent
-from ..audio.voice_check import classify_voice
 from ..config import Settings
 from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import (
@@ -78,45 +76,6 @@ def _is_filler_only(text: str) -> bool:
         if not matched:
             return False
     return True
-
-
-def _check_speech_segment(
-    vad_model: VADAdapter | None,
-    audio: np.ndarray,
-    speech_ratio_threshold: float = 0.05,
-) -> bool:
-    """Run FSMN VAD on a complete segment to check if it contains speech.
-
-    Unlike streaming VAD used for endpointing, this is a one-shot check.
-    Returns True if >= speech_ratio_threshold of frames are marked as speech.
-
-    Args:
-        vad_model: A VADAdapter instance (or None, returns False).
-        audio: Full audio segment, float32 numpy array.
-        speech_ratio_threshold: Minimum fraction of audio frames that must
-            contain speech for a positive result (default 5%).
-    """
-    if vad_model is None:
-        return False
-    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
-    if arr.size == 0:
-        return False
-    try:
-        result = vad_model.model.generate(input=arr, chunk_size=200)
-    except Exception:
-        return False
-    if not result or not isinstance(result, (list, tuple)):
-        return False
-    total_speech_ms = 0
-    for item in result:
-        if isinstance(item, dict):
-            for seg in item.get("value", []):
-                if isinstance(seg, (list, tuple)) and len(seg) >= 2:
-                    dur = seg[1] - seg[0]
-                    if dur > 0:
-                        total_speech_ms += dur
-    audio_duration_ms = max(len(arr) / 16000.0 * 1000.0, 1.0)
-    return (total_speech_ms / audio_duration_ms) >= speech_ratio_threshold
 
 
 def _compute_hotword_coverage(text: str, hotword_entries: list[tuple[str, float]]) -> float:
@@ -369,7 +328,6 @@ class SegmentProcessor:
         self,
         settings: Settings,
         store: Store,
-        stream_asr: StreamingASRAdapter,
         speaker: SpeakerEmbeddingAdapter,
         vad_model_id: str,
         voice_profile: VoiceProfileManager,
@@ -381,7 +339,6 @@ class SegmentProcessor:
     ):
         self.settings = settings
         self.store = store
-        self.stream_asr = stream_asr
         self.speaker = speaker
         self.vad_model_id = vad_model_id
         self.voice_profile = voice_profile
@@ -409,12 +366,10 @@ class SegmentProcessor:
         audio: np.ndarray,
         started_at: datetime,
         ended_at: datetime,
-        partial: str = "",
         segment_id: str | None = None,
         raw_audio: np.ndarray | None = None,
         speaker_turns: tuple = (),
         end_trigger: str | None = None,
-        quality_label: str = "ok",
         avg_raw_rms: float = 0.0,
         peak_raw_rms: float = 0.0,
         noise_floor_rms: float = 0.0,
@@ -422,7 +377,6 @@ class SegmentProcessor:
     ) -> SegmentRecord | None:
         segment_id = segment_id or uuid.uuid4().hex
         duration_ms = round(len(audio) * 1000 / self.settings.audio.sample_rate)
-        _is_quality_rejected = quality_label != "ok"
 
         # Compute multi-speaker metadata
         dominant_speaker, contains_user = _compute_dominant_speaker(speaker_turns)
@@ -430,61 +384,18 @@ class SegmentProcessor:
         # Loudness normalize before embedding for robustness to mic distance/volume
         audio_for_embedding = normalize_loudness(audio) if self.settings.speaker.loudness_normalize else audio
 
-        # Quality-rejected segments: skip ASR entirely (no final, no partial fallback).
-        # Still archive WAV + write DB with quality metadata for later analysis.
-        if _is_quality_rejected:
-            final_result = None
-            final_text = ""
-            partial = ""
-            self.output(
-                f"[{segment_id[:8]}] quality rejected: {quality_label} "
-                f"(rms={avg_raw_rms:.5f}, snr={snr_db:.1f}dB, floor={noise_floor_rms:.5f})"
-            )
-        else:
-            final_result = self._final(audio)
-            final_text = final_result.text if final_result else ""
+        # Single ASR: SenseVoice (or Qwen3 if resolved)
+        final_result = self._final(audio)
+        final_text = final_result.text if final_result else ""
+        transcript = final_text
 
-            # --- 热词幻觉检测: 音频模糊时词典词被串联输出 ---
-            # 仅当 hotword logits boosting 活跃时检查 (Qwen3-ASR + 有热词 + 未禁用)
-            if final_text and self.hotword_entries and self.settings.asr.hotword_boosting_enabled:
-                _hotword_density = _compute_hotword_coverage(final_text, self.hotword_entries)
-                _has_function = any(fw in final_text for fw in _ASR_FUNCTION_WORDS)
-                _avg_lp = getattr(final_result, "avg_logprob", None) if final_result else None
-                # 低置信度 (avg_logprob < -2.0) + (高热词覆盖 >55% 或 无功能词)
-                if (
-                    (_avg_lp is not None and _avg_lp < -2.0)
-                    and (_hotword_density > 0.55 or not _has_function)
-                ):
-                    self.output(
-                        f"[{segment_id[:8]}] hotword overload: "
-                        f"logprob={_avg_lp:.2f} density={_hotword_density:.2f} "
-                        f"func_words={_has_function}, falling back"
-                    )
-                    final_text = ""
-
-            # Defensive fallback: if final ASR output is dramatically shorter than the
-            # streaming partial (e.g. the model was token-truncated), prefer the fuller
-            # partial text instead of storing a broken half-transcript.
-            if (
-                final_text
-                and partial
-                and len(final_text.strip()) < int(len(partial.strip()) * 0.6)
-            ):
-                self.output(
-                    f"[{segment_id[:8]}] final ASR truncated: final={len(final_text.strip())}ch "
-                    f"vs partial={len(partial.strip())}ch; falling back to partial text"
-                )
-                final_text = partial
-        transcript = final_text or partial
         # Empty or filler-only segments are discarded (no WAV, no DB, no speaker check).
-        # Quality-rejected segments bypass this — always archive.
-        if not _is_quality_rejected:
-            if not transcript.strip():
-                self.output(f"[{segment_id[:8]}] discarded: empty transcript ({duration_ms}ms)")
-                return None
-            if self.settings.segment.discard_filler_only and _is_filler_only(transcript):
-                self.output(f"[{segment_id[:8]}] discarded: filler-only {transcript!r} ({duration_ms}ms)")
-                return None
+        if not transcript.strip():
+            self.output(f"[{segment_id[:8]}] discarded: empty transcript ({duration_ms}ms)")
+            return None
+        if self.settings.segment.discard_filler_only and _is_filler_only(transcript):
+            self.output(f"[{segment_id[:8]}] discarded: filler-only {transcript!r} ({duration_ms}ms)")
+            return None
 
         # Utterance alignment: use ASR timestamps if available, otherwise proportional mapping
         asr_segments = final_result.segments if final_result and final_result.has_timestamps else None
@@ -565,11 +476,11 @@ class SegmentProcessor:
             duration_ms=duration_ms,
             audio_path=str(wav_path), raw_audio_path=str(raw_path),
             sample_rate=self.settings.audio.sample_rate,
-            channels=self.settings.audio.channels, transcript_raw=partial,
+            channels=self.settings.audio.channels, transcript_raw="",
             transcript_final=final_text, speaker_label=speaker_label, speaker_score=score,
             wake_detected=decision.wake_detected, query_candidate=decision.query_candidate,
             query_text=decision.query_text, vad_model=self.vad_model_id,
-            asr_stream_model=self.settings.models.asr_streaming,
+            asr_stream_model="",
             asr_final_model=self._final_model_label(),
             speaker_model=self.settings.models.speaker,
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -583,7 +494,7 @@ class SegmentProcessor:
             source_type="voice",
             dominant_speaker=dominant_speaker,
             contains_user=contains_user,
-            quality_label=quality_label,
+            quality_label="ok",
             avg_raw_rms=avg_raw_rms,
             peak_raw_rms=peak_raw_rms,
             noise_floor_rms=noise_floor_rms,
@@ -734,8 +645,8 @@ class SegmentJob:
     audio: np.ndarray          # enhanced (preprocessed) audio → ASR/speaker/enhanced wav
     started_at: datetime
     ended_at: datetime
-    partial: str
     segment_id: str
+    partial: str = ""
     speaker_turns: tuple = ()
     raw_audio: np.ndarray | None = None  # raw (unprocessed) audio → archived as .raw.wav for future SE/context
     end_trigger: str | None = None       # vad_endpoint/max_duration/silence_timeout/... → 落库可观测
@@ -750,18 +661,15 @@ class SegmentWorker:
         self,
         settings: Settings,
         paths: dict[str, Path],
-        stream: StreamingASRAdapter,
         speaker: SpeakerEmbeddingAdapter,
         output: Callable[[str], None],
         emit: Callable[[str, dict], None],
         shared_threshold: dict | None = None,
         final_asr_resolver: Callable[[], Path] | None = None,
         denoiser: DenoiseAdapter | None = None,
-        vad_model: VADAdapter | None = None,
     ):
         self.settings = settings
         self.paths = paths
-        self.stream = stream
         self.speaker = speaker
         self.output = output
         self.emit = emit
@@ -772,7 +680,6 @@ class SegmentWorker:
         self._final_asr: SenseVoiceAdapter | Qwen3ASRAdapter | None = None
         self._reload_final = threading.Event()
         self._denoiser: DenoiseAdapter | None = denoiser
-        self._vad_model: VADAdapter | None = vad_model  # 用于人声确认
         self.jobs: queue.Queue[SegmentJob | None] = queue.Queue()
         self.thread = threading.Thread(target=self._run, name="ev-segment-worker", daemon=True)
         self.thread.start()
@@ -826,7 +733,6 @@ class SegmentWorker:
             processor = SegmentProcessor(
                 self.settings,
                 store,
-                self.stream,
                 self.speaker,
                 self.settings.models.vad,
                 voice_profile,
@@ -867,12 +773,10 @@ class SegmentWorker:
                         if _avg_raw_rms > 0 and _noise_floor > 0:
                             _snr_db = float(20.0 * np.log10(max(_avg_raw_rms, 1e-10) / _noise_floor))
 
-                    # --- FSMN 人声确认: 降噪后 + raw 各跑一次, OR 决策 ---
-                    # 替代旧的质量门控 (SNR/电平/voice_check) — 神经网络 VAD 比 DSP 规则更可靠
-                    _quality_label = "ok"
+                    # --- 降噪预处理 (语音路径) ---
+                    # SenseVoice 对中等噪声鲁棒，降噪作为可选质量增强
                     _denoised: np.ndarray | None = None
                     if job.raw_audio is not None and job.raw_audio.size > 0:
-                        # 降噪 (如果可用)
                         _denoiser = self._denoiser
                         if _denoiser is not None and _denoiser.available:
                             try:
@@ -882,43 +786,6 @@ class SegmentWorker:
                                 )
                             except Exception:
                                 _denoised = None
-                        # FSMN 人声确认
-                        _raw_has_speech = _check_speech_segment(
-                            self._vad_model,
-                            job.raw_audio,
-                            self.settings.segment.voice_confirm_min_speech_ratio,
-                        )
-                        _denoised_has_speech = False
-                        if _denoised is not None and _denoised.size > 0:
-                            _denoised_has_speech = _check_speech_segment(
-                                self._vad_model,
-                                _denoised,
-                                self.settings.segment.voice_confirm_min_speech_ratio,
-                            )
-                        _is_voice = _raw_has_speech or _denoised_has_speech
-
-                        if not _is_voice and not job.is_warmup:
-                            # 无人声: voice_check.py 降级为解释信号
-                            _voice_result = classify_voice(
-                                job.raw_audio, int(self.settings.audio.sample_rate)
-                            )
-                            _quality_label = "rejected_non_voice"
-                            self.output(
-                                f"[{job.segment_id[:8]}] rejected: no speech detected "
-                                f"(raw={_raw_has_speech}, denoised={_denoised_has_speech}), "
-                                f"voice_check={_voice_result.get('reasons', [])}"
-                            )
-                            # 丢弃，不入库，不跑 ASR
-                            self.emit(
-                                "segment_discarded",
-                                {
-                                    "segment_id": job.segment_id,
-                                    "reason": "no_speech_detected",
-                                    "quality_label": _quality_label,
-                                },
-                            )
-                            self.jobs.task_done()
-                            continue
 
                     # --- final ASR 模型懒加载 (一次性) ---
                     with self._final_asr_lock:
@@ -934,44 +801,22 @@ class SegmentWorker:
                         _log_memory(f"final-asr loaded ({type(final).__name__})")
                     processor.final_asr = final
 
-                    # --- 推理跳过决策 (仅极短无内容段) ---
-                    # 质量拒绝段已在前面的 FSMN 人声确认中丢弃，此处不再处理
-                    _VERY_SHORT_MS = 800
-                    partial_clean = job.partial.strip() if job.partial else ""
-                    is_very_short = duration_ms < _VERY_SHORT_MS and not job.speaker_turns
-                    has_no_content = (not partial_clean) or _is_filler_only(partial_clean)
-                    _skip_very_short = is_very_short and has_no_content
-
-                    # 选择 ASR 输入音频: 降噪后 > 原始 (降噪后转写质量更好)
+                    # 选择 ASR 输入音频: 降噪后 > 原始
                     _asr_audio = _denoised if _denoised is not None and _denoised.size > 0 else job.audio
-
-                    if _skip_very_short:
-                        # 极短无内容段: 临时绕过 final ASR (process() 会 fallback 到 partial)
-                        processor.final_asr = None
-                        self.output(
-                            f"[{job.segment_id[:8]}] very short no-content "
-                            f"({duration_ms}ms), skipping final ASR"
-                        )
 
                     record = processor.process(
                         _asr_audio,
                         job.started_at,
                         job.ended_at,
-                        job.partial,
-                        job.segment_id,
+                        segment_id=job.segment_id,
                         raw_audio=job.raw_audio,
                         speaker_turns=job.speaker_turns,
                         end_trigger=job.end_trigger,
-                        quality_label="ok",
                         avg_raw_rms=_avg_raw_rms,
                         peak_raw_rms=_peak_raw_rms,
                         noise_floor_rms=job.noise_floor_rms,
                         snr_db=_snr_db,
                     )
-
-                    # 恢复极短段绕过的 final_asr
-                    if _skip_very_short:
-                        processor.final_asr = final
 
                     if record is None:
                         self.emit(
@@ -1021,8 +866,8 @@ async def transcribe_forever(
 
     # Resolve base paths for non-switchable models (vad, streaming, speaker)
     base_paths = resolve_model_paths(settings.models, model_root)
-    # Strictly verify only vad, asr_streaming, speaker — asr_final comes from resolver
-    strict_keys = ("vad", "asr_streaming", "speaker")
+    # Strictly verify only vad, speaker — asr_final comes from resolver
+    strict_keys = ("vad", "speaker")
     checks = verify_models(settings.models, model_root)
     failed = [
         f"{c.key}: {', '.join(c.errors)} ({c.path})"
@@ -1054,7 +899,6 @@ async def transcribe_forever(
     vad_model: VADAdapter | None = None
     energy_vad: EnergyVAD | None = None
     vad: CompositeVAD | None = None
-    stream: StreamingASRAdapter | None = None
     speaker: SpeakerEmbeddingAdapter | None = None
     capture: AudioCapture | None = None
     # 1) 预处理管线 (DC → preemphasis → AGC → NoiseGate)
@@ -1112,7 +956,6 @@ async def transcribe_forever(
         f"fsmn_th={settings.vad.fsmn_threshold}"
     )
 
-    stream = StreamingASRAdapter(str(paths["asr_streaming"]))
     speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
     capture = AudioCapture(settings.audio, device=device, preprocessor=preprocessor)
 
@@ -1130,12 +973,11 @@ async def transcribe_forever(
 
     profile_centroids = load_centroids()
 
-    # 实例化降噪适配器 — 用于 SegmentWorker 的人声确认
+    # 实例化降噪适配器 — 用于语音路径预处理
     denoiser_adapter = DenoiseAdapter(model_path=denoiser_path)
     worker = SegmentWorker(
-        settings, paths, stream, speaker, output, send, shared_threshold,
+        settings, paths, speaker, output, send, shared_threshold,
         final_asr_resolver=final_asr_resolver,
-        vad_model=vad_model,
         denoiser=denoiser_adapter,
     )
     if worker_holder is not None:
@@ -1156,7 +998,6 @@ async def transcribe_forever(
         frames: list[np.ndarray] = []              # RECORDING enhanced
         raw_frames: list[np.ndarray] = []          # RECORDING raw
         started_at: datetime | None = None
-        partial = ""
         current_segment_id: str | None = None
         speaker_turns: list[SpeakerTurn] = []
         current_turn_label: str | None = None
@@ -1168,7 +1009,6 @@ async def transcribe_forever(
         energy_silent_samples = 0  # consecutive samples where EnergyVAD SNR is below threshold
         peak_rms = 0.0  # peak raw RMS during this segment (for relative silence detection)
         relative_silence_samples = 0  # consecutive samples below relative silence threshold
-        last_partial_samples = 0  # samples count when partial was last updated
         local_stop = asyncio.Event()
 
         # 常驻 raw 底噪追踪器 — 跨段持久, IDLE 也在跑, 段间不重置
@@ -1217,15 +1057,14 @@ async def transcribe_forever(
             observe_start_samples = 0
 
         def _reset_recording() -> None:
-            nonlocal frames, raw_frames, started_at, partial, current_segment_id
+            nonlocal frames, raw_frames, started_at, current_segment_id
             nonlocal speaker_turns, current_turn_label, current_turn_start_samples
             nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples
             nonlocal silence_samples, energy_silent_samples, peak_rms
-            nonlocal relative_silence_samples, last_partial_samples
+            nonlocal relative_silence_samples
             frames = []
             raw_frames = []
             started_at = None
-            partial = ""
             current_segment_id = None
             speaker_turns = []
             current_turn_label = None
@@ -1237,7 +1076,6 @@ async def transcribe_forever(
             energy_silent_samples = 0
             peak_rms = 0.0
             relative_silence_samples = 0
-            last_partial_samples = 0
 
         def force_segment_end(trigger_reason: str) -> None:
             nonlocal state
@@ -1246,17 +1084,11 @@ async def transcribe_forever(
                 _reset_observing()
                 _reset_recording()
                 vad.reset()
-                stream.reset()
                 return
             ended_at = datetime.now(timezone.utc)
             total_samples = sum(f.size for f in frames)
             # Close the last speaker turn
             _close_current_turn(total_samples)
-            final_partial = stream.accept(
-                np.empty(0, dtype=np.float32),
-                sr,
-                is_final=True,
-            )
             send("speech_ended", {
                 "segment_id": current_segment_id,
                 "ended_at": ended_at.isoformat(),
@@ -1272,7 +1104,6 @@ async def transcribe_forever(
                         raw_audio=seg_raw,
                         started_at=started_at,
                         ended_at=ended_at,
-                        partial=final_partial,
                         segment_id=current_segment_id,
                         speaker_turns=tuple(speaker_turns),
                         end_trigger=trigger_reason,
@@ -1292,7 +1123,6 @@ async def transcribe_forever(
             _reset_observing()
             _reset_recording()
             vad.reset()
-            stream.reset()
             # Reload centroids after segment ends
             nonlocal profile_centroids
             profile_centroids = load_centroids()
@@ -1344,11 +1174,11 @@ async def transcribe_forever(
 
             def _enter_recording(initial_label: str, initial_frames: list[np.ndarray], initial_raw: list[np.ndarray]) -> None:
                 """Transition from OBSERVING (or cold start) to RECORDING state."""
-                nonlocal state, frames, raw_frames, started_at, partial, current_segment_id
+                nonlocal state, frames, raw_frames, started_at, current_segment_id
                 nonlocal speaker_turns, current_turn_label, current_turn_start_samples
                 nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples
                 nonlocal silence_samples, energy_silent_samples, peak_rms
-                nonlocal relative_silence_samples, last_partial_samples
+                nonlocal relative_silence_samples
                 state = PipelineState.RECORDING
                 frames = list(initial_frames)
                 raw_frames = list(initial_raw)
@@ -1364,10 +1194,6 @@ async def transcribe_forever(
                 energy_silent_samples = 0
                 peak_rms = 0.0
                 relative_silence_samples = 0
-                stream.reset()
-                partial = stream.accept(np.concatenate(frames), sr)
-                # Only start stall timer after we get actual partial content
-                last_partial_samples = sum(f.size for f in frames) if partial else 0
                 send(
                     "speech_started",
                     {
@@ -1376,27 +1202,29 @@ async def transcribe_forever(
                         "speaker_label": initial_label,
                     },
                 )
-                if partial:
-                    send("transcript_partial", {"segment_id": current_segment_id, "text": partial})
                 output(f"[{current_segment_id[:8]}] recording started speaker={initial_label}")
 
-            def _check_speaker_switch() -> None:
-                """Periodic speaker check during RECORDING: record turn changes without truncating.
+            def _check_speaker_switch() -> bool | None:
+                """Periodic speaker check during RECORDING.  On confirmed switch the
+                current segment is ended immediately (方案 A: speaker-triggered split) and the
+                pipeline re-enters OBSERVING for the new speaker.
 
-                Uses asymmetric hysteresis:
-                - non-user → user: 1 confirmation (fast recovery when user comes back)
-                - user → non-user: _SWITCH_CONFIRM_USER_TO_NONUSER confirmations
-                  (conservative: avoid flipping to non-user on a single noisy window)
+                Returns True when a segment split occurred (caller should return from
+                handle_frame because state may have changed to OBSERVING).
                 """
-                nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples, current_turn_label
+                nonlocal state, frames, raw_frames, started_at, current_segment_id
+                nonlocal speaker_turns, current_turn_label, last_speaker_check_samples
+                nonlocal speaker_switch_streak, last_switch_samples
+                nonlocal silence_samples, energy_silent_samples, peak_rms, relative_silence_samples
+                nonlocal observing_frames, observing_raw_frames, observe_start_samples
                 total_samples = sum(f.size for f in frames)
                 interval_samples = _SPEAKER_CHECK_INTERVAL_MS * sr // 1000
                 gate_samples = _OBSERVING_GATE_MS * sr // 1000
                 min_gap_samples = _MIN_SPEAKER_SWITCH_GAP_MS * sr // 1000
                 if total_samples < gate_samples:
-                    return
+                    return None
                 if (total_samples - last_speaker_check_samples) < interval_samples:
-                    return
+                    return None
                 last_speaker_check_samples = total_samples
                 # Build sliding window (last 600ms)
                 window_buf = np.empty(0, dtype=np.float32)
@@ -1412,34 +1240,118 @@ async def transcribe_forever(
                 new_label = "user" if is_user else "non-user"
                 if current_turn_label == new_label:
                     speaker_switch_streak = 0
-                    return
+                    return None
                 speaker_switch_streak += 1
                 # Asymmetric confirmation: faster to recognize user, slower to lose them
                 if new_label == "user":
                     needed = _SWITCH_CONFIRM_NONUSER_TO_USER
                 else:
                     needed = _SWITCH_CONFIRM_USER_TO_NONUSER
-                if speaker_switch_streak >= needed and (total_samples - last_switch_samples) >= min_gap_samples:
-                    # Speaker switch confirmed: close current turn, start new turn
-                    _close_current_turn(total_samples - window_target // 2)
-                    _start_turn(new_label, total_samples - window_target // 2)
-                    last_switch_samples = total_samples
-                    speaker_switch_streak = 0
-                    output(f"speaker turn change: {current_turn_label} → {new_label} (score={score:.3f}, confirm={needed})")
-                    send("speaker_turn_changed", {
+                if not (speaker_switch_streak >= needed and (total_samples - last_switch_samples) >= min_gap_samples):
+                    return None
+                # ── Speaker switch confirmed: split segment ──────────────────
+                old_label = current_turn_label
+                last_switch_samples = total_samples
+                speaker_switch_streak = 0
+                output(f"speaker switch: {old_label} → {new_label} (score={score:.3f}, confirm={needed})")
+                # 1) Find split index in frames
+                switch_sample = total_samples - window_target // 2
+                split_idx = len(frames)  # default: all frames to old
+                cum = 0
+                for i, f in enumerate(frames):
+                    if cum + f.size > switch_sample:
+                        split_idx = i
+                        break
+                    cum += f.size
+                # 2) Split buffers
+                old_frames = frames[:split_idx]
+                new_frames = frames[split_idx:]
+                old_raw = raw_frames[:split_idx]
+                new_raw = raw_frames[split_idx:]
+                # 3) Submit old segment (when long enough)
+                _close_current_turn(sum(f.size for f in old_frames))
+                old_audio = np.concatenate(old_frames) if old_frames else np.empty(0, dtype=np.float32)
+                old_raw_audio = np.concatenate(old_raw) if old_raw else old_audio
+                old_dur_ms = round(len(old_audio) * 1000 / sr)
+                old_total_samples = sum(f.size for f in old_frames)
+                if old_dur_ms >= settings.segment.min_duration_ms and current_segment_id:
+                    # Estimate ended_at: now minus the time the new speaker has been talking
+                    ended_at = datetime.now(timezone.utc) - timedelta(
+                        seconds=(total_samples - old_total_samples) / sr,
+                    )
+                    worker.submit(
+                        SegmentJob(
+                            audio=old_audio,
+                            raw_audio=old_raw_audio,
+                            started_at=started_at,
+                            ended_at=ended_at,
+                            segment_id=current_segment_id,
+                            speaker_turns=tuple(speaker_turns),
+                            end_trigger="speaker_switch",
+                            noise_floor_rms=raw_noise_tracker.floor_rms,
+                            is_warmup=raw_noise_tracker.is_warmup,
+                        )
+                    )
+                    send("speech_ended", {
                         "segment_id": current_segment_id,
-                        "from": current_turn_label,
-                        "to": new_label,
-                        "score": score,
+                        "ended_at": ended_at.isoformat(),
+                        "trigger": "speaker_switch",
                     })
+                    output(
+                        f"[{current_segment_id[:8]}] ended (speaker_switch, "
+                        f"{old_dur_ms}ms, {old_label}→{new_label})"
+                    )
+                else:
+                    # Old segment too short or no segment_id — discard
+                    if current_segment_id:
+                        output(
+                            f"[{current_segment_id[:8]}] discarded: too short on switch "
+                            f"({old_dur_ms}ms)"
+                        )
+                        send("segment_discarded", {
+                            "segment_id": current_segment_id,
+                            "reason": "too_short",
+                            "trigger": "speaker_switch",
+                            "duration_ms": old_dur_ms,
+                        })
+                # 4) Transition to new speaker
+                speaker_turns = []
+                _start_turn(new_label, 0)
+                current_segment_id = None
+                silence_samples = 0
+                energy_silent_samples = 0
+                peak_rms = 0.0
+                relative_silence_samples = 0
+                send("speaker_turn_changed", {
+                    "segment_id": "",  # old segment already submitted
+                    "from": old_label,
+                    "to": new_label,
+                    "score": score,
+                    "segment_split": True,
+                })
+                # 5) Enter OBSERVING (or skip gate if enough audio)
+                new_total = sum(f.size for f in new_frames)
+                if new_total >= gate_samples:
+                    # Already have enough audio for gate — score & enter recording
+                    obs_audio = np.concatenate(new_frames)
+                    sc = _score_window(obs_audio)
+                    label = "user" if sc >= shared_threshold["threshold"] - _OBSERVING_MARGIN else "non-user"
+                    _enter_recording(label, list(new_frames), list(new_raw))
+                else:
+                    state = PipelineState.OBSERVING
+                    observing_frames = list(new_frames)
+                    observing_raw_frames = list(new_raw)
+                    observe_start_samples = new_total  # only future frames count toward gate
+                    output(f"[observing] speaker switch → OBSERVING ({new_total * 1000 // sr}ms pre-fill)")
+                return True  # segment was split — caller should exit handle_frame
 
             async def handle_frame(processed: np.ndarray, raw: np.ndarray) -> None:
                 nonlocal state, observing_frames, observing_raw_frames, observe_start_samples
-                nonlocal frames, raw_frames, started_at, partial, current_segment_id
+                nonlocal frames, raw_frames, started_at, current_segment_id
                 nonlocal speaker_turns, current_turn_label, current_turn_start_samples
                 nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples
                 nonlocal silence_samples, energy_silent_samples, peak_rms
-                nonlocal relative_silence_samples, last_partial_samples
+                nonlocal relative_silence_samples
                 processed_rms = float(np.sqrt(np.mean(processed**2)))
                 raw_rms = float(np.sqrt(np.mean(raw**2)))
                 send("audio_level", {
@@ -1514,15 +1426,9 @@ async def transcribe_forever(
                     if raw_rms > peak_rms:
                         peak_rms = raw_rms
 
-                    candidate = stream.accept(processed, sr)
-                    if candidate and candidate != partial:
-                        partial = candidate
-                        last_partial_samples = total_samples
-                        output(f"partial: {partial}")
-                        send("transcript_partial", {"segment_id": current_segment_id, "text": partial})
-                    # Periodic speaker check (turn change detection)
-                    if profile_centroids:
-                        _check_speaker_switch()
+                    # Periodic speaker check (方案 A: segment split on confirmed switch)
+                    if profile_centroids and _check_speaker_switch():
+                        return  # state changed to OBSERVING, skip rest of this frame
                     # Drive VAD (updates both FSMN and EnergyVAD state)
                     vad_ended = False
                     for boundary in vad.accept(processed, sr):
@@ -1566,12 +1472,6 @@ async def transcribe_forever(
                         else:
                             energy_silent_samples = 0
 
-                    # 4) ASR stall: no new partial for too long = done speaking
-                    # Only trigger after we've gotten at least some partial content
-                    ms_since_last_partial = 0
-                    if last_partial_samples > 0:
-                        ms_since_last_partial = round((total_samples - last_partial_samples) * 1000 / sr)
-
                     # --- Endpoint decision (priority order) ---
                     # 1) Normal VAD end (primary path)
                     if vad_ended:
@@ -1609,18 +1509,6 @@ async def transcribe_forever(
                         output(f"[{current_segment_id[:8]}] force_end: energy_silent ({energy_total_silent_ms:.0f}ms, total={total_duration_ms}ms)")
                         force_segment_end("energy_silent")
                         return
-                    # 6) ASR stall: streaming model stopped producing new text.
-                    #    Only fire when audio is genuinely quiet too — if the speaker is
-                    #    still talking (raw RMS above the silence floor) while ASR lags,
-                    #    that's a model stall, not the end of speech; don't cut early.
-                    if (
-                        ms_since_last_partial >= settings.segment.asr_stall_timeout_ms
-                        and total_duration_ms >= min_dur + 500
-                        and raw_rms < settings.segment.silence_rms_threshold
-                    ):
-                        output(f"[{current_segment_id[:8]}] force_end: asr_stall ({ms_since_last_partial}ms since partial, rms={raw_rms:.4f}, total={total_duration_ms}ms)")
-                        force_segment_end("asr_stall")
-                        return
 
             await handle_frame(*first_pair)
             async for p, r in iterator:
@@ -1652,9 +1540,6 @@ async def transcribe_forever(
                 ended_at = datetime.now(timezone.utc)
                 total_samples = sum(f.size for f in frames)
                 _close_current_turn(total_samples)
-                partial = stream.accept(
-                    np.empty(0, dtype=np.float32), sr, is_final=True
-                )
                 send("speech_ended", {"segment_id": current_segment_id, "ended_at": ended_at.isoformat()})
                 seg_audio = np.concatenate(frames)
                 seg_raw = np.concatenate(raw_frames) if raw_frames else seg_audio
@@ -1676,7 +1561,6 @@ async def transcribe_forever(
                             raw_audio=seg_raw,
                             started_at=started_at,
                             ended_at=ended_at,
-                            partial=partial,
                             segment_id=current_segment_id,
                             speaker_turns=tuple(speaker_turns),
                             end_trigger="stop",
@@ -1690,7 +1574,7 @@ async def transcribe_forever(
     finally:
         worker.close()
         # Explicitly unload all models to free memory (especially PyTorch/MPS)
-        for _obj in (vad, stream, speaker, energy_vad, vad_model):
+        for _obj in (vad, speaker, energy_vad, vad_model):
             if _obj is not None:
                 _safe_unload(_obj)
         # Stop audio capture if still running

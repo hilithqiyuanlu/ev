@@ -1,0 +1,83 @@
+{
+  "slug": "modal",
+  "schemaVersion": "2",
+  "name": "Modal",
+  "category": "overlay",
+  "sourceKind": "from-scratch",
+  "confidence": "medium",
+  "semanticTypeCandidates": [
+    {
+      "type": "Popover",
+      "evidence": "Device picker popover triggered from capsule button in HomeView"
+    },
+    {
+      "type": "Alert",
+      "evidence": "App-level alert presenting error messages with single OK button"
+    }
+  ],
+  "variantDimensions": {
+    "style": [
+      "popover",
+      "alert"
+    ],
+    "size": [
+      "sm",
+      "md"
+    ]
+  },
+  "representativeVariants": [
+    {
+      "variantId": "popover-menu",
+      "whySelected": "Device picker appears as a compact popover with selectable rows",
+      "traits": {
+        "background": "var(--color-popover)",
+        "radius": "var(--radius-xl)",
+        "shadow": "var(--shadow-4)",
+        "padding": "var(--space-1)"
+      },
+      "childrenDigest": [
+        "selectable rows",
+        "checkmark indicator",
+        "empty state"
+      ]
+    },
+    {
+      "variantId": "alert",
+      "whySelected": "Error alert with title, message, and single action",
+      "traits": {
+        "background": "var(--color-card)",
+        "radius": "var(--radius-2xl)",
+        "actions": "stacked buttons"
+      },
+      "childrenDigest": [
+        "title",
+        "message",
+        "action button"
+      ]
+    }
+  ],
+  "anatomy": [
+    "overlay surface",
+    "content area",
+    "action controls",
+    "drop shadow"
+  ],
+  "structurePatterns": [
+    "centered or anchored panel",
+    "vertical stack",
+    "action row"
+  ],
+  "usageHints": {
+    "priorityHint": "medium",
+    "placement": "device selection, confirmations, error alerts"
+  },
+  "doNotInvent": [
+    "full-screen modal",
+    "sheet drawer",
+    "wizard dialog"
+  ],
+  "unknowns": [
+    "popover arrow styling"
+  ],
+  "keyInsightSeed": "Modals are lightweight: small popovers for choices and simple alerts for errors"
+}

@@ -9,7 +9,6 @@ from pathlib import Path
 
 class ModelType(str, Enum):
     VAD = "vad"
-    ASR_STREAMING = "asr_streaming"
     ASR_FINAL = "asr_final"
     SPEAKER = "speaker"
     SPEECH_ENHANCEMENT = "speech_enhancement"
@@ -60,27 +59,12 @@ _DEFAULT_CATALOG: tuple[ModelDefinition, ...] = (
         estimated_size_bytes=2_500_000,
     ),
     ModelDefinition(
-        key="paraformer-zh-streaming",
-        name="Paraformer Streaming",
-        type=ModelType.ASR_STREAMING,
-        source=ModelSource.GITHUB,
-        default_dirname="ev-paraformer-zh-streaming-16k",
-        description="FunASR Paraformer 中文流式识别",
-        github_asset_key="asr_streaming",
-        github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-paraformer-zh-streaming-16k.tar.gz",
-        github_filename="ev-paraformer-zh-streaming-16k.tar.gz",
-        github_size=820157164,
-        github_sha256="4ff1d661db592f59dc869940fb1bec6db10f61f595cbcec0fd1a20d2cb4aebcb",
-        needs_tokens=True,
-        needs_seg_dict=True,
-    ),
-    ModelDefinition(
         key="sensevoice-small",
         name="SenseVoice Small",
         type=ModelType.ASR_FINAL,
         source=ModelSource.GITHUB,
         default_dirname="ev-sensevoice-small",
-        description="SenseVoice Small 多语言终稿识别，支持中英日韩粤",
+        description="SenseVoice Small 多语言自动语音识别，支持中英日韩粤",
         github_asset_key="asr_final",
         github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-sensevoice-small.tar.gz",
         github_filename="ev-sensevoice-small.tar.gz",
@@ -140,12 +124,11 @@ _DEFAULT_CATALOG: tuple[ModelDefinition, ...] = (
     ),
 )
 
-# 槽位默认分配
+# 槽位默认分配（5 槽，流式 ASR 已移除）
 _DEFAULT_SLOTS: dict[str, str] = {
     "vad": "fsmn-vad",
-    "asr_streaming": "paraformer-zh-streaming",
     "speech_enhancement": "dfsmn-ans",
-    "asr_final": "qwen3-asr-1.7b",
+    "asr_final": "sensevoice-small",
     "speaker": "eres2netv2",
     "environment": "yamnet",
 }

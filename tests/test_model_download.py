@@ -39,7 +39,6 @@ def test_download_sha_verify_extract_and_atomic_install(tmp_path, monkeypatch):
     settings = ModelSettings(
         root=tmp_path,
         vad="vad-model",
-        asr_streaming="stream",
         asr_final="final",
         speaker="speaker",
     )

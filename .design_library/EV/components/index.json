@@ -1,0 +1,64 @@
+{
+  "components": [
+    {
+      "slug": "button",
+      "name": "Button",
+      "category": "action",
+      "sourceKind": "from-scratch",
+      "confidence": "high",
+      "variantCount": 18,
+      "priorityHint": "high",
+      "keyInsightSeed": "Capsule buttons with subtle gray fill are the primary action language"
+    },
+    {
+      "slug": "input",
+      "name": "Input",
+      "category": "form",
+      "sourceKind": "from-scratch",
+      "confidence": "high",
+      "variantCount": 6,
+      "priorityHint": "high",
+      "keyInsightSeed": "Input bars combine a leading icon, rounded border, and a circular submit action"
+    },
+    {
+      "slug": "card",
+      "name": "Card",
+      "category": "container",
+      "sourceKind": "from-scratch",
+      "confidence": "high",
+      "variantCount": 8,
+      "priorityHint": "high",
+      "keyInsightSeed": "Cards use near-transparent fills and hairline borders to stay lightweight on macOS"
+    },
+    {
+      "slug": "navigation",
+      "name": "Navigation",
+      "category": "navigation",
+      "sourceKind": "from-scratch",
+      "confidence": "high",
+      "variantCount": 2,
+      "priorityHint": "high",
+      "keyInsightSeed": "A compact macOS sidebar with symbol icons and Chinese labels drives app navigation"
+    },
+    {
+      "slug": "tag",
+      "name": "Tag",
+      "category": "data-display",
+      "sourceKind": "from-scratch",
+      "confidence": "high",
+      "variantCount": 8,
+      "priorityHint": "medium",
+      "keyInsightSeed": "Small high-density tags annotate row metadata with minimal visual weight"
+    },
+    {
+      "slug": "modal",
+      "name": "Modal",
+      "category": "overlay",
+      "sourceKind": "from-scratch",
+      "confidence": "medium",
+      "variantCount": 4,
+      "priorityHint": "medium",
+      "keyInsightSeed": "Modals are lightweight: small popovers for choices and simple alerts for errors"
+    }
+  ]
+}

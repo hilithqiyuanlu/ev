@@ -10,18 +10,15 @@ struct VoiceView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 20) {
                 fingerprintCard
-                Divider()
                 if !model.pendingSamples.isEmpty {
                     pendingSection
-                    Divider()
                 }
                 sampleList
-                Divider()
                 thresholdSection
             }
-            .padding(20)
+            .padding(24)
             .frame(maxWidth: 760)
             .frame(maxWidth: .infinity)
         }
@@ -45,9 +42,17 @@ struct VoiceView: View {
 
     private var fingerprintCard: some View {
         let needsOnboarding = model.needsVoiceOnboarding
-        return HStack(alignment: .top, spacing: 22) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
+        return HStack(alignment: .center, spacing: 20) {
+            FingerprintView(
+                progress: model.onboardingProgress,
+                countText: needsOnboarding && model.onboardingCount > 0
+                    ? "\(model.onboardingCount)/\(model.onboardingTarget)"
+                    : nil,
+                greyed: needsOnboarding && model.voiceProfile.coreCount == 0
+            )
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
                     Text("我的声纹")
                         .font(.title2.bold())
                     voiceStatusBadge
@@ -58,35 +63,42 @@ struct VoiceView: View {
                     .foregroundStyle(.secondary)
 
                 if needsOnboarding {
-                    Text("已录入 \(model.onboardingCount) / \(model.onboardingTarget) 段")
-                        .font(.subheadline.monospacedDigit().weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                }
-
-                HStack(spacing: 20) {
-                    statItem("核心", value: "\(model.voiceProfile.coreCount)/\(model.voiceProfile.coreCount + model.voiceProfile.cacheCount)", color: .orange)
-                    statItem("缓存", value: "\(model.voiceProfile.cacheCount)", color: .secondary)
-                    if model.voiceProfile.centroidCount > 0 {
-                        statItem("质心", value: "\(model.voiceProfile.centroidCount)", color: .blue)
+                    HStack(spacing: 12) {
+                        Text("已录入 \(model.onboardingCount) / \(model.onboardingTarget) 段")
+                            .font(.subheadline.monospacedDigit().weight(.semibold))
+                            .fixedSize()
+                        ProgressView(value: model.onboardingProgress)
+                            .progressViewStyle(.linear)
+                            .frame(maxWidth: 180)
                     }
-                }
-
-                if needsOnboarding {
-                    enrollControl
+                    if model.voiceProfile.coreCount == 0 {
+                        Text("安静环境下用平时音量说话，每段 2–10 秒即可")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    HStack(spacing: 14) {
+                        Text("共 \(model.voiceProfile.sampleCount) 个样本")
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        if !model.autoLearnEnabled {
+                            Text("自动学习已关闭")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.orange)
+                        }
+                    }
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
-            FingerprintView(
-                progress: model.onboardingProgress,
-                greyed: needsOnboarding && model.voiceProfile.coreCount == 0
-            )
-            .frame(width: 112, height: 136)
+            if needsOnboarding {
+                enrollControl
+            }
         }
-        .padding(18)
-        .background(Color.secondary.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardStyle()
     }
 
     private var enrollControl: some View {
@@ -97,11 +109,17 @@ struct VoiceView: View {
                     Button {
                         model.stopVoiceEnrollment()
                     } label: {
-                        Text("完成本段")
-                            .fontWeight(.medium)
+                        HStack(spacing: 6) {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("完成本段")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
                     }
-                    .tint(.red)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(CapsuleButtonStyle(isDestructive: true))
                 }
             } else if model.enrollStatus == "processing" {
                 ProgressView().controlSize(.small)
@@ -110,14 +128,22 @@ struct VoiceView: View {
                 Button {
                     model.startVoiceEnrollment()
                 } label: {
-                    Text(model.voiceProfile.coreCount == 0 ? "开始录入" : "继续录入")
+                    HStack(spacing: 6) {
+                        Image(systemName: model.voiceProfile.coreCount == 0 ? "waveform" : "plus")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(model.voiceProfile.coreCount == 0 ? "开始录入" : "继续录入")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(CapsuleButtonStyle())
                 .disabled(model.enrollStatus == "processing")
             }
 
             if model.enrollStatus == "done" {
-                Text("已添加，继续下一段")
+                Label("已添加，继续下一段", systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
             } else if model.enrollStatus == "failed" {
@@ -126,6 +152,7 @@ struct VoiceView: View {
                 } label: {
                     Text("录入失败，重试")
                         .font(.caption)
+                        .foregroundStyle(.red)
                 }
                 .buttonStyle(.plain)
             }
@@ -167,7 +194,7 @@ struct VoiceView: View {
 
     private var descriptorText: String {
         if model.voiceProfile.coreCount == 0 {
-            return "尚未录制，完成引导后自动学习开启"
+            return "录制 \(model.onboardingTarget) 段语音，建立你的专属声纹"
         }
         if model.voiceProfile.coreCount >= model.onboardingTarget {
             return "已就绪，高置信度语音会持续优化声纹"
@@ -175,57 +202,69 @@ struct VoiceView: View {
         return "继续录制以完成引导"
     }
 
-    private func statItem(_ label: String, value: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
+    // MARK: - Pending samples
+
+    private var pendingSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Text("待确认样本")
+                    .font(.headline)
+                Text("\(model.pendingSamples.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Text("与当前声纹差异较大的样本，确认后纳入参考，否则删除。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(value)
-                .font(.subheadline.monospacedDigit().weight(.semibold))
-                .foregroundStyle(color)
+            ForEach(model.pendingSamples) { sample in
+                pendingRow(sample)
+            }
         }
+    }
+
+    private func pendingRow(_ sample: VoiceSample) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.orange)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(Color.orange.opacity(0.1)))
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(formatDuration(sample.durationMS))
+                        .font(.subheadline.monospacedDigit())
+                    Text("置信度 \(String(format: "%.2f", sample.score))")
+                        .font(.caption)
+                        .foregroundStyle(scoreColor(score: sample.score))
+                }
+                Text(formatDate(sample.createdAt))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            Button("确认") {
+                model.confirmPendingVoiceSample(sample.id)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button("删除", role: .destructive) {
+                model.rejectPendingVoiceSample(sample.id)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .cardStyle()
     }
 
     // MARK: - Sample list
 
-    private var pendingSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("待确认样本")
-                    .font(.headline)
-                Spacer()
-                Text("与声纹距离较大的缓存样本，确认后晋升核心")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(model.pendingSamples) { sample in
-                HStack(spacing: 10) {
-                    Image(systemName: "questionmark.circle")
-                        .foregroundStyle(.orange)
-                    Text(URL(fileURLWithPath: sample.audioPath).lastPathComponent)
-                        .lineLimit(1)
-                    Spacer()
-                    Text("置信度 \(String(format: "%.2f", sample.score))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("确认") {
-                        model.confirmPendingVoiceSample(sample.id)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    Button("删除", role: .destructive) {
-                        model.rejectPendingVoiceSample(sample.id)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-                .padding(.vertical, 6)
-            }
-        }
-    }
-
     private var sampleList: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("样本列表")
                     .font(.headline)
@@ -272,27 +311,24 @@ struct VoiceView: View {
             }
 
             if model.voiceSamples.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "waveform")
-                        .font(.system(size: 34))
-                        .foregroundStyle(.tertiary)
-                    Text("暂无样本")
-                        .font(.headline)
-                    Text("完成上方引导录制，或正常使用 EV 自动收集")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 28)
+                emptySampleState
             } else {
                 if !coreSamples.isEmpty {
-                    tierHeader(title: "核心样本", systemImage: "star.fill", color: .orange, count: coreSamples.count)
+                    tierHeader(
+                        title: "核心样本",
+                        count: coreSamples.count,
+                        subtitle: "高置信度样本，声纹判定的主要参考"
+                    )
                     ForEach(Array(coreSamples.enumerated()), id: \.element.id) { index, sample in
                         sampleRow(sample, index: index, tier: "core")
                     }
                 }
                 if !cacheSamples.isEmpty {
-                    tierHeader(title: "缓存样本", systemImage: "tray", color: .secondary, count: cacheSamples.count)
+                    tierHeader(
+                        title: "缓存样本",
+                        count: cacheSamples.count,
+                        subtitle: "低置信度候选样本，可手动晋升为核心"
+                    )
                     ForEach(Array(cacheSamples.enumerated()), id: \.element.id) { index, sample in
                         sampleRow(sample, index: index, tier: "cache")
                     }
@@ -301,18 +337,26 @@ struct VoiceView: View {
         }
     }
 
-    private func tierHeader(title: String, systemImage: String, color: Color, count: Int) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: systemImage)
-                .foregroundStyle(color)
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-            Text("(\(count))")
+    private var emptySampleState: some View {
+        EmptyStateView("暂无样本，完成上方引导或正常使用自动收集", systemImage: "waveform")
+            .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+    }
+
+    private func tierHeader(title: String, count: Int, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Text("\(count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Text(subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Spacer()
         }
-        .padding(.vertical, 6)
+        .padding(.top, 8)
+        .padding(.bottom, 2)
     }
 
     private func sampleRow(_ sample: VoiceSample, index: Int, tier: String) -> some View {
@@ -333,27 +377,33 @@ struct VoiceView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
                     Text(formatDuration(sample.durationMS))
                         .font(.subheadline.monospacedDigit())
-                    Text("·")
-                        .foregroundStyle(.tertiary)
-                    Text("置信度 \(String(format: "%.2f", sample.score))")
-                        .font(.caption)
-                        .foregroundStyle(scoreColor(score: sample.score))
+                    if let hint = sample.transcriptHint, !hint.isEmpty {
+                        Text(hint)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                     if !sample.audioAvailable {
-                        Text("音频缺失")
+                        Label("音频缺失", systemImage: "exclamationmark.triangle")
                             .font(.caption2)
                             .foregroundStyle(.red)
                     }
                 }
-                Text(formatDate(sample.createdAt))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text(formatDate(sample.createdAt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("置信度 \(String(format: "%.2f", sample.score))")
+                        .font(.caption)
+                        .foregroundStyle(scoreColor(score: sample.score))
+                }
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             if tier == "cache" {
                 Button {
@@ -363,6 +413,7 @@ struct VoiceView: View {
                         .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.borderless)
+                .help("晋升为核心样本")
             }
 
             Button {
@@ -382,9 +433,18 @@ struct VoiceView: View {
                     .frame(width: 28, height: 28)
             }
             .buttonStyle(.borderless)
+            .help("删除样本")
         }
-        .padding(.vertical, 8)
-        .background(isPlaying ? Color.accentColor.opacity(0.06) : Color.clear)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(isPlaying ? Color.accentColor.opacity(0.06) : Color.primary.opacity(0.03))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(isPlaying ? Color.accentColor.opacity(0.15) : Color.primary.opacity(0.04), lineWidth: 0.5)
+                )
+        )
         .contentShape(Rectangle())
     }
 
@@ -406,20 +466,22 @@ struct VoiceView: View {
     // MARK: - Threshold
 
     private var thresholdSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("声纹判定阈值")
                 .font(.headline)
-            HStack(spacing: 12) {
+            Text("判断语音是否来自你本人的敏感度：数值越低越宽松，越高越严格。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 14) {
                 Slider(value: $model.speakerThreshold, in: 0.3...0.8, onEditingChanged: { editing in
                     if !editing { model.saveThresholds() }
                 })
-                Text(String(format: "%.2f", model.speakerThreshold)).monospacedDigit()
+                Text(String(format: "%.2f", model.speakerThreshold))
+                    .font(.subheadline.monospacedDigit())
             }
-            .font(.subheadline)
         }
-        .padding(12)
-        .background(Color.secondary.opacity(0.05))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(16)
+        .cardStyle()
     }
 
     // MARK: - Helpers
@@ -449,42 +511,78 @@ struct VoiceView: View {
     }
 }
 
+// MARK: - Card style
+
+private struct CardStyle: ViewModifier {
+    var fill: Color = Color.primary.opacity(0.03)
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(fill)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
+                    )
+            )
+    }
+}
+
+private extension View {
+    func cardStyle(fill: Color = Color.primary.opacity(0.03)) -> some View {
+        modifier(CardStyle(fill: fill))
+    }
+}
+
 // MARK: - Fingerprint visual
 
 struct FingerprintView: View {
     let progress: Double
+    let countText: String?
     let greyed: Bool
 
-    private let ridges = 5
-
-    private var filledRidges: Int {
+    private var fillFraction: Double {
         guard !greyed else { return 0 }
-        return max(0, min(ridges, Int((progress * Double(ridges)).rounded(.up))))
+        return max(0, min(progress, 1))
     }
 
     var body: some View {
-        Canvas { context, size in
-            let w = size.width
-            let h = size.height
-            let bottom = h * 0.98
-            for i in 0..<ridges {
-                let t = Double(i) / Double(ridges - 1)
-                let archW = w * (0.42 + 0.34 * t)
-                let archH = h * (0.18 + 0.62 * t)
-                let top = h * (0.94 - archH)
-                let x0 = (w - archW) / 2
-                var path = Path()
-                path.move(to: CGPoint(x: x0, y: bottom))
-                path.addQuadCurve(
-                    to: CGPoint(x: x0 + archW, y: bottom),
-                    control: CGPoint(x: x0 + archW / 2, y: top)
-                )
-                let isFilled = i < filledRidges
-                let color: Color = isFilled
-                    ? .accentColor
-                    : Color.secondary.opacity(greyed ? 0.12 : 0.28)
-                context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: 3.4, lineCap: .round))
-            }
+        ZStack {
+            Circle()
+                .stroke(Color.secondary.opacity(0.12), lineWidth: 5)
+            Circle()
+                .trim(from: 0, to: fillFraction)
+                .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.easeOut(duration: 0.3), value: fillFraction)
+            centerContent
+        }
+        .frame(width: 84, height: 84)
+        .padding(14)
+        .background(
+            Circle().fill(Color.primary.opacity(0.03))
+        )
+        .overlay(
+            Circle().stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private var centerContent: some View {
+        if greyed {
+            Image(systemName: "waveform")
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(.tertiary)
+        } else if let countText {
+            Text(countText)
+                .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(.primary)
+        } else {
+            Image(systemName: "person.wave.2")
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(Color.accentColor)
         }
     }
 }

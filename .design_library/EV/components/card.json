@@ -1,0 +1,87 @@
+{
+  "slug": "card",
+  "schemaVersion": "2",
+  "name": "Card",
+  "category": "container",
+  "sourceKind": "from-scratch",
+  "confidence": "high",
+  "semanticTypeCandidates": [
+    {
+      "type": "Card",
+      "evidence": "Query rows and environment status bars use rounded rectangle fills"
+    },
+    {
+      "type": "ListRow",
+      "evidence": "HistoryRow and QueryRow present structured content in rounded rows"
+    }
+  ],
+  "variantDimensions": {
+    "style": [
+      "filled",
+      "outlined"
+    ],
+    "padding": [
+      "sm",
+      "md"
+    ],
+    "state": [
+      "default",
+      "active"
+    ]
+  },
+  "representativeVariants": [
+    {
+      "variantId": "filled-row",
+      "whySelected": "Query list items in HomeView use ultra-subtle primary-opacity fill",
+      "traits": {
+        "background": "rgba(var(--color-foreground-rgb),0.03)",
+        "border": "0.5px solid rgba(var(--color-foreground-rgb),0.04)",
+        "radius": "var(--radius-xl)",
+        "padding": "var(--space-2) var(--space-3)"
+      },
+      "childrenDigest": [
+        "leading icon",
+        "primary text",
+        "metadata row"
+      ]
+    },
+    {
+      "variantId": "status-bar",
+      "whySelected": "Environment awareness bar uses tinted background to show active listening state",
+      "traits": {
+        "background": "rgba(var(--color-primary-rgb),0.06)",
+        "radius": "var(--radius-lg)",
+        "padding": "var(--space-2) var(--space-3)"
+      },
+      "childrenDigest": [
+        "status icon",
+        "label",
+        "confidence value"
+      ]
+    }
+  ],
+  "anatomy": [
+    "rounded container",
+    "background fill",
+    "optional border",
+    "content slot"
+  ],
+  "structurePatterns": [
+    "vertical stack inside rounded rectangle",
+    "horizontal meta row",
+    "leading icon + text"
+  ],
+  "usageHints": {
+    "priorityHint": "high",
+    "placement": "lists, status panels, query results"
+  },
+  "doNotInvent": [
+    "image card",
+    "pricing card",
+    "expandable accordion"
+  ],
+  "unknowns": [
+    "active state transition duration"
+  ],
+  "keyInsightSeed": "Cards use near-transparent fills and hairline borders to stay lightweight on macOS"
+}

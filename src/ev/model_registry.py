@@ -67,12 +67,26 @@ class ModelRegistry:
         self._lock = threading.RLock()
         self._cancel_event = threading.Event()
         self._download_thread: threading.Thread | None = None
-        self.state = self._load_state()
+        loaded = self._load_state()
+        self.state = loaded.state
+        if loaded.migrated:
+            self._save_state()
 
     # ── 持久化 ──────────────────────────────────────────────────────
 
-    def _load_state(self) -> ModelRegistryState:
-        """从磁盘加载注册表状态，不存在则初始化默认值。"""
+    @dataclass
+    class _LoadedState:
+        state: ModelRegistryState
+        migrated: bool
+
+    def _load_state(self) -> _LoadedState:
+        """从磁盘加载注册表状态，不存在则初始化默认值。
+
+        加载后自动修复：
+        1. 移除已废弃的槽位 (如 asr_streaming)
+        2. 补全缺失的新槽位 (如 speech_enhancement, environment)
+        3. 若某槽位指向未安装的模型，但同类型恰好有已安装模型，则自动切换
+        """
         if self.state_path.exists():
             try:
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -84,11 +98,13 @@ class ModelRegistry:
                     k: InstalledModel(**v)
                     for k, v in data.get("installed", {}).items()
                 }
-                return ModelRegistryState(
+                state = ModelRegistryState(
                     installed=installed,
                     slots=slots,
                     version=data.get("version", "1"),
                 )
+                migrated = self._migrate_slots(state)
+                return self._LoadedState(state=state, migrated=migrated)
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -100,7 +116,59 @@ class ModelRegistry:
                 model_key=default_key,
                 enabled=True,
             )
-        return state
+        return self._LoadedState(state=state, migrated=False)
+
+    def _migrate_slots(self, state: ModelRegistryState) -> bool:
+        """迁移槽位至最新定义：移除废弃槽位、补全新槽位、修复指向。
+
+        Returns True if any change was made (caller should persist).
+        """
+        valid_slots = set(get_all_slots())
+        changed = False
+
+        # 1) 移除已废弃的槽位 (如 asr_streaming)
+        for stale in list(state.slots.keys()):
+            if stale not in valid_slots:
+                del state.slots[stale]
+                changed = True
+
+        # 2) 补全缺失的新槽位
+        for slot in valid_slots:
+            if slot not in state.slots:
+                default_key = get_default_slot(slot)
+                state.slots[slot] = SlotAssignment(
+                    slot=slot,
+                    model_key=default_key,
+                    enabled=True,
+                )
+                changed = True
+
+        # 3) 修复指向已卸载模型的槽位
+        installed_keys = set(state.installed.keys())
+        for slot_name, assignment in list(state.slots.items()):
+            if assignment.model_key and assignment.model_key in installed_keys:
+                continue
+            # 查找同类型的已安装模型
+            slot_def = get_definition(
+                assignment.model_key
+            ) if assignment.model_key else None
+            slot_type = slot_def.type if slot_def else None
+            candidates: list[str] = []
+            for key in installed_keys:
+                definition = get_definition(key)
+                if definition is None:
+                    continue
+                if slot_type is not None and definition.type == slot_type:
+                    candidates.append(key)
+            if len(candidates) == 1:
+                state.slots[slot_name] = SlotAssignment(
+                    slot=slot_name,
+                    model_key=candidates[0],
+                    enabled=assignment.enabled,
+                )
+                changed = True
+
+        return changed
 
     def _save_state(self) -> None:
         """持久化注册表状态到磁盘。"""
@@ -753,7 +821,6 @@ def _guess_model_key(slot: str, dirname: str) -> str | None:
     """根据目录名猜测模型 key。"""
     catalog = {
         "ev-fsmn-vad-zh-16k": "fsmn-vad",
-        "ev-paraformer-zh-streaming-16k": "paraformer-zh-streaming",
         "ev-sensevoice-small": "sensevoice-small",
         "ev-eres2netv2-zh-16k": "eres2netv2",
         "qwen3-asr-1.7b": "qwen3-asr-1.7b",
@@ -771,8 +838,7 @@ def def_key_to_model_key(slot: str) -> str | None:
     """将旧槽位名映射到模型 key。"""
     mapping = {
         "vad": "fsmn-vad",
-        "asr_streaming": "paraformer-zh-streaming",
-        "asr_final": "qwen3-asr-1.7b",
+        "asr_final": "sensevoice-small",
         "speaker": "eres2netv2",
     }
     return mapping.get(slot)

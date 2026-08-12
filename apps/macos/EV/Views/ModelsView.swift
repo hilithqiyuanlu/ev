@@ -6,7 +6,6 @@ struct ModelsView: View {
 
     private let typeOrder: [String] = [
         "vad",
-        "asr_streaming",
         "speech_enhancement",
         "asr_final",
         "speaker",
@@ -15,9 +14,8 @@ struct ModelsView: View {
 
     private let typeNames: [String: String] = [
         "vad": "语音活动检测（VAD）",
-        "asr_streaming": "流式识别（流式 ASR）",
         "speech_enhancement": "语音增强/降噪",
-        "asr_final": "终稿识别（终稿 ASR）",
+        "asr_final": "自动语音识别（ASR）",
         "speaker": "声纹识别",
         "environment": "环境感知",
     ]
@@ -113,7 +111,6 @@ struct ModelsView: View {
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            slotSwitch(for: type)
                         }
                         slotIssue(for: type)
 
@@ -123,32 +120,6 @@ struct ModelsView: View {
                     }
                 }
             }
-        }
-    }
-
-    /// 类型标题行右侧的槽位切换：该类型已安装 ≥2 个模型时才显示（当前仅终稿识别有 SenseVoice/Qwen3 两个候选）。
-    /// 样式参考输入页麦克风设备选择器；未分配时默认显示 Qwen3-ASR。
-    @ViewBuilder
-    private func slotSwitch(for type: String) -> some View {
-        let compatible = model.installedModels.filter { installed in
-            guard let def = model.availableModels.first(where: { $0.key == installed.key }) else { return false }
-            return def.type == type
-        }
-        if compatible.count >= 2,
-           let assignment = model.slotAssignments.first(where: { $0.slot == type }) {
-            Picker("", selection: Binding(
-                get: { assignment.modelKey ?? "qwen3-asr-1.7b" },
-                set: { model.setActiveModel(slot: type, modelKey: $0) }
-            )) {
-                ForEach(compatible) { installed in
-                    let name = model.availableModels.first(where: { $0.key == installed.key })?.name ?? installed.key
-                    Text(name).tag(installed.key)
-                }
-            }
-            .pickerStyle(.menu)
-            .controlSize(.small)
-            .fixedSize(horizontal: true, vertical: false)
-            .help("切换 \(typeNames[type, default: type]) 使用的模型")
         }
     }
 

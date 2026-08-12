@@ -1,0 +1,82 @@
+{
+  "slug": "tag",
+  "schemaVersion": "2",
+  "name": "Tag",
+  "category": "data-display",
+  "sourceKind": "from-scratch",
+  "confidence": "high",
+  "semanticTypeCandidates": [
+    {
+      "type": "Tag",
+      "evidence": "Source badges 手动/语音 in query rows with small rounded background"
+    },
+    {
+      "type": "Badge",
+      "evidence": "Quality labels like 信噪比低 and status indicators use color-coded labels"
+    }
+  ],
+  "variantDimensions": {
+    "style": [
+      "filled",
+      "outline"
+    ],
+    "color": [
+      "neutral",
+      "green",
+      "orange",
+      "red"
+    ],
+    "size": [
+      "sm"
+    ]
+  },
+  "representativeVariants": [
+    {
+      "variantId": "source-badge",
+      "whySelected": "Identifies query origin (manual vs voice) inside history rows",
+      "traits": {
+        "background": "rgba(var(--color-foreground-rgb),0.15)",
+        "foreground": "var(--color-foreground)",
+        "radius": "var(--radius-xs)",
+        "padding": "var(--space-0-5) var(--space-1-5)",
+        "fontSize": "var(--font-size-caption)"
+      },
+      "childrenDigest": [
+        "text-label"
+      ]
+    },
+    {
+      "variantId": "status-badge",
+      "whySelected": "Warns about audio quality or marks query candidates",
+      "traits": {
+        "foreground": "var(--color-warning)",
+        "icon": "leading"
+      },
+      "childrenDigest": [
+        "icon",
+        "text-label"
+      ]
+    }
+  ],
+  "anatomy": [
+    "container",
+    "optional icon",
+    "label text"
+  ],
+  "structurePatterns": [
+    "inline inline-flex element",
+    "small rounded rectangle",
+    "icon + compact text"
+  ],
+  "usageHints": {
+    "priorityHint": "medium",
+    "placement": "metadata rows, status lists, inline filters"
+  },
+  "doNotInvent": [
+    "removable chip",
+    "dropdown tag",
+    "avatar tag"
+  ],
+  "unknowns": [],
+  "keyInsightSeed": "Small high-density tags annotate row metadata with minimal visual weight"
+}

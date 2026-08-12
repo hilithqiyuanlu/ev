@@ -4,7 +4,7 @@ import asyncio
 import numpy as np
 
 from ev.config import load_settings
-from ev.asr.adapters import StreamingASRAdapter
+from ev.asr.adapters import SenseVoiceAdapter
 from ev.models import verify_models
 from ev.pipeline import runtime as runtime_module
 from ev.pipeline.runtime import SegmentJob, SegmentProcessor, SegmentWorker
@@ -103,26 +103,6 @@ def test_fsmn_vad_stream_boundaries_and_chunking():
     assert all(call["disable_pbar"] is True for call in model.calls)
 
 
-def test_streaming_asr_uses_600ms_chunks_and_accumulates_partial():
-    class Model:
-        def __init__(self):
-            self.calls = []
-
-        def generate(self, **kwargs):
-            self.calls.append(kwargs)
-            return [{"text": "你好" if len(self.calls) == 1 else "世界"}]
-
-    model = Model()
-    stream = StreamingASRAdapter("stream", model=model)
-    assert stream.accept(np.zeros(4800, dtype=np.float32)) == ""
-    assert stream.accept(np.zeros(4800, dtype=np.float32)) == "你好"
-    assert stream.accept(np.zeros(1600, dtype=np.float32), is_final=True) == "你好世界"
-    assert model.calls[0]["chunk_size"] == [0, 10, 5]
-    assert model.calls[0]["encoder_chunk_look_back"] == 4
-    assert model.calls[0]["decoder_chunk_look_back"] == 1
-    assert model.calls[-1]["is_final"] is True
-
-
 def test_vui_only_sentence_prefix_and_user_gate():
     assert normalize_text(" 小E， 你好 ") == "小E, 你好"
     assert match_wake_prefix("小E，打开灯").query_text == "打开灯"
@@ -196,7 +176,7 @@ def test_sqlite_segment_and_profile(tmp_path):
                 id="seg", started_at=now, ended_at=now, duration_ms=100, audio_path="a.wav",
                 sample_rate=16000, channels=1, transcript_raw="EV hi", transcript_final="EV hi",
                 speaker_label="non-user", wake_detected=True, query_candidate=False,
-                vad_model="vad", asr_stream_model="stream", asr_final_model="final",
+                vad_model="vad", asr_stream_model="", asr_final_model="final",
                 speaker_model="speaker", created_at=now, speaker_score=0.2,
             )
         )
@@ -208,7 +188,7 @@ def test_sqlite_segment_and_profile(tmp_path):
 def test_model_verify_is_offline_and_reports_missing(tmp_path):
     settings = load_settings()
     checks = verify_models(settings.models, tmp_path)
-    assert len(checks) == 4
+    assert len(checks) == 3
     assert all(not item.ok for item in checks)
 
 
@@ -238,7 +218,7 @@ def test_segment_processor_archives_every_segment_and_gates_query(tmp_path, monk
             is_ready=True,
         )
         processor = SegmentProcessor(
-            settings, store, Stream(), Speaker(), settings.models.vad,
+            settings, store, Speaker(), settings.models.vad,
             voice_profile=voice_profile, final_asr=Final(), output=lambda _: None,
         )
         record = processor.process(
@@ -261,7 +241,7 @@ def test_manual_query_history_and_atomic_segment_delete(tmp_path):
                 id="delete-me", started_at=now, ended_at=now, duration_ms=100, audio_path=str(audio),
                 sample_rate=16000, channels=1, transcript_raw="hello", transcript_final="hello",
                 speaker_label="unknown", wake_detected=False, query_candidate=False,
-                vad_model="vad", asr_stream_model="stream", asr_final_model="final",
+                vad_model="vad", asr_stream_model="", asr_final_model="final",
                 speaker_model="speaker", created_at=now,
             )
         )
@@ -305,7 +285,6 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
     worker = SegmentWorker(
         settings,
         {"asr_final": tmp_path / "final"},
-        Stream(),
         Speaker(),
         lambda _: None,
         lambda kind, payload: events.append((kind, payload)),
@@ -395,12 +374,11 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
                 yield f, f
 
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
-    monkeypatch.setattr(runtime_module, "StreamingASRAdapter", Stream)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
     monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
     # Create model directories and monkeypatch _create_final_asr_adapter
-    for d in ["vad", "stream", "final", "speaker"]:
+    for d in ["vad", "final", "speaker"]:
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
     (tmp_path / "final" / "configuration.json").write_text("{}")
     monkeypatch.setattr(
@@ -411,7 +389,6 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
         from ev.models import ModelCheck
         return (
             ModelCheck("vad", tmp_path / "vad", ()),
-            ModelCheck("asr_streaming", tmp_path / "stream", ()),
             ModelCheck("asr_final", tmp_path / "final", ()),
             ModelCheck("speaker", tmp_path / "speaker", ()),
         )
@@ -475,12 +452,12 @@ def test_segment_processor_discards_empty_final(tmp_path, monkeypatch):
     with Store(settings.db_path) as store:
         voice_profile = MockVoiceProfile(centroid=None, centroids=[], sample_count=0, core_count=0, is_ready=False)
         proc = SegmentProcessor(
-            settings, store, Stream(), Speaker(), "vad-test",
+            settings, store, Speaker(), "vad-test",
             voice_profile=voice_profile, final_asr=Final(), output=lambda _: None,
         )
         audio = np.zeros(16000, dtype=np.float32)
         now = datetime.now(timezone.utc)
-        result = proc.process(audio, now, now, partial="", segment_id="empty-test")
+        result = proc.process(audio, now, now, segment_id="empty-test")
         assert result is None
         assert store.list_segments() == []
 
@@ -503,12 +480,12 @@ def test_segment_processor_discards_filler_only(tmp_path, monkeypatch):
     with Store(settings.db_path) as store:
         voice_profile = MockVoiceProfile(centroid=None, centroids=[], sample_count=0, core_count=0, is_ready=False)
         proc = SegmentProcessor(
-            settings, store, Stream(), Speaker(), "vad-test",
+            settings, store, Speaker(), "vad-test",
             voice_profile=voice_profile, final_asr=Final(), output=lambda _: None,
         )
         audio = np.zeros(16000, dtype=np.float32)
         now = datetime.now(timezone.utc)
-        result = proc.process(audio, now, now, partial="", segment_id="filler-test")
+        result = proc.process(audio, now, now, segment_id="filler-test")
         assert result is None
         assert store.list_segments() == []
 
@@ -531,12 +508,12 @@ def test_segment_processor_commits_valid_segment(tmp_path, monkeypatch):
     with Store(settings.db_path) as store:
         voice_profile = MockVoiceProfile(centroid=None, centroids=[], sample_count=0, core_count=0, is_ready=False)
         proc = SegmentProcessor(
-            settings, store, Stream(), Speaker(), "vad-test",
+            settings, store, Speaker(), "vad-test",
             voice_profile=voice_profile, final_asr=Final(), output=lambda _: None,
         )
         audio = np.zeros(16000, dtype=np.float32)
         now = datetime.now(timezone.utc)
-        result = proc.process(audio, now, now, partial="帮我", segment_id="valid-test")
+        result = proc.process(audio, now, now, segment_id="valid-test")
         assert result is not None
         assert result.transcript_final == "帮我打开灯"
         assert len(store.list_segments()) == 1
@@ -603,7 +580,6 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
                 yield f, f
 
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
-    monkeypatch.setattr(runtime_module, "StreamingASRAdapter", Stream)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
     monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
@@ -611,7 +587,6 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
         from ev.models import ModelCheck
         return (
             ModelCheck("vad", tmp_path / "vad", ()),
-            ModelCheck("asr_streaming", tmp_path / "stream", ()),
             ModelCheck("asr_final", tmp_path / "final", ()),
             ModelCheck("speaker", tmp_path / "speaker", ()),
         )
@@ -643,7 +618,7 @@ def test_correction_history_crud(tmp_path):
             sample_rate=16000, channels=1,
             transcript_raw="我想研究强化学", transcript_final="我想研究强化学", speaker_label="user",
             wake_detected=False, query_candidate=True, query_text="我想研究强化学",
-            vad_model="vad", asr_stream_model="stream", asr_final_model="final",
+            vad_model="vad", asr_stream_model="", asr_final_model="final",
             speaker_model="speaker", created_at=now, speaker_score=0.82,
         ))
         # Record a correction

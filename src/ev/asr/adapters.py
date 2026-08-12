@@ -170,59 +170,6 @@ class _FunASR:
         gc.collect()
 
 
-class StreamingASRAdapter(_FunASR):
-    CHUNK_SIZE = [0, 10, 5]
-    ENCODER_LOOK_BACK = 4
-    DECODER_LOOK_BACK = 1
-
-    def __init__(self, model_path: str, model: Any | None = None):
-        super().__init__(model_path, model, disable_update=True)
-        self.cache: dict[str, Any] = {}
-        self._buffer = np.empty(0, dtype=np.float32)
-        self._pieces: list[str] = []
-
-    def accept(self, frame: np.ndarray, sample_rate: int = 16000, is_final: bool = False) -> str:
-        self._buffer = np.concatenate(
-            [self._buffer, np.asarray(frame, dtype=np.float32).reshape(-1)]
-        )
-        chunk_samples = sample_rate * 600 // 1000
-        while self._buffer.size >= chunk_samples:
-            chunk = self._buffer[:chunk_samples]
-            self._buffer = self._buffer[chunk_samples:]
-            self._generate(chunk, sample_rate, False)
-        if is_final and self._buffer.size:
-            chunk = self._buffer
-            self._buffer = np.empty(0, dtype=np.float32)
-            self._generate(chunk, sample_rate, True)
-        return "".join(self._pieces).strip()
-
-    def _generate(self, audio: np.ndarray, sample_rate: int, is_final: bool) -> None:
-        result = self.model.generate(
-            input=audio,
-            cache=self.cache,
-            is_final=is_final,
-            sampling_rate=sample_rate,
-            chunk_size=self.CHUNK_SIZE,
-            encoder_chunk_look_back=self.ENCODER_LOOK_BACK,
-            decoder_chunk_look_back=self.DECODER_LOOK_BACK,
-            disable_pbar=True,
-        )
-        piece = _text(result)
-        if piece:
-            self._pieces.append(piece)
-
-    def reset(self) -> None:
-        self.cache.clear()
-        self._buffer = np.empty(0, dtype=np.float32)
-        self._pieces = []
-
-    def unload(self) -> None:
-        self.cache.clear()
-        self._buffer = np.empty(0, dtype=np.float32)
-        self._pieces = []
-        super().unload()
-
-
 class SenseVoiceAdapter(_FunASR):
     """SenseVoice Small — 多语言终稿 ASR（FunASR 引擎）。"""
 

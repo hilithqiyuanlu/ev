@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Card — EV</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  /* Page scaffold — NOT extracted */
+  body { margin: 0; padding: var(--space-3); background: var(--color-background); font-family: var(--font-body); color: var(--fg); }
+  .row { display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2); }
+  .label { width: 92px; flex-shrink: 0; color: var(--muted); font-size: var(--font-size-caption); text-transform: uppercase; white-space: nowrap; }
+  .divider { border: none; border-top: 1px solid var(--rule); margin: var(--space-3) 0; }
+
+  /* @component-css-start */
+  /* Component definitions — extracted to components.css by deterministic script */
+  .card { display: flex; align-items: center; gap: var(--space-3); width: 100%; min-width: 0; overflow: hidden; transition: filter .15s; }
+  .card-row { background: color-mix(in srgb, var(--fg) 3%, transparent); border: 0.5px solid color-mix(in srgb, var(--fg) 4%, transparent); border-radius: var(--radius-xl); padding: var(--space-2) var(--space-3); }
+  .card-row:hover { filter: brightness(0.97); }
+  .card-status { background: color-mix(in srgb, var(--color-primary) 6%, transparent); border-radius: var(--radius-lg); padding: var(--space-2) var(--space-3); }
+  .card-status:hover { filter: brightness(0.97); }
+  .card-icon { flex-shrink: 0; width: var(--size-icon-md); height: var(--size-icon-md); color: var(--muted); }
+  .card-status .card-icon { color: var(--color-primary); }
+  .card-body { flex: 1; min-width: 0; }
+  .card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-body); line-height: var(--line-height-body); color: var(--fg); }
+  .card-meta { display: flex; align-items: center; gap: var(--space-2); color: var(--muted); font-size: var(--font-size-caption); line-height: var(--line-height-caption); }
+  .card-value { margin-left: auto; color: var(--color-primary); font-size: var(--font-size-body); font-weight: var(--font-weight-h4); white-space: nowrap; }
+  /* @component-css-end */
+</style>
+</head>
+<body>
+  <div class="row"><span class="label">查询项</span><div class="card card-row" data-evidence-sample="filled-row"><img class="card-icon" src="https://cdn.jsdelivr.net/npm/lucide-static@1.8.0/icons/search.svg" width="20" height="20" alt="查询"><div class="card-body"><div class="card-title">查询最近一周能耗数据</div><div class="card-meta"><span>14:32</span><span>已完成</span></div></div></div></div>
+  <hr class="divider">
+  <div class="row"><span class="label">状态栏</span><div class="card card-status" data-evidence-sample="status-bar"><img class="card-icon" src="https://cdn.jsdelivr.net/npm/lucide-static@1.8.0/icons/mic.svg" width="20" height="20" alt="聆听"><div class="card-body"><div class="card-title">正在聆听</div><div class="card-meta">环境音识别中</div></div><span class="card-value">98%</span></div></div>
+</body>
+</html>

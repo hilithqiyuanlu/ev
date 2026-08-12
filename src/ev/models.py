@@ -40,10 +40,9 @@ _WEIGHT_SUFFIXES = (".pt", ".pth", ".bin", ".safetensors", ".onnx", ".ckpt")
 
 
 def specs(settings: ModelSettings) -> tuple[ModelSpec, ...]:
-    """从旧 ModelSettings (4硬编码字段) 生成 spec 列表。"""
+    """从旧 ModelSettings (3硬编码字段) 生成 spec 列表。"""
     return (
         ModelSpec("vad", settings.vad),
-        ModelSpec("asr_streaming", settings.asr_streaming, True, True),
         ModelSpec("asr_final", settings.asr_final, True),
         ModelSpec("speaker", settings.speaker),
     )

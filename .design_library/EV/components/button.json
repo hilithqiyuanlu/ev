@@ -1,0 +1,88 @@
+{
+  "slug": "button",
+  "schemaVersion": "2",
+  "name": "Button",
+  "category": "action",
+  "sourceKind": "from-scratch",
+  "confidence": "high",
+  "semanticTypeCandidates": [
+    {
+      "type": "Button",
+      "evidence": "Primary action trigger with icon+text, e.g. 开始监听/停止监听 in HomeView top bar"
+    },
+    {
+      "type": "IconButton",
+      "evidence": "Borderless icon-only controls in history rows (folder, xmark, pencil)"
+    }
+  ],
+  "variantDimensions": {
+    "style": [
+      "capsule",
+      "borderless",
+      "primary"
+    ],
+    "size": [
+      "sm",
+      "md"
+    ],
+    "state": [
+      "default",
+      "pressed",
+      "disabled"
+    ]
+  },
+  "representativeVariants": [
+    {
+      "variantId": "capsule-default",
+      "whySelected": "Default capsule button used across top bars and device picker trigger",
+      "traits": {
+        "background": "rgba(120,120,128,0.06)",
+        "foreground": "var(--color-secondary)",
+        "radius": "var(--radius-lg)",
+        "padding": "var(--space-2) var(--space-3)",
+        "icon": "leading"
+      },
+      "childrenDigest": [
+        "icon",
+        "text-label"
+      ]
+    },
+    {
+      "variantId": "borderless-icon",
+      "whySelected": "Inline row actions in history and query lists",
+      "traits": {
+        "background": "transparent",
+        "foreground": "var(--color-primary)",
+        "radius": "var(--radius-sm)",
+        "padding": "var(--space-1)"
+      },
+      "childrenDigest": [
+        "icon"
+      ]
+    }
+  ],
+  "anatomy": [
+    "background fill",
+    "icon",
+    "label text",
+    "press feedback"
+  ],
+  "structurePatterns": [
+    "single-row horizontal layout",
+    "icon leading label",
+    "rounded rectangle background"
+  ],
+  "usageHints": {
+    "priorityHint": "high",
+    "placement": "top bars, action bars, inline row actions"
+  },
+  "doNotInvent": [
+    "floating action button",
+    "toggle switch",
+    "segmented control"
+  ],
+  "unknowns": [
+    "exact pressed opacity animation curve"
+  ],
+  "keyInsightSeed": "Capsule buttons with subtle gray fill are the primary action language"
+}

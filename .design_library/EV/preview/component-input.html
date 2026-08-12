@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Input</title>
+  <link rel="stylesheet" href="../colors_and_type.css">
+  <style>
+    /* Page scaffold — NOT extracted */
+    body { margin: 0; padding: var(--space-3); background: var(--color-background); font-family: var(--font-body); font-size: var(--font-size-body); color: var(--color-foreground); }
+    .row { display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-2); flex-wrap: wrap; }
+    .label { width: 92px; flex-shrink: 0; font-size: var(--font-size-caption); color: var(--color-muted-foreground); text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .divider { border: none; border-top: 1px solid var(--color-border); margin: var(--space-3) 0; }
+    /* @component-css-start */
+    /* Component definitions — extracted to components.css by deterministic script */
+    .input { display: inline-flex; align-items: center; gap: var(--space-2); height: var(--size-input); padding: 0 var(--space-3); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-foreground); flex-shrink: 0; min-width: 120px; transition: border-color .15s, box-shadow .15s; }
+    .input:hover { border-color: var(--color-muted-foreground); }
+    .input:focus-within { outline: 2px solid var(--ring); outline-offset: 2px; }
+    .input.disabled { opacity: 0.5; cursor: not-allowed; }
+    .input.disabled .input-field { cursor: not-allowed; }
+    .input-rounded { border-radius: var(--radius-full); }
+    .input-field { flex: 1; min-width: 0; height: 100%; border: none; background: transparent; color: inherit; font: inherit; outline: none; }
+    .input-field::placeholder { color: var(--color-muted-foreground); }
+    .input-icon { width: var(--size-icon-md); height: var(--size-icon-md); flex-shrink: 0; color: var(--color-muted-foreground); }
+    .input-action { display: inline-flex; align-items: center; justify-content: center; width: var(--size-button-sm); height: var(--size-button-sm); flex-shrink: 0; border: none; border-radius: var(--radius-full); background: var(--accent); color: var(--accent-foreground); cursor: pointer; transition: background .15s; }
+    .input-action:hover { background: var(--accent-hover); }
+    .input.disabled .input-action { background: var(--color-border); cursor: not-allowed; }
+    /* @component-css-end */
+  </style>
+</head>
+<body>
+  <div class="row">
+    <span class="label">Inline</span>
+    <div class="input" role="search" data-evidence-sample="inline-query">
+      <img class="input-icon" src="https://cdn.jsdelivr.net/npm/lucide-static@1.8.0/icons/keyboard.svg" width="20" height="20" alt="键盘">
+      <input class="input-field" type="text" placeholder="请输入关键词" aria-label="搜索关键词">
+      <button class="input-action" type="button" aria-label="提交">
+        <img src="https://cdn.jsdelivr.net/npm/lucide-static@1.8.0/icons/send.svg" width="16" height="16" alt="">
+      </button>
+    </div>
+  </div>
+  <div class="row">
+    <span class="label">Disabled</span>
+    <div class="input disabled" role="search" aria-disabled="true" data-evidence-sample="inline-query">
+      <img class="input-icon" src="https://cdn.jsdelivr.net/npm/lucide-static@1.8.0/icons/keyboard.svg" width="20" height="20" alt="键盘">
+      <input class="input-field" type="text" placeholder="请输入关键词" disabled aria-label="搜索关键词">
+      <button class="input-action" type="button" aria-label="提交" disabled>
+        <img src="https://cdn.jsdelivr.net/npm/lucide-static@1.8.0/icons/send.svg" width="16" height="16" alt="">
+      </button>
+    </div>
+  </div>
+  <hr class="divider">
+  <div class="row">
+    <span class="label">Rounded</span>
+    <div class="input input-rounded" data-evidence-sample="rounded-border">
+      <input class="input-field" type="text" placeholder="请输入内容" aria-label="文本输入">
+    </div>
+  </div>
+  <div class="row">
+    <span class="label">Disabled</span>
+    <div class="input input-rounded disabled" aria-disabled="true" data-evidence-sample="rounded-border">
+      <input class="input-field" type="text" placeholder="请输入内容" disabled aria-label="文本输入">
+    </div>
+  </div>
+</body>
+</html>

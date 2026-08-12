@@ -547,3 +547,65 @@ private func timeFromISO(_ iso: String) -> String {
     let end = iso.index(iso.startIndex, offsetBy: 16)
     return String(iso[start..<end])
 }
+
+// MARK: - Voice Samples Sheet
+
+/// 声纹样本管理弹窗（供设置页「管理样本」按钮使用）。
+struct VoiceSamplesSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("声纹样本")
+                    .font(.title3.bold())
+                Spacer()
+                Button("完成") { dismiss() }
+                    .buttonStyle(.bordered)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+
+            Divider()
+
+            if model.voiceSamples.isEmpty {
+                Spacer()
+                Text("暂无样本")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            } else {
+                List {
+                    ForEach(model.voiceSamples) { sample in
+                        HStack {
+                            Image(systemName: sample.tier == "core" ? "star.fill" : "square.stack.3d.up")
+                                .foregroundStyle(sample.tier == "core" ? .orange : .secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(sample.tier == "core" ? "核心样本" : "缓存样本")
+                                    .font(.subheadline.weight(.medium))
+                                if let hint = sample.transcriptHint, !hint.isEmpty {
+                                    Text(hint)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("\(sample.durationMS / 1000)s")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(String(format: "%.0f%%", sample.score * 100))
+                                    .font(.caption)
+                                    .foregroundStyle(sample.score >= 0.7 ? .green : .orange)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .frame(width: 400, height: 420)
+    }
+}

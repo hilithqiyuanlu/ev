@@ -145,7 +145,7 @@ def _insert_segment(store: Store, segment_id: str, wav: Path) -> None:
             wake_detected=False,
             query_candidate=False,
             vad_model="vad",
-            asr_stream_model="stream",
+            asr_stream_model="",
             asr_final_model="final",
             speaker_model="speaker",
             created_at=now,
