@@ -83,7 +83,10 @@ class AudioCapture:
         self._audio = audio
         self._device = device
         self._frame_ms = int(frame_ms)
+        self._target_sr = audio.sample_rate
         self._frame_samples = audio.sample_rate * frame_ms // 1000
+        # 打开流实际使用的采样率；默认等于目标采样率，若设备不支持则回退到其默认值并重采样
+        self._stream_sr = self._target_sr
         # blocksize: 与帧长对齐,避免 PortAudio 内部缓冲区不匹配导致 -9986
         self._blocksize = self._frame_samples
         # 主队列: 归一化后的定长帧 (预处理后, 若挂载 preprocessor)
@@ -143,55 +146,68 @@ class AudioCapture:
                 print(f"[audio] PortAudio status: {status}", file=sys.stderr)
                 self._status_reported = True
         raw = indata[:, 0].copy().astype(np.float32, copy=False)
+        # 若打开流用了非目标采样率, 线性重采样到目标采样率(仍产出定长帧)
+        if self._stream_sr != self._target_sr and raw.size > 0 and raw.size != self._frame_samples:
+            raw = np.interp(
+                np.linspace(0.0, raw.size - 1.0, self._frame_samples),
+                np.arange(raw.size),
+                raw,
+            ).astype(np.float32)
         self._put_both(raw)
 
     def start(self) -> None:
         if self._started:
             return
-        sr = self._audio.sample_rate
         ch = self._audio.channels
 
         # 校验设备参数,必要时回退到默认设备
-        device, warn = _validate_device(self._device, sr, ch)
+        device, warn = _validate_device(self._device, self._target_sr, ch)
         self._warning = warn
         if warn:
             print(f"[audio] warning: {warn}", file=sys.stderr)
 
-        # 尝试打开流;失败时重置 PortAudio 再重试一次 (解决 macOS -9986)
+        # 依次尝试候选采样率: 目标 → 设备默认 → 常见值(蓝牙设备常不支持 16kHz)
         stream = None
         last_err: Exception | None = None
-        for attempt in range(2):
-            try:
-                stream = sd.InputStream(
-                    device=device,
-                    samplerate=sr,
-                    channels=ch,
-                    dtype="float32",
-                    blocksize=self._blocksize,
-                    latency="high",
-                    callback=self._callback,
-                )
-                stream.start()
+        for stream_sr in self._candidate_samplerates(device):
+            self._stream_sr = stream_sr
+            self._blocksize = stream_sr * self._frame_ms // 1000
+            for attempt in range(2):
+                try:
+                    stream = sd.InputStream(
+                        device=device,
+                        samplerate=stream_sr,
+                        channels=ch,
+                        dtype="float32",
+                        blocksize=self._blocksize,
+                        latency="high",
+                        callback=self._callback,
+                    )
+                    stream.start()
+                    break
+                except sd.PortAudioError as exc:
+                    last_err = exc
+                    # 检测 -9986 Internal PortAudio error: args=(message_string, error_code)
+                    is_internal_error = (
+                        (len(exc.args) >= 2 and exc.args[1] == -9986)
+                        or "-9986" in str(exc)
+                    )
+                    if attempt == 0 and is_internal_error:
+                        # Internal PortAudio error: 尝试重置 PA 后端再重试
+                        print(f"[audio] PortAudio internal error (-9986), resetting backend...", file=sys.stderr)
+                        _safe_pa_reset()
+                        # 重置后重新校验设备(设备索引可能在重置后变化)
+                        if self._device is not None:
+                            try:
+                                sd.query_devices(self._device)
+                            except Exception:
+                                device = None
+                        continue
+                    # 非 -9986 或已重试: 换下一个候选采样率
+                    break
+            if stream is not None:
                 break
-            except sd.PortAudioError as exc:
-                last_err = exc
-                # 检测 -9986 Internal PortAudio error: args=(message_string, error_code)
-                is_internal_error = (
-                    (len(exc.args) >= 2 and exc.args[1] == -9986)
-                    or "-9986" in str(exc)
-                )
-                if attempt == 0 and is_internal_error:
-                    # Internal PortAudio error: 尝试重置 PA 后端再重试
-                    print(f"[audio] PortAudio internal error (-9986), resetting backend...", file=sys.stderr)
-                    _safe_pa_reset()
-                    # 重置后重新校验设备(设备索引可能在重置后变化)
-                    if self._device is not None:
-                        try:
-                            sd.query_devices(self._device)
-                        except Exception:
-                            device = None
-                    continue
-                raise
+
         if stream is None:
             raise RuntimeError(
                 f"无法打开音频输入流: {last_err}.\n"
@@ -199,8 +215,35 @@ class AudioCapture:
                 "2) 输入设备是否被其他应用占用; "
                 "3) 尝试重新选择输入设备。"
             ) from last_err
+        if self._stream_sr != self._target_sr:
+            print(f"[audio] 设备以 {self._stream_sr}Hz 采集，重采样至 {self._target_sr}Hz", file=sys.stderr)
         self._stream = stream
         self._started = True
+
+    def _candidate_samplerates(self, device: int | None):
+        """候选采样率(去重): 目标 → 设备默认 → 常见值。"""
+        seen: set[int] = set()
+
+        def _add(sr: float) -> bool:
+            sr_i = int(round(sr))
+            if sr_i > 0 and sr_i not in seen:
+                seen.add(sr_i)
+                return True
+            return False
+
+        if _add(self._target_sr):
+            yield self._target_sr
+        default_sr = self._target_sr
+        if device is not None:
+            try:
+                default_sr = sd.query_devices(device)["default_samplerate"]
+            except Exception:
+                pass
+        if _add(default_sr):
+            yield int(round(default_sr))
+        for sr in (48000, 44100, 32000, 24000, 22050, 8000):
+            if _add(sr):
+                yield sr
 
     def stop(self) -> None:
         if not self._started:

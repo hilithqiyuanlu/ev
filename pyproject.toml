@@ -5,6 +5,7 @@ description = "EV —— 个人语音助手(Phase 1a:ASR 转写 + 用户声纹�
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ai-edge-litert>=1.0,<3",
     "numpy>=2.4.6",
     "sounddevice>=0.5.5",
 ]

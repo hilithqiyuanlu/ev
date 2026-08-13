@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import asyncio
+import json
 
 import numpy as np
 
@@ -180,7 +181,7 @@ def test_sqlite_segment_and_profile(tmp_path):
             )
         )
         assert store.connection.execute("select count(*) from segments").fetchone()[0] == 1
-        assert store.connection.execute("pragma user_version").fetchone()[0] == 17
+        assert store.connection.execute("pragma user_version").fetchone()[0] == 19
         assert store.connection.execute("select count(*) from speaker_samples").fetchone()[0] == 0
 
 
@@ -291,10 +292,8 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
         )
     )
     worker.close()
-    assert [kind for kind, _ in events] == [
-        "segment_processing",
-        "speaker_result",
-        "segment_committed",
+    assert [kind for kind, _ in events if kind != "pipeline_status"] == [
+        "segment_processing", "speaker_result", "segment_committed",
     ]
     with Store(settings.db_path) as store:
         assert store.list_segments()[0]["transcript_final"] == "测试终稿"
@@ -561,6 +560,88 @@ def test_segment_processor_commits_valid_segment(tmp_path, monkeypatch):
         assert len(store.list_segments()) == 1
 
 
+def test_segment_processor_records_only_passed_and_hit_hotwords(tmp_path, monkeypatch):
+    from ev.lexicon import LexiconEntry
+
+    monkeypatch.setenv("EV_DATA_DIR", str(tmp_path / "data"))
+    settings = load_settings()
+
+    class Final:
+        last_hotwords = None
+
+        def transcribe(self, audio, sample_rate, hotwords=None):
+            self.last_hotwords = hotwords
+            return "请打开网易云"
+
+    class Speaker:
+        def embed(self, audio, sample_rate):
+            return np.array([1.0], dtype=np.float32)
+
+    with Store(settings.db_path) as store:
+        cloud = store.add_lexicon_word("网易云")
+        store.add_lexicon_word("强化学习")
+        final = Final()
+        voice_profile = MockVoiceProfile(
+            centroid=None, centroids=[], sample_count=0, core_count=0, is_ready=False
+        )
+        proc = SegmentProcessor(
+            settings, store, Speaker(), "vad-test", voice_profile=voice_profile,
+            final_asr=final, output=lambda _: None,
+            lexicon_entries=store.get_active_lexicon_entries(),
+        )
+        audio = np.zeros(16000, dtype=np.float32)
+        now = datetime.now(timezone.utc)
+        result = proc.process(
+            audio, now, now, segment_id="hotword-test", stream_text="打开网易音乐云"
+        )
+
+        assert result is not None
+        assert final.last_hotwords == ["网易云"]
+        candidates = json.loads(result.hotword_candidates)
+        assert [item["entry_id"] for item in candidates] == [cloud["id"]]
+        assert json.loads(result.hotword_hits) == ["网易云"]
+        rows = {row["word"]: row for row in store.list_lexicon()}
+        assert rows["网易云"]["use_count"] == 1
+        assert rows["强化学习"]["use_count"] == 0
+
+
+def test_segment_processor_omits_hotwords_without_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("EV_DATA_DIR", str(tmp_path / "data"))
+    settings = load_settings()
+
+    class Final:
+        last_hotwords = "unset"
+
+        def transcribe(self, audio, sample_rate, hotwords=None):
+            self.last_hotwords = hotwords
+            return "普通文本"
+
+    class Speaker:
+        def embed(self, audio, sample_rate):
+            return np.array([1.0], dtype=np.float32)
+
+    with Store(settings.db_path) as store:
+        store.add_lexicon_word("网易云")
+        final = Final()
+        proc = SegmentProcessor(
+            settings, store, Speaker(), "vad-test",
+            voice_profile=MockVoiceProfile(
+                centroid=None, centroids=[], sample_count=0, core_count=0, is_ready=False
+            ),
+            final_asr=final, output=lambda _: None,
+            lexicon_entries=store.get_active_lexicon_entries(),
+        )
+        now = datetime.now(timezone.utc)
+        result = proc.process(
+            np.zeros(16000, dtype=np.float32), now, now,
+            segment_id="no-hotword-test", stream_text="普通文本",
+        )
+        assert result is not None
+        assert final.last_hotwords == []
+        assert result.hotword_candidates is None
+        assert result.hotword_hits is None
+
+
 def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
     """A VAD segment shorter than min_duration_ms should be discarded (no worker submit)."""
     monkeypatch.setenv("EV_DATA_DIR", str(tmp_path / "data"))
@@ -719,8 +800,7 @@ def test_correction_manual_add_word_signal(tmp_path):
         assert store.count_corrections() == 1
 
 
-def test_hotword_entries_order_and_system_exclusion(tmp_path):
-    """get_hotword_entries returns weighted pairs, excludes system, orders weight DESC."""
+def test_active_lexicon_entries_exclude_unconfirmed_and_system(tmp_path):
     from ev.store.db import Store
     db = tmp_path / "test.db"
     with Store(db) as store:
@@ -729,8 +809,9 @@ def test_hotword_entries_order_and_system_exclusion(tmp_path):
         store.add_lexicon_word("张三", 5.0, source="manual")
         store.add_lexicon_word("vibe coding", 2.5, source="auto")
         # System words are seeded (小E/小e)
-        entries = store.get_hotword_entries()
-        words = [w for w, _ in entries]
+        entries = store.get_active_lexicon_entries()
+        words = [entry.word for entry in entries]
         assert "小E" not in words  # system excluded
         assert "小e" not in words
-        assert entries == [("张三", 5.0), ("网易云", 3.0), ("vibe coding", 2.5)]
+        assert set(words) == {"张三", "网易云"}
+        assert "vibe coding" not in words

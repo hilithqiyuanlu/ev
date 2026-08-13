@@ -69,6 +69,7 @@ final class AppModel: ObservableObject {
     static let systemDefaultDeviceTag = ""
     private static let selectedDeviceDefaultsKey = "selectedDevice"
     private static let selectedDeviceLabelDefaultsKey = "selectedDeviceLabel"
+    private static let environmentMonitoringDefaultsKey = "environmentMonitoringEnabled"
 
     @Published var engineState: EngineState = .stopped
     @Published var devices: [AudioDevice] = []
@@ -105,8 +106,19 @@ final class AppModel: ObservableObject {
     }
 
     @Published var partialText = ""
+    @Published var partialRevision = 0
     @Published var lastFinalText = ""
+    @Published var pipelinePhase = "idle"
+    @Published var pipelineMessage = ""
+    @Published var pipelineQueueDepth = 0
+    @Published var pipelineElapsedMS = 0
+    @Published var currentSegmentStartedAt: Date?
+    @Published var lastPartialLatencyMS: Int?
     @Published var captureReady = false
+    @Published var environmentStatus: EnvironmentRuntimeStatus = .stopped
+    @Published var environmentMonitoringEnabled = UserDefaults.standard.object(
+        forKey: AppModel.environmentMonitoringDefaultsKey
+    ) as? Bool ?? true
     @Published var envCategory: String = ""
     @Published var envCategoryLabel: String = ""
     @Published var envConfidence: Double = 0
@@ -116,6 +128,9 @@ final class AppModel: ObservableObject {
     @Published var segments: [Segment] = []
     @Published var queries: [QueryItem] = []
     @Published var historyItems: [HistoryItem] = []
+    @Published var environmentEvents: [EnvironmentEvent] = []
+    @Published var environmentDateFilter = ""
+    @Published var isLoadingEnvironmentHistory = false
     @Published var availableModels: [AvailableModel] = []
     @Published var installedModels: [InstalledModel] = []
     @Published var slotAssignments: [SlotAssignment] = []
@@ -162,6 +177,7 @@ final class AppModel: ObservableObject {
     private let permissionProvider: MicrophonePermissionProviding
     private var didInitialRefresh = false
     private var receivedInitialDeviceList = false
+    private var lastDefaultDeviceName: String?
     private var deviceRefreshTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
@@ -177,6 +193,18 @@ final class AppModel: ObservableObject {
 
     var isProcessing: Bool { !processingSegmentIDs.isEmpty }
 
+    var environmentStatusLabel: String {
+        switch environmentStatus {
+        case .disabled: return "环境感知已停用"
+        case .loading, .warmingUp: return "环境感知准备中"
+        case .quiet: return "环境安静"
+        case .active: return envCategoryLabel
+        case .unavailable: return "环境感知不可用"
+        case .error: return "环境感知异常"
+        case .stopped: return ""
+        }
+    }
+
     var canStartListening: Bool {
         allModelsReady && runtimeReady && !devices.isEmpty &&
             microphonePermission != .denied && microphonePermission != .restricted
@@ -186,6 +214,10 @@ final class AppModel: ObservableObject {
         if engineState == .error { return "语音引擎出错" }
         if engineState == .loading { return "正在加载语音模型" }
         if engineState == .stopping { return "正在停止监听" }
+        if pipelinePhase == "streaming" { return "正在识别" }
+        if pipelinePhase == "finalizing" { return "正在完成终稿" }
+        if pipelinePhase == "filtered" { return "已标记为无效" }
+        if pipelinePhase == "committed" { return "已完成" }
         if engineState == .speech { return "检测到语音" }
         if isProcessing { return "正在生成转写" }
         if engineState == .listening { return captureReady ? "正在监听" : "正在连接麦克风" }
@@ -193,6 +225,7 @@ final class AppModel: ObservableObject {
     }
 
     var activityDetail: String {
+        if !pipelineMessage.isEmpty { return pipelineMessage }
         if engineState == .speech { return "继续说话，停顿后会自动生成终稿" }
         if isProcessing { return "正在完成终稿、声纹判断和保存" }
         if engineState == .listening { return "所有检测到的人声都会保存在本机" }
@@ -346,7 +379,25 @@ final class AppModel: ObservableObject {
                 "device": selectedDevice,
                 "threshold": speakerThreshold,
                 "auto_learn": autoLearnEnabled,
+                "environment_enabled": environmentMonitoringEnabled,
             ]
+        )
+    }
+
+    func toggleEnvironmentMonitoring() {
+        environmentMonitoringEnabled.toggle()
+        UserDefaults.standard.set(
+            environmentMonitoringEnabled,
+            forKey: Self.environmentMonitoringDefaultsKey
+        )
+        environmentStatus = environmentMonitoringEnabled ? .loading : .disabled
+        envActive = false
+        envCategory = ""
+        envCategoryLabel = ""
+        envConfidence = 0
+        engine.send(
+            "set_environment_monitoring",
+            payload: ["enabled": environmentMonitoringEnabled]
         )
     }
 
@@ -361,6 +412,15 @@ final class AppModel: ObservableObject {
                 "date": dateFilter,
             ]
         )
+    }
+
+    func loadEnvironmentHistory() {
+        isLoadingEnvironmentHistory = true
+        engine.send("list_environment_events", payload: ["date": environmentDateFilter])
+    }
+
+    func clearEnvironmentHistory() {
+        engine.send("clear_environment_events", payload: ["date": environmentDateFilter])
     }
 
     func submitQuery(_ text: String) {
@@ -471,6 +531,18 @@ final class AppModel: ObservableObject {
 
     func clearAutoLexicon() {
         engine.send("clear_auto_lexicon")
+    }
+
+    func confirmLexiconWord(_ id: String) {
+        engine.send("confirm_lexicon_word", payload: ["id": id])
+    }
+
+    func rejectLexiconWord(_ id: String) {
+        engine.send("reject_lexicon_word", payload: ["id": id])
+    }
+
+    func setLexiconWordStatus(_ id: String, status: String) {
+        engine.send("set_lexicon_word_status", payload: ["id": id, "status": status])
     }
 
     func learnCorrections() {
@@ -650,21 +722,29 @@ final class AppModel: ObservableObject {
             }
         case "device_list":
             let newDevices = event.payload["devices"]?.array?.compactMap(AudioDevice.init) ?? []
-            let previousNames = Set(devices.map(\.name))
             devices = newDevices
             let deviceNames = Set(newDevices.map(\.name))
+            let newDefaultName = newDevices.first(where: \.isDefault)?.name
 
             if receivedInitialDeviceList {
-                // 新接入且成为系统默认 → 自动切到系统默认（跟随新默认设备）
-                if let addedDefault = newDevices.first(where: { !previousNames.contains($0.name) && $0.isDefault }) {
-                    selectedDevice = Self.systemDefaultDeviceTag
-                    lastEngineLog = String(
-                        (lastEngineLog + "已接入新默认输入设备「\(addedDefault.name)」，已切换为使用系统默认\n")
-                            .suffix(8_192)
-                    )
+                // 系统默认设备发生变化（如热插拔新默认麦克风）
+                if newDefaultName != lastDefaultDeviceName {
+                    lastDefaultDeviceName = newDefaultName
+                    if selectedDevice == Self.systemDefaultDeviceTag {
+                        // 跟随系统默认：主动通知后端重新解析默认设备（监听中后端会自动重启采集）
+                        engine.send("set_device", payload: ["device": Self.systemDefaultDeviceTag])
+                        if let name = newDefaultName {
+                            lastEngineLog = String(
+                                (lastEngineLog + "系统默认输入设备变更为「\(name)」，已自动跟随\n")
+                                    .suffix(8_192)
+                            )
+                        }
+                    }
+                    // 用户手动选择了具体设备：不覆盖用户选择
                 }
+
                 // 用户选中的设备被拔出 → 回退到系统默认
-                else if selectedDevice != Self.systemDefaultDeviceTag && !deviceNames.contains(selectedDevice) {
+                if selectedDevice != Self.systemDefaultDeviceTag && !deviceNames.contains(selectedDevice) {
                     let removed = selectedDevice
                     selectedDevice = Self.systemDefaultDeviceTag
                     lastEngineLog = String(
@@ -674,8 +754,9 @@ final class AppModel: ObservableObject {
                 }
                 // 其余情况 —— 不再强制覆盖用户手动选择（避免闪烁）
             } else {
-                // 首次列表到达：校验 UserDefaults 恢复的设备是否仍存在
+                // 首次列表到达：记录当前默认设备，并校验持久化设备是否仍存在
                 receivedInitialDeviceList = true
+                lastDefaultDeviceName = newDefaultName
                 if selectedDevice != Self.systemDefaultDeviceTag && !deviceNames.contains(selectedDevice) {
                     let persisted = selectedDevice
                     selectedDevice = Self.systemDefaultDeviceTag
@@ -695,20 +776,38 @@ final class AppModel: ObservableObject {
             agcGain = event.payload["gain"]?.double ?? 1.0
         case "capture_started":
             captureReady = true
+            environmentStatus = environmentMonitoringEnabled ? .loading : .disabled
             envCategory = ""
             envCategoryLabel = ""
             envActive = false
-        case "environment_event":
+        case "environment_status":
+            environmentStatus = EnvironmentRuntimeStatus(rawValue: event.payload["status"]?.string ?? "") ?? .error
             let cat = event.payload["category"]?.string ?? ""
             envCategory = cat
             envCategoryLabel = envDisplayName(cat)
             envConfidence = event.payload["confidence"]?.double ?? 0
-            envActive = envConfidence > 0.3
+            envActive = environmentStatus == .active
             envLastUpdate = Date()
+        case "environment_monitoring_changed":
+            if let enabled = event.payload["enabled"]?.bool {
+                environmentMonitoringEnabled = enabled
+                UserDefaults.standard.set(enabled, forKey: Self.environmentMonitoringDefaultsKey)
+            }
+        case "environment_event":
+            loadEnvironmentHistory()
         case "speech_started":
             partialText = ""
+            partialRevision = 0
+            currentSegmentStartedAt = Date()
         case "transcript_partial":
-            partialText = event.payload["text"]?.string ?? ""
+            let revision = Int(event.payload["revision"]?.double ?? 0)
+            if revision >= partialRevision {
+                partialRevision = revision
+                partialText = event.payload["text"]?.string ?? ""
+                if let latency = event.payload["latency_ms"]?.double {
+                    lastPartialLatencyMS = Int(latency)
+                }
+            }
         case "segment_processing":
             if let id = event.payload["segment_id"]?.string { processingSegmentIDs.insert(id) }
         case "segment_committed":
@@ -718,6 +817,8 @@ final class AppModel: ObservableObject {
                 processingSegmentIDs.remove(segment.id)
                 lastFinalText = segment.transcript
                 partialText = ""
+                partialRevision = 0
+                currentSegmentStartedAt = nil
                 rebuildHistoryItems()
             }
         case "segment_failed":
@@ -725,6 +826,20 @@ final class AppModel: ObservableObject {
             errorMessage = event.payload["message"]?.string ?? "语音段处理失败"
         case "segment_discarded":
             if let id = event.payload["segment_id"]?.string { processingSegmentIDs.remove(id) }
+            pipelinePhase = "filtered"
+            pipelineMessage = "该片段未形成有效人声"
+            currentSegmentStartedAt = nil
+        case "pipeline_status":
+            pipelinePhase = event.payload["phase"]?.string ?? pipelinePhase
+            pipelineMessage = event.payload["message"]?.string ?? ""
+            pipelineQueueDepth = Int(event.payload["queue_depth"]?.double ?? 0)
+            pipelineElapsedMS = Int(event.payload["elapsed_ms"]?.double ?? 0)
+        case "model_loading":
+            pipelinePhase = "loading"
+            pipelineMessage = "正在加载\(event.payload["component"]?.string ?? "语音模型")"
+        case "model_error":
+            pipelinePhase = "error"
+            pipelineMessage = event.payload["message"]?.string ?? "模型加载失败"
         case "segment_list":
             segments = event.payload["segments"]?.array?.compactMap { $0.object.flatMap(Segment.init) } ?? []
             queries = event.payload["queries"]?.array?.compactMap(QueryItem.init) ?? []
@@ -734,6 +849,11 @@ final class AppModel: ObservableObject {
             loadHistory()
             // Segment deletion preserves samples but clears their segment link.
             loadVoiceSamples()
+        case "environment_event_list":
+            environmentEvents = event.payload["events"]?.array?.compactMap(EnvironmentEvent.init) ?? []
+            isLoadingEnvironmentHistory = false
+        case "environment_events_cleared":
+            loadEnvironmentHistory()
         case "segment_corrected":
             if let changed = event.payload["changed"]?.bool, changed,
                let segmentId = event.payload["segment_id"]?.string {
@@ -908,7 +1028,7 @@ final class AppModel: ObservableObject {
     }
 
     /// 环境音类别 → 中文显示名
-    private func envDisplayName(_ category: String) -> String {
+    func envDisplayName(_ category: String) -> String {
         switch category {
         case "typing": return "键盘打字"
         case "music": return "音乐"

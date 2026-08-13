@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ..lexicon import LexiconEntry
+
 # Chinese stopwords: common function words, particles, pronouns that should not be auto-learned
 _STOPWORDS = frozenset({
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
@@ -99,6 +101,11 @@ class SegmentRecord:
     # 热词命中统计 (v16)
     hotword_density: float | None = None
     hotword_hits: str | None = None
+    hotword_candidates: str | None = None
+    speech_ratio: float | None = None
+    stream_first_partial_ms: int | None = None
+    stream_revision_count: int | None = None
+    final_latency_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -138,7 +145,7 @@ class Store:
               speaker_turns TEXT, utterances TEXT,
               source_type TEXT NOT NULL DEFAULT 'voice',
               dominant_speaker TEXT, contains_user INTEGER NOT NULL DEFAULT 1,
-              hotword_density REAL, hotword_hits TEXT
+              hotword_density REAL, hotword_hits TEXT, hotword_candidates TEXT
             );
             CREATE TABLE IF NOT EXISTS speaker_profiles (
               id TEXT PRIMARY KEY, label TEXT NOT NULL, device_selector TEXT,
@@ -172,6 +179,8 @@ class Store:
               word TEXT NOT NULL UNIQUE,
               weight REAL NOT NULL DEFAULT 2.0,
               source TEXT NOT NULL CHECK(source IN ('manual','auto','system')),
+              status TEXT NOT NULL DEFAULT 'active',
+              confirmed_at TEXT,
               use_count INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -199,7 +208,9 @@ class Store:
         self._migrate_diversity_v15()
         self._migrate_hotword_stats_v16()
         self._migrate_asr_stream_model_v17()
-        self.connection.execute("PRAGMA user_version=17")
+        self._migrate_diagnostics_v18()
+        self._migrate_lexicon_status_v19()
+        self.connection.execute("PRAGMA user_version=19")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -292,6 +303,38 @@ class Store:
         if "asr_stream_model" in cols:
             self.connection.execute("ALTER TABLE segments DROP COLUMN asr_stream_model")
 
+    def _migrate_diagnostics_v18(self) -> None:
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        for name, sql_type in {
+            "speech_ratio": "REAL",
+            "stream_first_partial_ms": "INTEGER",
+            "stream_revision_count": "INTEGER",
+            "final_latency_ms": "INTEGER",
+        }.items():
+            if name not in cols:
+                self.connection.execute(f"ALTER TABLE segments ADD COLUMN {name} {sql_type}")
+
+    def _migrate_lexicon_status_v19(self) -> None:
+        lexicon_cols = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(lexicon)").fetchall()
+        }
+        if "status" not in lexicon_cols:
+            self.connection.execute("ALTER TABLE lexicon ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            self.connection.execute("UPDATE lexicon SET status='pending' WHERE source='auto'")
+        if "confirmed_at" not in lexicon_cols:
+            self.connection.execute("ALTER TABLE lexicon ADD COLUMN confirmed_at TEXT")
+            self.connection.execute(
+                "UPDATE lexicon SET confirmed_at=created_at WHERE source='manual' AND status='active'"
+            )
+        segment_cols = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()
+        }
+        if "hotword_candidates" not in segment_cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN hotword_candidates TEXT")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lexicon_status_source ON lexicon(status, source)"
+        )
+
     def _migrate_binary_classification_v5(self) -> None:
         """Migrate from three-class (user/uncertain/non-user) to binary (user/non-user).
         - Existing 'uncertain' segments are reclassified as 'non-user' (safe default: better to reject than falsely accept)
@@ -311,6 +354,8 @@ class Store:
               word TEXT NOT NULL UNIQUE,
               weight REAL NOT NULL DEFAULT 2.0,
               source TEXT NOT NULL CHECK(source IN ('manual','auto','system')),
+              status TEXT NOT NULL DEFAULT 'active',
+              confirmed_at TEXT,
               use_count INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -390,8 +435,9 @@ class Store:
         for word, weight in system_words:
             self.connection.execute(
                 """
-                INSERT OR IGNORE INTO lexicon (id, word, weight, source, use_count, created_at, updated_at)
-                VALUES (?, ?, ?, 'system', 0, ?, ?)
+                INSERT OR IGNORE INTO lexicon
+                    (id, word, weight, source, status, use_count, created_at, updated_at)
+                VALUES (?, ?, ?, 'system', 'active', 0, ?, ?)
                 """,
                 (uuid.uuid4().hex, word, weight, now, now),
             )
@@ -917,7 +963,7 @@ class Store:
 
     def list_lexicon(self) -> list[dict]:
         rows = self.connection.execute(
-            "SELECT * FROM lexicon ORDER BY CASE source WHEN 'system' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END, weight DESC, use_count DESC"
+            "SELECT * FROM lexicon ORDER BY CASE source WHEN 'system' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END, CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, weight DESC, use_count DESC"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -929,20 +975,23 @@ class Store:
             raise ValueError(f"invalid source: {source}")
         w = max(0.5, min(10.0, float(weight)))
         now = datetime.now(timezone.utc).isoformat()
+        status = "pending" if source == "auto" else "active"
+        confirmed_at = now if source == "manual" else None
         word_id = uuid.uuid4().hex
         with self.connection:
             self.connection.execute(
                 """
-                INSERT OR REPLACE INTO lexicon (id, word, weight, source, use_count, created_at, updated_at)
+                INSERT OR REPLACE INTO lexicon
+                    (id, word, weight, source, status, confirmed_at, use_count, created_at, updated_at)
                 VALUES (
-                    COALESCE((SELECT id FROM lexicon WHERE word=?), ?),
-                    ?, ?, ?,
+                    COALESCE((SELECT id FROM lexicon WHERE word=?), ?), ?, ?, ?, ?, ?,
                     COALESCE((SELECT use_count FROM lexicon WHERE word=?), 0),
                     COALESCE((SELECT created_at FROM lexicon WHERE word=?), ?),
                     ?
                 )
                 """,
-                (cleaned, word_id, cleaned, w, source, cleaned, cleaned, now, now),
+                (cleaned, word_id, cleaned, w, source, status, confirmed_at,
+                 cleaned, cleaned, now, now),
             )
         row = self.connection.execute("SELECT * FROM lexicon WHERE word=?", (cleaned,)).fetchone()
         return dict(row) if row else {}
@@ -963,7 +1012,9 @@ class Store:
             updates.append("weight=?")
             params.append(w)
         if promote_to_manual and existing["source"] != "system":
-            updates.append("source='manual'")
+            updates.append("status='active'")
+            updates.append("confirmed_at=?")
+            params.append(datetime.now(timezone.utc).isoformat())
             updates.append("weight=?")
             params.append(max(float(existing["weight"]), 3.0))
         if not updates:
@@ -992,38 +1043,63 @@ class Store:
             cursor = self.connection.execute("DELETE FROM lexicon WHERE source='auto'")
             return cursor.rowcount
 
-    def get_hotwords_string(self, max_words: int = 80) -> str:
-        """Build space-separated hotword list for the final ASR (Fun-ASR-Nano 待接入).
+    def confirm_lexicon_word(self, word_id: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE lexicon
+                SET status='active', confirmed_at=?, weight=MAX(weight, 3.0), updated_at=?
+                WHERE id=? AND source='auto'
+                """,
+                (now, now, word_id),
+            )
+        return cursor.rowcount > 0
 
-        Returns word list WITHOUT weights, e.g. "word1 word2 word3".
-        Weight suffixes (":3.0") break FunASR's seg_tokenize / prompt parsing.
+    def reject_lexicon_word(self, word_id: str) -> bool:
+        return self.set_lexicon_word_status(word_id, "disabled", auto_only=True)
 
-        Consistent with ``get_hotword_entries``: system words are excluded (wake-word
-        matching is rule-based in vui.py) and ordering is manual > auto, weight DESC.
-        """
-        return " ".join(w for w, _ in self.get_hotword_entries(max_words=max_words))
+    def set_lexicon_word_status(self, word_id: str, status: str, *, auto_only: bool = False) -> bool:
+        if status not in ("active", "disabled"):
+            raise ValueError(f"invalid lexicon status: {status}")
+        now = datetime.now(timezone.utc).isoformat()
+        source_clause = " AND source='auto'" if auto_only else " AND source!='system'"
+        with self.connection:
+            if status == "active":
+                cursor = self.connection.execute(
+                    f"""
+                    UPDATE lexicon
+                    SET status='active',
+                        confirmed_at=CASE WHEN source='auto' THEN COALESCE(confirmed_at, ?) ELSE confirmed_at END,
+                        updated_at=?
+                    WHERE id=?{source_clause}
+                    """,
+                    (now, now, word_id),
+                )
+            else:
+                cursor = self.connection.execute(
+                    f"UPDATE lexicon SET status='disabled', updated_at=? WHERE id=?{source_clause}",
+                    (now, word_id),
+                )
+        return cursor.rowcount > 0
 
-    def get_hotword_entries(self, max_words: int = 80) -> list[tuple[str, float]]:
-        """Return (word, weight) pairs for the final ASR hotword bias (待接入).
-
-        System words (e.g. 小E) are excluded: wake-word matching is rule-based in
-        vui.py, and injecting the wake word into decode bias would nudge mundane
-        speech toward spurious wake words. Ordering: manual > auto, weight DESC.
-        """
+    def get_active_lexicon_entries(self) -> list[LexiconEntry]:
+        """Return every confirmed, enabled non-system term for evidence matching."""
         rows = self.connection.execute(
             """
-            SELECT word, weight FROM lexicon
-            WHERE source != 'system'
-            ORDER BY CASE source WHEN 'manual' THEN 0 ELSE 1 END, weight DESC
-            LIMIT ?
-            """,
-            (max_words,),
+            SELECT id, word, weight, source, status FROM lexicon
+            WHERE status='active' AND source!='system'
+            ORDER BY id
+            """
         ).fetchall()
-        entries = []
+        entries: list[LexiconEntry] = []
         for row in rows:
             w = str(row["word"]).strip()
             if w and _PUNCT_RE.sub("", w):
-                entries.append((w, float(row["weight"])))
+                entries.append(LexiconEntry(
+                    id=str(row["id"]), word=w, weight=float(row["weight"]),
+                    source=str(row["source"]), status=str(row["status"]),
+                ))
         return entries
 
     def learn_high_frequency_words(self, min_count: int = 2, max_auto_words: int = 100) -> int:
@@ -1154,7 +1230,7 @@ class Store:
                 break
             if count < min_corrections or token in existing:
                 continue
-            self.add_lexicon_word(token, weight=1.5, source="auto")
+            self.add_lexicon_word(token, weight=2.0, source="auto")
             existing.add(token)
             added.append(token)
         with self.connection:

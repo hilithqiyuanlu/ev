@@ -46,6 +46,12 @@ class TranscriptionResult:
         return bool(self.segments) and any(s.end_ms > 0 for s in self.segments)
 
 
+@dataclass(frozen=True)
+class StreamingResult:
+    text: str
+    is_final: bool = False
+
+
 def _find_model_root(path: str) -> Path:
     """Find the actual model directory containing config files.
 
@@ -206,11 +212,69 @@ class FunASRNanoAdapter(_FunASR):
             disable_update=True,
         )
 
-    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> TranscriptionResult:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        hotwords: list[str] | None = None,
+    ) -> TranscriptionResult:
         import torch
 
         # FunASRNano.generate_chatml 只识别 str 路径或 torch.Tensor（不识别 numpy），
         # 故将 numpy 转成 Tensor 走内存音频分支，避免为每个段落盘临时 WAV。
         tensor = torch.from_numpy(audio).float()
-        result = self.model.generate(input=tensor, disable_pbar=True)
+        kwargs: dict[str, Any] = {"disable_pbar": True}
+        if hotwords:
+            # Fun-ASR-Nano 官方热词: list[str] 注入 prompt（get_prompt 拼接"热词列表：[...]"），
+            # 属模型级引导（解码前），比文本级后处理更自然。权重仅影响排序（weight DESC 已排好）。
+            kwargs["hotwords"] = [str(w) for w in hotwords]
+        result = self.model.generate(input=tensor, **kwargs)
         return TranscriptionResult(text=_text(result))
+
+
+class StreamingASRAdapter(_FunASR):
+    """Paraformer online adapter with segment-scoped cache."""
+
+    def __init__(self, model_path: str, model: Any | None = None):
+        super().__init__(model_path, model, disable_update=True)
+        self.cache: dict[str, Any] = {}
+        self._text = ""
+
+    def transcribe_chunk(
+        self,
+        frame: np.ndarray,
+        sample_rate: int = 16000,
+        *,
+        is_final: bool = False,
+    ) -> StreamingResult:
+        audio = np.asarray(frame, dtype=np.float32).reshape(-1)
+        result = self.model.generate(
+            input=audio,
+            sampling_rate=sample_rate,
+            cache=self.cache,
+            is_final=is_final,
+            chunk_size=[0, 10, 5],
+            encoder_chunk_look_back=4,
+            decoder_chunk_look_back=1,
+            disable_pbar=True,
+        )
+        chunk_text = _text(result)
+        if chunk_text:
+            # FunASR online versions may return either the full hypothesis or
+            # only the newly decoded suffix.
+            if chunk_text.startswith(self._text):
+                self._text = chunk_text
+            elif not self._text.endswith(chunk_text):
+                self._text += chunk_text
+        output = StreamingResult(text=self._text, is_final=is_final)
+        if is_final:
+            self.reset()
+        return output
+
+    def reset(self) -> None:
+        self.cache.clear()
+        self._text = ""
+
+    def unload(self) -> None:
+        self.reset()
+        super().unload()

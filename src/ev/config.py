@@ -105,6 +105,17 @@ class AsrSettings:
     """
 
 
+@dataclass(frozen=True)
+class QualitySettings:
+    low_level_rms: float = 0.001
+    low_peak_rms: float = 0.004
+    low_snr_db: float = 1.0
+    borderline_snr_db: float = 4.0
+    min_speech_ratio: float = 0.18
+    borderline_speech_ratio: float = 0.35
+    min_stable_ms: int = 300
+
+
 
 @dataclass(frozen=True)
 class VuiSettings:
@@ -158,6 +169,7 @@ class Settings:
     segment: SegmentSettings
     voice_learning: VoiceLearningSettings
     asr: AsrSettings
+    quality: QualitySettings
 
     @property
     def models_dir(self) -> Path:
@@ -214,6 +226,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
     vui_raw = raw.get("vui", {})
     segment_raw = raw.get("segment", {})
     voice_learning_raw = raw.get("voice_learning", {})
+    quality_raw = raw.get("quality", {})
     data_dir = Path(
         os.environ.get("EV_DATA_DIR", raw.get("paths", {}).get("data_dir", "data"))
     )
@@ -339,4 +352,13 @@ def load_settings(config_path: Path | None = None) -> Settings:
             min_interval_sec=float(voice_learning_raw.get("min_interval_sec", 30.0)),
         ),
         asr=AsrSettings(),
+        quality=QualitySettings(
+            low_level_rms=float(quality_raw.get("low_level_rms", 0.001)),
+            low_peak_rms=float(quality_raw.get("low_peak_rms", 0.004)),
+            low_snr_db=float(quality_raw.get("low_snr_db", 1.0)),
+            borderline_snr_db=float(quality_raw.get("borderline_snr_db", 4.0)),
+            min_speech_ratio=float(quality_raw.get("min_speech_ratio", 0.18)),
+            borderline_speech_ratio=float(quality_raw.get("borderline_speech_ratio", 0.35)),
+            min_stable_ms=int(quality_raw.get("min_stable_ms", 300)),
+        ),
     )

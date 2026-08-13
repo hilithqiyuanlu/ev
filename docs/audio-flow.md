@@ -6,6 +6,10 @@
 > 的完整输入链路。声纹细节见 [voiceprint.md](./voiceprint.md)，
 > 声纹学习机制见 [voice-learning.md](./voice-learning.md)，
 > 词典/热词机制见 [dictionary.md](./dictionary.md)。
+>
+> 维护规则：凡修改音频采集、预处理、VAD、流式/终稿 ASR、质量判断、声纹、
+> 环境声旁路、事件协议、数据库诊断字段或实时状态 UI，必须在同一次开发中同步
+> 更新本文档，并以当前代码和测试结果为准。
 
 ## 目标架构：三层
 
@@ -16,18 +20,19 @@ EV 的语音输入被拆成三层，各司其职：
    持续感知「是否有人声、是谁、什么环境」，只产出轻量信号，不产出文本。
    VAD (FSMN + EnergyVAD) · 声纹 (ERes2NetV2) · 环境 (YAMNet) · 降噪 (DFSMN-ANS)
 
-② 终稿理解层  —— 已实现 ——
-   高质量终稿转写 (SenseVoice Small)，服务 LLM：段结束后一次性产出
-   准确、带标点的文本。非自回归模型，拿到完整音频才一次输出。
-   由 `SegmentWorker` 懒加载，`_create_final_asr_adapter()` 按 config 自动检测
-   适配器（SenseVoiceAdapter / Qwen3ASRAdapter）。
+② 流式转写层 + 终稿理解层  —— 已实现 ——
+   Paraformer Streaming 在 RECORDING 内持续输出 partial 字幕；
+   高质量终稿转写 (Fun-ASR-Nano-2512)，服务 LLM：段结束后一次性产出
+   准确、带标点的文本。speech-LLM 自回归模型，拿到完整音频才一次输出。
+   流式 ASR 与终稿 ASR 都在监听会话启动阶段预热；终稿失败时保留 partial，
+   通过 `model_error` 明确通知客户端。
 
 ③ 业务理解层  —— Phase 3 预留 ——
    把 ② 的文本喂给业务逻辑（意图理解 / agent / 工具调用）。
 ```
 
-> 关键设计原则：**ASR 是离线终稿模型，段结束后才出文本。**
-> 实时信号交给感知层（VAD/声纹/环境），文本转写交给终稿层，二者分工明确。
+> 关键设计原则：**流式 ASR 负责低延迟字幕，终稿 ASR 负责段结束后的高质量文本。**
+> 环境声仍只读取 raw 音频，不经过语音降噪或任一语音 ASR。
 
 ---
 
@@ -115,46 +120,57 @@ EV 的语音输入被拆成三层，各司其职：
 │ ⑥ 后台串行 worker (SegmentWorker → SegmentProcessor.process)                │
 │    单线程队列逐段处理, 采集/VAD 不等待                                       │
 │                                                                             │
-│  6.1 人声确认: DFSMN 降噪 + FSMN one-shot, OR 决策                           │
+│  6.1 降噪与信号统计:                                                        │
 │      · DenoiseAdapter (DFSMN-ANS) 对 raw 段降噪 → denoised                  │
 │        (16k↔48k 重采样; 依赖 modelscope[framework]+speechbrain, 未装则静默│
 │         禁用并在启动时输出 [denoise] 提示)                                  │
-│      · 语音帧占比 ≥5% 才算有人声; raw 与 denoised 各跑一次                    │
-│      · 无人声且过 warm-up → discard (no_speech_detected)                     │
+│      · raw 音频计算 avg/peak RMS、noise floor 与 SNR                        │
+│      · RECORDING 内累计 VAD active 帧，形成 speech_ratio                    │
+│      · 环境声继续消费 raw 帧，不读取 denoised                               │
 │                                                                             │
-│  6.2 终稿 ASR: ✅ 已接入 (Fun-ASR-Nano-2512, speech-LLM)                    │
+│  6.2 流式 ASR: ✅ 已接入 (Paraformer Streaming)                             │
+│      · 每个语音段独立维护 cache，约每200ms发送去重 partial                   │
+│      · 不注入热词，发送 revision；段结束 flush 并清理 cache                  │
+│      · 记录 stream_first_partial_ms / stream_revision_count                  │
+│                                                                             │
+│  6.3 终稿 ASR: ✅ 已接入 (Fun-ASR-Nano-2512, speech-LLM)                    │
 │      · SegmentWorker.final_asr_factory 钩子, service.py 注入 FunASRNanoAdapter│
 │      · numpy → torch.Tensor 内存分支 generate, 不落盘临时 WAV                 │
-│      · 段结束后整段转写, 无流式 partial                                       │
-│      · 懒加载: 首个非跳过段才加载, 运行时热切换 (reload_final_asr)            │
+│      · 监听会话启动阶段预热，段结束后整段转写                             │
+│      · 记录 final_latency_ms；加载失败通过 model_error 暴露                 │
 │      · 输入音频: 降噪后 denoised 优先, 否则用 processed                      │
 │                                                                             │
-│  6.3 段过滤:                                                                 │
-│      · final 为空 → discard (empty)                                          │
-│      · 纯语气词 → discard (filler)                                           │
+│  6.4 质量评估与段过滤:                                                       │
+│      · 基于 raw RMS / peak / noise floor / SNR / speech_ratio                 │
+│      · 结合 partial 稳定性，输出 ok/borderline/rejected_*                    │
+│      · 无效段仍保存 WAV 与历史记录，标红显示淘汰原因                         │
+│      · 无效段不生成 Query、不计热词、不进入自动声纹学习                      │
+│      · borderline 自动样本只进入 cache，手动核心样本不受影响                 │
 │                                                                             │
-│  6.4 utterance 对齐 (_align_utterances):                                    │
+│  6.5 utterance 对齐 (_align_utterances):                                    │
 │      · 有真实时间戳 → 按句切分                                               │
 │      · 无时间戳 → 标点切句 + 字符比例映射                                    │
 │      · 每句按时间中点落进 speaker_turns → 标 user/non-user                   │
 │                                                                             │
-│  6.5 声纹识别 (融合判决, 全段 embedding 为主):                              │
+│  6.6 声纹识别 (融合判决, 全段 embedding 为主):                              │
 │      fullseg=user → user; fullseg=non-user 但 turns 含 user → user;         │
 │      都 non-user → non-user; 冷启动全 user                                  │
 │                                                                             │
-│  6.6 唤醒词与 query 决策 (vui.py):                                          │
+│  6.7 唤醒词与 query 决策 (vui.py):                                          │
 │      · 句首"小E": 前缀剥离, 同音容错                                         │
 │      · query_candidate 由融合后的段级 dominant_speaker 门控                  │
 │      · 冷启动额外要求: 唤醒词后 query ≥ 2 字                                 │
 │                                                                             │
-│  6.7 自动声纹学习: 三档分级 (≥0.70 core / 0.40-0.70 cache / <0.40 拒收)     │
+│  6.8 自动声纹学习: 三档分级 (≥0.70 core / 0.40-0.70 cache / <0.40 拒收)     │
 │      (完整机制见 voice-learning.md)                                         │
 │                                                                             │
-│  6.8 热词词典: system > manual > auto (≤80词); 命中统计随段落库                │
-│      (hotword_density / use_count); 消费未接入 — Fun-ASR-Nano 不透传热词,      │
-│      原拼音后处理已移除 (优化方向见 dictionary-hotword-notes.md)               │
+│  6.9 热词词典: 证据触发                                                     │
+│      · 流式 ASR 不注入热词；只使用流式文本作为首遍证据                     │
+│      · 全量 active 非系统词参与保守字形/顺序检索，最多选择 8 个候选         │
+│      · 无证据时终稿不传 hotwords；自动词须人工确认后才能参与                │
+│      · 落库实际候选；只统计实际传入且最终文本命中的候选词                   │
 │                                                                             │
-│  6.9 双 WAV 存档 + SQLite:                                                     │
+│  6.10 双 WAV 存档 + SQLite:                                                │
 │      · {id}.wav → 降噪后 denoised (降噪不可用=前端 processed)                  │
 │      · {id}.raw.wav → raw 原始 (留作未来重处理/上下文)                         │
 │      · 声纹样本 voice_samples/{id}.wav = 高置信 user 段 (decouple)             │
@@ -169,9 +185,10 @@ EV 的语音输入被拆成三层，各司其职：
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─ 旁路: 环境感知 ─────────────────────────────────────────────────────────────┐
-│ EnvironmentMonitor (audio/environment.py): YAMNet tflite (AudioSet 521     │
-│ 类映射 ~15 个有意义类别), 10s ring buffer, 每 2s 取最近 5s 推理,            │
-│ 时序聚合成持续状态 → environment_event → EnvironmentLog (logs/ 下 jsonl).   │
+│ EnvironmentMonitor (audio/environment.py): YAMNet LiteRT (AudioSet 521     │
+│ 类映射 ~15 个有意义类别), 10s ring buffer, 每 2s 取最近 5s 推理。           │
+│ environment_status 每轮更新实时 UI；完成区间由 environment_event 写入       │
+│ EnvironmentLog (logs/ 下 jsonl)，支持按日期查询与清空。                      │
 │ 独立于语音路径, 不依赖 VAD 触发。                                           │
 │ 联动前端降噪: 噪声类 (typing/background_noise/music/appliance) 收紧         │
 │  NoiseGate (SNR 1.5→9dB) 与 AGC 上限 (40→6x), 缓解噪声误触发。              │
@@ -213,12 +230,12 @@ EV 的语音输入被拆成三层，各司其职：
 | `speech_enhancement` | dfsmn-ans | ModelScope | 段级降噪 + 人声确认输入 |
 | `speaker` | eres2netv2 | GitHub release | 声纹 embedding |
 | `environment` | yamnet | GitHub release | 环境声分类 (旁路, 实时) |
-| `asr_final` | sensevoice-small | GitHub release | 终稿 ASR (非自回归, 默认) |
+| `asr_final` | fun-asr-nano-2512 | ModelScope | 终稿 ASR (speech-LLM) |
+| `asr_stream` | paraformer-zh-streaming | GitHub release | 流式 partial 字幕 |
 
-> 备选终稿 ASR：`qwen3-asr-1.7b`（ModelScope，自回归，支持词级时间戳 + 热词 logits 偏置）。
-> 流式 ASR 槽位已在 v0.1.0 移除。
+> 终稿 ASR 热词只接收经过流式文本证据筛选的 active 非系统候选词；自动学习词须人工确认，流式 ASR 永不注入热词。
 
-> 两个模型已放置于 `~/Library/Application Support/EV/models/`。注册表启动时通过
+> 本地模型放置于 `~/Library/Application Support/EV/models/`。注册表启动时通过
 > `ModelRegistry.rescan_local()` 自动扫描 `models_root` 并注册本地已存在的模型目录
 > （无需联网下载），使其出现在模型页「已安装」列表并支持卸载。
 
@@ -226,8 +243,8 @@ EV 的语音输入被拆成三层，各司其职：
 
 | 组件 | 当前状态 | 接入点 |
 |---|---|---|
-| 流式 ASR (paraformer-zh-streaming) | 槽位已注册, adapter 待接入 | `transcribe_forever` 需新增 streaming adapter, 服务 barge-in / 字幕 / `asr_stall` 端点 |
-| 热词消费 (词典 → 终稿 ASR) | 已收集未消费, 原拼音后处理已移除 | `FunASRNanoAdapter.transcribe` 透传 hotwords (见 [dictionary-hotword-notes.md](./dictionary-hotword-notes.md)) |
+| 流式 ASR (paraformer-zh-streaming) | ✅ 已接入 | `StreamingASRAdapter.transcribe_chunk()`，段内 cache + partial revision |
+| 热词消费 (词典 → 终稿 ASR) | ✅ 证据触发 | 流式文本检索人工词条后，最多向终稿注入8个候选词 |
 | 业务理解层 (LLM 意图) | Phase 3 预留 | 段落库后接 query 决策下游 |
 
 ## macOS 客户端 (SwiftUI)
@@ -245,7 +262,7 @@ SwiftUI 主窗口 / 菜单栏
 在后台 worker 串行完成，采集/VAD 不等待这些计算。关闭主窗口不停止 engine；
 退出应用时发送 `shutdown`。
 
-ASR 模型可在 GUI 模型页安装/卸载，切换后下一个段自动加载新模型。声纹录入通过
+ASR 模型可在 GUI 模型页安装/卸载；监听会话启动时按当前槽位加载。声纹录入通过
 独立命令 (`start_voice_enrollment` / `stop_voice_enrollment` / `capture_manual_sample`)，
 另有待确认样本队列 (`list_pending_voice_samples` / `confirm_voice_sample` /
 `reject_voice_sample`)。
@@ -255,12 +272,15 @@ ASR 模型可在 GUI 模型页安装/卸载，切换后下一个段自动加载�
 | 事件 | 作用 | 关键字段 |
 |---|---|---|
 | `capture_started` | 采集已实际启动 | device, sample_rate, channels |
+| `model_loading` / `model_ready` / `model_error` | 模型槽位预热状态 | component, message |
+| `pipeline_status` | 统一流水线阶段与空闲心跳 | phase, component, elapsed_ms, queue_depth, message |
 | `audio_level` | GUI 实时输入电平 | rms, raw_rms, gain |
 | `speech_started` | 进入 RECORDING | segment_id, started_at, speaker_label |
 | `speech_ended` | 段结束 | segment_id, ended_at, trigger |
 | `speaker_turn_changed` | 说话人切换 (含切段标记) | segment_id, from, to, score, segment_split |
 | `segment_discarded` | 段被丢弃 | segment_id, reason, duration_ms |
 | `segment_processing` | 后台处理开始 | segment_id, phase, queue_depth |
+| `transcript_partial` | 流式字幕更新 | segment_id, text, revision, latency_ms |
 | `speaker_result` | 声纹融合判决 | segment_id, label, score |
 | `segment_committed` | WAV 与 SQLite 已提交 | 完整 SegmentRecord |
 | `segment_failed` | 段级错误 | segment_id, code, message |
@@ -272,8 +292,32 @@ ASR 模型可在 GUI 模型页安装/卸载，切换后下一个段自动加载�
 | `segment_corrected` | 手动纠错落地 | segment_id, changed, corrected_text |
 | `segment_deleted` | 历史段删除 | segment_id, deleted |
 | `segment_list` | 历史段列表响应 | segments |
-| `lexicon_updated` | 词典增删改热更新 | word, added/updated/deleted |
+| `lexicon_updated` | 词典增删改及确认/启停热更新 | word/id, added/updated/confirmed/rejected/status_updated |
 | `lexicon_list` | 词典列表响应 | words |
 | `engine_state` | 引擎运行状态 | state |
 | `model_status` / `available_models` / `installed_models` | 模型页状态与列表 | models |
 | `environment_event` | 环境声分类状态变化 | timestamp, category, confidence, duration_sec |
+
+### 质量与数据库诊断字段
+
+`segments` 表当前 schema version 为 v18。除原有 RMS/SNR 字段外，新增：
+
+| 字段 | 含义 |
+|---|---|
+| `speech_ratio` | 当前段被 VAD 判为 speech-like 的帧比例 |
+| `stream_first_partial_ms` | 从段开始到首个 partial 的耗时 |
+| `stream_revision_count` | 流式假设更新次数 |
+| `final_latency_ms` | 终稿 ASR 调用耗时 |
+
+质量标签包括 `ok`、`borderline`、`rejected_low_level`、`rejected_low_snr`、
+`rejected_non_voice`、`rejected_unstable` 和 `processing_error`。开发阶段无效段
+仍保留 WAV 与历史记录，历史页的“清空无效”删除所有 `quality_label != ok` 的段。
+
+### 环境声隔离约束
+
+环境声旁路必须继续使用 `env_monitor.feed(raw)`：
+
+- 不经过 `DenoiseAdapter`。
+- 不进入 `StreamingASRAdapter` 或终稿 ASR。
+- 不依赖语音 VAD 是否启动。
+- 语音链路增加状态事件、质量门控或模型预热时，不改变环境事件协议和环境历史存储。

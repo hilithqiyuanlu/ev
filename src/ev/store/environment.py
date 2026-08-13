@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,8 +48,10 @@ class EnvironmentLog:
         """
         line = json.dumps(
             {
-                "ts": event.timestamp,
+                "id": event.id,
                 "category": event.category,
+                "started_at": event.started_at,
+                "ended_at": event.ended_at,
                 "confidence": event.confidence,
                 "duration_sec": event.duration_sec,
             },
@@ -87,19 +90,79 @@ class EnvironmentLog:
                             record = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        ts = record.get("ts")
-                        if ts is None:
+                        record = self._normalize(record)
+                        started_at = record.get("started_at")
+                        if started_at is None:
                             continue
-                        if start_time is not None and ts < start_time:
+                        if start_time is not None and started_at < start_time:
                             continue
-                        if end_time is not None and ts > end_time:
+                        if end_time is not None and started_at > end_time:
                             continue
                         results.append(record)
             except OSError:
                 continue
 
-        results.sort(key=lambda r: r.get("ts", 0))
+        results.sort(key=lambda r: r.get("started_at", 0))
         return results
+
+    @staticmethod
+    def _normalize(record: dict) -> dict:
+        """将旧的 ts/duration_sec 记录转换为当前区间结构。"""
+        if "started_at" in record and "ended_at" in record:
+            normalized = dict(record)
+            normalized.setdefault("id", uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(record, sort_keys=True)).hex)
+            return normalized
+        ts = record.get("ts")
+        if ts is None:
+            return record
+        duration = float(record.get("duration_sec") or 0.0)
+        return {
+            "id": uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(record, sort_keys=True)).hex,
+            "category": record.get("category", "unknown"),
+            "started_at": float(ts) - duration,
+            "ended_at": float(ts),
+            "duration_sec": duration,
+            "confidence": float(record.get("confidence") or 0.0),
+        }
+
+    def clear(self, date_str: str | None = None) -> int:
+        """删除指定本地日期或全部环境记录，返回删除条数。"""
+        paths = list(self.log_dir.glob(f"{_ENV_LOG_PREFIX}-*.jsonl"))
+        count = 0
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                if date_str is None:
+                    with open(path, encoding="utf-8") as f:
+                        count += sum(1 for line in f if line.strip())
+                    path.unlink()
+                    continue
+
+                kept: list[str] = []
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        raw = line.strip()
+                        if not raw:
+                            continue
+                        try:
+                            record = self._normalize(json.loads(raw))
+                            started_at = float(record.get("started_at", 0))
+                            local_date = datetime.fromtimestamp(started_at).astimezone().strftime("%Y-%m-%d")
+                        except (ValueError, TypeError, json.JSONDecodeError):
+                            kept.append(raw)
+                            continue
+                        if local_date == date_str:
+                            count += 1
+                        else:
+                            kept.append(raw)
+                if kept:
+                    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                else:
+                    path.unlink()
+            except OSError:
+                continue
+        return count
 
     def query_summary(
         self,

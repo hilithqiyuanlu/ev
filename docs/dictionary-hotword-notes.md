@@ -1,27 +1,32 @@
-# 词典/热词优化方向备忘（后置待办）
+# 词典/热词优化开发记录
 
-> 记录：2026-08-13。本轮词典开发后置，此笔记供后续轮次重看，不展开实现。
-> 详细现状见 [dictionary.md](./dictionary.md)（其中 SenseVoice/Qwen3 部分已过时，终稿已换 Fun-ASR-Nano-2512）。
+> 更新：2026-08-13。详细实际行为见 [dictionary.md](./dictionary.md)。
 
-## 一句话现状
+## 现状（2026-08-13 更新）
 
-终稿 ASR 已换成 Fun-ASR-Nano-2512，但热词**零生效**：
+- 终稿 ASR = Fun-ASR-Nano-2512（speech-LLM，解码器 Qwen3-0.6B）。
+- 已改为证据触发：流式 ASR 无热词，使用流式文本检索 active 非系统词条，终稿最多接收 8 个候选。
+- 候选选择位于独立 `ev.lexicon` 模块，采用 NFKC、完整命中和长度分级的有序字符覆盖规则。
+- SQLite v19 分离 `source` 与 `status`；自动词待人工确认，确认后仍保留 auto 来源。
+- 每段保存实际候选、最终命中和覆盖率；`use_count` 只统计实际传入且命中的段数。
 
-- `FunASRNanoAdapter.transcribe()` 调 `model.generate(input=tensor)`，**不传热词**；
-- 原 `asr/hotword.py`（含 `postprocess_hotwords` 拼音纠错）**已删**（只剩 .pyc 残留）；
-- 热词当前只被收集 + 统计（`hotword_density`/`hotword_hits` 覆盖率），对转写结果无影响。
+## 已核实：Fun-ASR-Nano 热词接口
 
-## 讨论定下的方向（同事「三级增强」裁到两级）
+- 官方 README 用法：`generate(input=..., hotwords=["词1","词2"], language="中文", itn=True)`。
+- 参数名是 `hotwords`（**复数**，注意 `generate` docstring 误写单数 `hotword`，model 层实际读 `kwargs.get("hotwords")`）。
+- **权重不参与解码**：`get_prompt` 只收纯字符串列表，权重退化为排序（weight DESC 靠前）。
 
-- **第一级 hotword 透传（必做）**：`transcribe(audio, sr)` 加 `hotwords` 参数 → 透传 `generate`。Fun-ASR-Nano 唯一值得做的路径，收益最大、改动最小。
-- **第二级 logits 锚定（不做）**：Fun-ASR-Nano 经 funasr 调用是黑盒 `generate`，不暴露逐 token logits，无法低成本迁移；「权重作用于 logits」在 prompt 注入方式下不成立。
-- **第三级 拼音兜底（暂缓）**：原 `postprocess_hotwords` 已删、需重写；等第一级跑通看效果再决定。
+## 本轮测试
 
-## 待查证（下轮开工前先做）
+- 候选归一化、长度阈值、排序、去重、上限 8 和第 81 个词可检索。
+- pending/disabled/system 隔离、auto 确认保留来源、v18 到 v19 迁移。
+- 无证据不传热词、候选与命中集合约束、每段计数去重。
+- 引擎确认、拒绝、启停命令和 macOS 数据解析/命令发送。
 
-1. Fun-ASR-Nano `generate` 的热词传参方式：官方 `hotword=` 参数 vs 拼 prompt 前缀（读已下载模型推理代码 + funasr 接口）。
-2. 权重（0.5–10）在第一级怎么落地：若只认字符串列表不认权重，权重退化为「排序 + 统计」，需决定保留程度。
+## 后续方向
 
-## 复用不动的部分
+1. **第三级拼音兜底（暂缓）**：funasr 原生支持 `postprocess_hotwords` 参数（文本级纠错，`apply_postprocess_hotwords_to_results` 在 `generate` 内自动应用）。原 `asr/hotword.py` 已删。等第一级实测看命中率再决定。
+2. **language 提示**：README 示例传 `language="中文"`；当前未传（`get_prompt` 默认走「语音转写」分支）。如需方言/中文优化可加。
+3. **不做的第二级**：logits 锚定 — Fun-ASR-Nano 黑盒 `generate`，不暴露逐 token logits。
 
-`lexicon` 表、三种来源（system/manual/auto）、热更新 `_broadcast_hotwords`、`hotword_density`/`use_count` 统计——全模型无关，保留。
+4. **效果评估**：建立带无热词对照集，区分自然命中与热词带来的真实改善。

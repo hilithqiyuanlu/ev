@@ -18,6 +18,9 @@ LOGGER = logging.getLogger(__name__)
 
 # DFSMN 模型原生采样率
 _DFSMN_NATIVE_SR = 48000
+_MAX_OUTPUT_GAIN_DB = 6.0
+_MAX_OUTPUT_GAIN = 10.0 ** (_MAX_OUTPUT_GAIN_DB / 20.0)
+_MAX_OUTPUT_PEAK = 0.98
 
 
 class DenoiseAdapter:
@@ -99,7 +102,8 @@ class DenoiseAdapter:
             import tempfile
             from pathlib import Path
 
-            # 将 PCM 写入临时 WAV 文件
+            # 保持采集到的真实幅度。按整段峰值归一化会把远场底噪和近静音片段
+            # 放大到满幅，模型输出又不会自动恢复原响度，最终同时污染播放和 ASR。
             with tempfile.NamedTemporaryFile(
                 suffix=".wav", delete=False
             ) as tmp_in:
@@ -107,9 +111,9 @@ class DenoiseAdapter:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit
                     wf.setframerate(_DFSMN_NATIVE_SR)
-                    # 归一化到 [-1, 1]，转为 int16
-                    peak = max(np.abs(arr_48k).max(), 1e-10)
-                    pcm_16 = (arr_48k / peak * 32767).astype(np.int16)
+                    pcm_16 = (
+                        np.clip(arr_48k, -1.0, 1.0) * 32767.0
+                    ).astype("<i2")
                     wf.writeframes(pcm_16.tobytes())
                 tmp_in_path = Path(tmp_in.name)
 
@@ -135,7 +139,13 @@ class DenoiseAdapter:
                 if file_sr != _DFSMN_NATIVE_SR:
                     output_arr = resample(output_arr, file_sr, _DFSMN_NATIVE_SR)
             elif isinstance(output, np.ndarray):
-                output_arr = np.asarray(output, dtype=np.float32).reshape(-1)
+                raw_output = np.asarray(output).reshape(-1)
+                if np.issubdtype(raw_output.dtype, np.integer):
+                    info = np.iinfo(raw_output.dtype)
+                    scale = float(max(abs(info.min), info.max))
+                    output_arr = raw_output.astype(np.float32) / scale
+                else:
+                    output_arr = raw_output.astype(np.float32)
             elif isinstance(output, (bytes, bytearray, memoryview)):
                 # ModelScope ANS pipeline 以 int16 LE PCM bytes 返回 (native 48k),
                 # 之前未解析 bytes 直接走 else 返回原音频 → 降噪形同虚设。
@@ -148,6 +158,9 @@ class DenoiseAdapter:
             # 重采样回原始采样率
             if len(output_arr) == 0:
                 return arr.copy()
+            if not np.all(np.isfinite(output_arr)):
+                LOGGER.warning("DFSMN returned non-finite audio, fallback to original")
+                return arr.copy()
             enhanced = resample(output_arr, _DFSMN_NATIVE_SR, sample_rate)
 
             # 对齐长度
@@ -155,6 +168,18 @@ class DenoiseAdapter:
                 enhanced = np.pad(enhanced, (0, len(arr) - len(enhanced)))
             elif len(enhanced) > len(arr):
                 enhanced = enhanced[: len(arr)]
+
+            if not np.all(np.isfinite(enhanced)):
+                return arr.copy()
+
+            input_rms = float(np.sqrt(np.mean(np.square(arr.astype(np.float64)))))
+            output_rms = float(np.sqrt(np.mean(np.square(enhanced.astype(np.float64)))))
+            if input_rms > 1e-7 and output_rms > input_rms * _MAX_OUTPUT_GAIN:
+                enhanced = enhanced * (input_rms * _MAX_OUTPUT_GAIN / output_rms)
+
+            peak = float(np.max(np.abs(enhanced))) if enhanced.size else 0.0
+            if peak > _MAX_OUTPUT_PEAK:
+                enhanced = enhanced * (_MAX_OUTPUT_PEAK / peak)
 
             return enhanced.astype(np.float32)
 

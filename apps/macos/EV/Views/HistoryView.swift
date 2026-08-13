@@ -44,7 +44,7 @@ struct HistoryView: View {
             filterHeader
 
             if model.historyItems.isEmpty && !model.isLoadingHistory {
-                EmptyStateView("暂无历史记录", systemImage: "tray")
+                EmptyStateView("暂无语音记录", systemImage: "tray")
                     .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
             } else {
                 List(model.historyItems) { item in
@@ -98,16 +98,7 @@ struct HistoryView: View {
                         }
                     }
                     .padding(.vertical, 2)
-                    .listRowBackground(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.primary.opacity(0.03))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
-                            )
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 2)
-                    )
+                    .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
                 }
@@ -117,7 +108,7 @@ struct HistoryView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .navigationTitle("历史")
+        .navigationTitle("语言")
         .onAppear { applyFilters() }
         .sheet(item: $editingSegment) { segment in
             CorrectionEditSheet(
@@ -283,7 +274,7 @@ struct HistoryView: View {
             HStack(spacing: 6) {
                 Image(systemName: queryOnly ? "bolt.fill" : "bolt")
                     .font(.system(size: 11, weight: .semibold))
-                Text("仅 Query")
+                Text("仅对话")
                     .font(.subheadline.weight(.medium))
             }
             .padding(.horizontal, 14)
@@ -318,18 +309,10 @@ struct HistoryView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .foregroundStyle(invalidSegmentCount == 0 ? .tertiary : .secondary)
-            .background(
-                GeometryReader { _ in EmptyView() }
-            )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(CapsuleButtonStyle())
         .disabled(invalidSegmentCount == 0)
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.secondary.opacity(0.06))
-        )
         .help("仅删除信噪比低、音量过低、非人声等质量不佳的录音段，保留正常录音")
     }
 
@@ -346,20 +329,10 @@ struct HistoryView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .foregroundStyle(model.historyItems.isEmpty ? .tertiary : .secondary)
-            .background(
-                GeometryReader { _ in
-                    EmptyView()
-                }
-            )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(CapsuleButtonStyle(isDestructive: true))
         .disabled(model.historyItems.isEmpty)
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.secondary.opacity(0.06))
-        )
     }
 
     private func scheduleFilter() {
@@ -383,6 +356,211 @@ struct HistoryView: View {
         }
         model.queryOnly = queryOnly
         model.loadHistory()
+    }
+}
+
+struct EnvironmentHistoryView: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var filterDate: Date?
+    @State private var dateOption: DateFilterOption = .all
+    @State private var showDatePickerPopover = false
+    @State private var showClearConfirm = false
+
+    private static let displayDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy/MM/dd"
+        return formatter
+    }()
+
+    private static let queryDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    private var displayedDate: Date { filterDate ?? Calendar.current.startOfDay(for: Date()) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 12) {
+                dateCapsule
+                Spacer()
+                if model.isLoadingEnvironmentHistory {
+                    ProgressView().controlSize(.small)
+                }
+                clearCapsule
+            }
+
+            if model.environmentEvents.isEmpty && !model.isLoadingEnvironmentHistory {
+                EmptyStateView("暂无环境记录", systemImage: "ear")
+                    .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+            } else {
+                List(model.environmentEvents) { event in
+                    EnvironmentEventRow(event: event)
+                        .padding(.vertical, 2)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                }
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .navigationTitle("环境")
+        .onAppear { applyDateFilter() }
+        .alert("清空环境记录", isPresented: $showClearConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("清空", role: .destructive) { model.clearEnvironmentHistory() }
+        }
+    }
+
+    private var dateCapsule: some View {
+        HStack(spacing: 0) {
+            Button {
+                dateOption = .all
+                filterDate = nil
+                showDatePickerPopover = false
+                applyDateFilter()
+            } label: {
+                Text("全部日期")
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .foregroundStyle(dateOption == .all ? .primary : .secondary)
+                    .background {
+                        if dateOption == .all {
+                            RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06))
+                        }
+                    }
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                if dateOption == .all {
+                    filterDate = Calendar.current.startOfDay(for: Date())
+                    dateOption = .specific
+                    applyDateFilter()
+                } else {
+                    showDatePickerPopover = true
+                }
+            } label: {
+                Text(Self.displayDateFormatter.string(from: displayedDate))
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .foregroundStyle(dateOption == .specific ? .primary : .secondary)
+                    .background {
+                        if dateOption == .specific {
+                            RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06))
+                        }
+                    }
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showDatePickerPopover) {
+                DatePicker(
+                    "",
+                    selection: Binding(
+                        get: { displayedDate },
+                        set: { date in
+                            filterDate = Calendar.current.startOfDay(for: date)
+                            dateOption = .specific
+                            showDatePickerPopover = false
+                            applyDateFilter()
+                        }
+                    ),
+                    displayedComponents: .date
+                )
+                .labelsHidden()
+                .datePickerStyle(.graphical)
+                .frame(width: 300)
+                .padding(16)
+            }
+        }
+        .padding(4)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.secondary.opacity(0.06)))
+        .fixedSize(horizontal: true, vertical: true)
+    }
+
+    private var clearCapsule: some View {
+        Button(role: .destructive) { showClearConfirm = true } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("清空")
+                    .font(.subheadline.weight(.medium))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .foregroundStyle(model.environmentEvents.isEmpty ? .tertiary : .secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(CapsuleButtonStyle(isDestructive: true))
+        .disabled(model.environmentEvents.isEmpty)
+    }
+
+    private func applyDateFilter() {
+        model.environmentDateFilter = filterDate.map(Self.queryDateFormatter.string) ?? ""
+        model.loadEnvironmentHistory()
+    }
+}
+
+private struct EnvironmentEventRow: View {
+    @EnvironmentObject private var model: AppModel
+    let event: EnvironmentEvent
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 28, height: 28)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(model.envDisplayName(event.category))
+                    .font(.body)
+                Text("\(Self.timeFormatter.string(from: event.startedAt)) – \(Self.timeFormatter.string(from: event.endedAt))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(durationText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("\(Int(event.confidence * 100))%")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
+    }
+
+    private var durationText: String {
+        let seconds = max(0, Int(event.durationSec.rounded()))
+        return seconds >= 60 ? "\(seconds / 60)分\(seconds % 60)秒" : "\(seconds)秒"
+    }
+
+    private var symbol: String {
+        switch event.category {
+        case "typing": return "keyboard"
+        case "music": return "music.note"
+        case "background_speech": return "person.2.wave.2"
+        case "alert": return "bell"
+        case "animal": return "waveform"
+        case "impact": return "burst"
+        case "appliance": return "fan"
+        default: return "waveform"
+        }
     }
 }
 

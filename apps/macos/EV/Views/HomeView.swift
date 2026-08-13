@@ -127,29 +127,41 @@ struct HomeView: View {
                         .font(.system(size: 13))
                         .foregroundStyle(model.envActive ? .blue : .secondary)
 
-                    if !model.envCategoryLabel.isEmpty {
-                        Text(model.envCategoryLabel)
+                    if !model.environmentStatusLabel.isEmpty {
+                        Text(model.environmentStatusLabel)
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.primary)
-                        if model.envConfidence > 0 {
+                        if model.environmentStatus == .active && model.envConfidence > 0 {
                             Text("\(Int(model.envConfidence * 100))%")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                    } else if model.isListening && model.envCategory.isEmpty {
-                        Text("环境感知中...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
 
                     Spacer()
+
+                    Button {
+                        model.toggleEnvironmentMonitoring()
+                    } label: {
+                        Text(model.environmentMonitoringEnabled ? "停用" : "启用")
+                            .font(.subheadline.weight(.medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(CapsuleButtonStyle())
                 }
                 .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+                .padding(.vertical, 12)
+                .frame(minHeight: 58)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(model.envActive ? Color.blue.opacity(0.06) : Color.secondary.opacity(0.04))
+                        .fill(
+                            model.environmentMonitoringEnabled
+                                ? (model.envActive ? Color.blue.opacity(0.06) : Color.secondary.opacity(0.04))
+                                : Color.secondary.opacity(0.025)
+                        )
                 )
+                .opacity(model.environmentMonitoringEnabled ? 1 : 0.72)
             }
         }
     }

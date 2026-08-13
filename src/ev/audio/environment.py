@@ -14,6 +14,7 @@ import csv
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -107,12 +108,22 @@ _MIN_CONFIDENCE = 0.25
 
 @dataclass
 class EnvEvent:
-    """环境事件 — 一次状态变化的记录。"""
+    """环境事件 — 一个已经结束的环境声音区间。"""
 
-    timestamp: float  # Unix 时间戳
+    id: str
     category: str  # 类别: "typing", "background_noise", "alert", ...
+    started_at: float  # Unix 时间戳
+    ended_at: float  # Unix 时间戳
     confidence: float  # 平均置信度 0.0-1.0
-    duration_sec: float | None  # 持续时间，None 表示点事件（瞬时）
+    duration_sec: float
+
+
+@dataclass(frozen=True)
+class EnvironmentStatus:
+    status: str
+    category: str = ""
+    confidence: float = 0.0
+    message: str = ""
 
 
 class TemporalAggregator:
@@ -213,10 +224,12 @@ class TemporalAggregator:
             else None
         )
         return EnvEvent(
-            timestamp=now,
+            id=uuid.uuid4().hex,
             category=self._current_category or "unknown",
+            started_at=self._category_start_time or now,
+            ended_at=now,
             confidence=round(avg_conf, 3),
-            duration_sec=round(duration, 1) if duration else None,
+            duration_sec=round(duration, 1) if duration else 0.0,
         )
 
     def _reset_state(self) -> None:
@@ -302,33 +315,40 @@ class EnvironmentMonitor:
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._running = False
+        self._enabled = True
         self._aggregator = TemporalAggregator()
         self._emit_callback: Callable[[EnvEvent], None] | None = None
+        self._status_callback: Callable[[EnvironmentStatus], None] | None = None
         self._category_map: dict[int, str] = {}
         self._interpreter: object | None = None  # tflite.Interpreter
         self._input_details: list = []
         self._output_details: list = []
 
-    def _load_model(self) -> None:
+    def _load_model(self) -> bool:
         """加载 YAMNet TFLite 模型和标签。
 
         macOS: tflite-runtime 无预编译 wheel，回退到 tensorflow。
         """
-        # 尝试加载 TFLite interpreter
+        if not Path(self.model_path).is_file() or not Path(self.label_path).is_file():
+            LOGGER.warning("YAMNet model files missing: %s, %s", self.model_path, self.label_path)
+            self._interpreter = None
+            return False
+
+        # 优先使用 Google LiteRT，兼容旧的独立解释器和 TensorFlow。
         tflite = None
         try:
-            import tflite_runtime.interpreter as tflite  # type: ignore[import-untyped]
+            from ai_edge_litert import interpreter as tflite  # type: ignore[import-untyped]
         except ImportError:
             try:
-                import tensorflow.lite as tflite  # type: ignore[import-untyped]
-                LOGGER.info("using tensorflow.lite (macOS fallback)")
+                import tflite_runtime.interpreter as tflite  # type: ignore[import-untyped]
             except ImportError:
-                LOGGER.warning(
-                    "tflite-runtime/tensorflow 均未安装，环境感知不可用。"
-                    "安装: pip install tensorflow"
-                )
-                self._interpreter = None
-                return
+                try:
+                    import tensorflow.lite as tflite  # type: ignore[import-untyped]
+                    LOGGER.info("using tensorflow.lite fallback")
+                except ImportError:
+                    LOGGER.warning("LiteRT/TFLite interpreter 未安装，环境感知不可用")
+                    self._interpreter = None
+                    return False
 
         labels = load_yamnet_labels(self.label_path)
         self._category_map = build_category_map(labels)
@@ -345,6 +365,7 @@ class EnvironmentMonitor:
         self._input_details = self._interpreter.get_input_details()
         self._output_details = self._interpreter.get_output_details()
         LOGGER.info("YAMNet TFLite model loaded from %s", self.model_path)
+        return True
 
     # ── 公开接口 ──────────────────────────────────────────────────────
 
@@ -357,15 +378,40 @@ class EnvironmentMonitor:
         with self._lock:
             self._buffer.extend(arr.tolist())
 
-    def start(self, emit_callback: Callable[[EnvEvent], None]) -> None:
+    def start(
+        self,
+        emit_callback: Callable[[EnvEvent], None] | None = None,
+        status_callback: Callable[[EnvironmentStatus], None] | None = None,
+    ) -> bool:
         """启动环境监测。
 
         Args:
             emit_callback: 当状态变化时调用，传入产生的 EnvEvent。
         """
-        self._emit_callback = emit_callback
-        self._load_model()
+        if emit_callback is not None:
+            self._emit_callback = emit_callback
+        if status_callback is not None:
+            self._status_callback = status_callback
+        if not self._enabled:
+            self._emit_status("disabled")
+            return False
+        if self._running:
+            return True
+        self._emit_status("loading")
+        try:
+            loaded = self._load_model()
+        except Exception:
+            LOGGER.exception("YAMNet environment monitor failed to load")
+            self._emit_status("error")
+            return False
+        if not loaded:
+            self._emit_status("unavailable")
+            return False
+        if not self._enabled:
+            self._emit_status("disabled")
+            return False
         self._running = True
+        self._emit_status("warming_up")
         self._schedule_next()
         LOGGER.info(
             "EnvironmentMonitor started (poll=%.1fs, window=%.1fs, buffer=%.1fs)",
@@ -373,9 +419,33 @@ class EnvironmentMonitor:
             self.window_sec,
             self.ring_buffer_sec,
         )
+        return True
 
-    def stop(self) -> None:
+    def configure(
+        self,
+        emit_callback: Callable[[EnvEvent], None],
+        status_callback: Callable[[EnvironmentStatus], None] | None = None,
+    ) -> None:
+        """注册运行时回调，供监听期间动态启停复用。"""
+        self._emit_callback = emit_callback
+        self._status_callback = status_callback
+
+    def disable(self) -> None:
+        """停用分类但保留回调，之后可直接重新启用。"""
+        self._enabled = False
+        self.stop(emit_status=False)
+        with self._lock:
+            self._buffer.clear()
+        self._emit_status("disabled")
+
+    def enable(self) -> bool:
+        """重新启用分类，并沿用已经注册的回调。"""
+        self._enabled = True
+        return self.start()
+
+    def stop(self, emit_status: bool = True) -> None:
         """停止环境监测。"""
+        was_running = self._running
         self._running = False
         if self._timer is not None:
             self._timer.cancel()
@@ -385,6 +455,8 @@ class EnvironmentMonitor:
             if self._emit_callback:
                 self._emit_callback(event)
         self._aggregator.reset()
+        if was_running and emit_status:
+            self._emit_status("stopped")
         LOGGER.info("EnvironmentMonitor stopped")
 
     def get_current_state(self) -> dict:
@@ -396,6 +468,33 @@ class EnvironmentMonitor:
             ),
             "running": self._running,
         }
+
+    def current_observation(
+        self, frame_categories: list[str], frame_confidences: list[float]
+    ) -> tuple[str, float]:
+        """返回当前推理窗口的主导类别，不等待历史区间确认。"""
+        if not frame_categories:
+            return "", 0.0
+        counts = collections.Counter(frame_categories)
+        dominant = counts.most_common(1)[0][0]
+        confidences = [
+            conf for category, conf in zip(frame_categories, frame_confidences)
+            if category == dominant
+        ]
+        confidence = float(np.mean(confidences)) if confidences else 0.0
+        if dominant in ("silence", "other") or confidence < self._aggregator.min_confidence:
+            return "", confidence
+        return dominant, confidence
+
+    def _emit_status(
+        self,
+        status: str,
+        category: str = "",
+        confidence: float = 0.0,
+        message: str = "",
+    ) -> None:
+        if self._status_callback:
+            self._status_callback(EnvironmentStatus(status, category, confidence, message))
 
     # ── 内部 ──────────────────────────────────────────────────────────
 
@@ -416,6 +515,7 @@ class EnvironmentMonitor:
             window_samples = int(self.window_sec * self.sample_rate)
             with self._lock:
                 if len(self._buffer) < window_samples:
+                    self._emit_status("warming_up")
                     return
                 buf_list = list(self._buffer)
                 window_data = np.array(
@@ -425,15 +525,22 @@ class EnvironmentMonitor:
             # 极低能量时跳过推理（绝对静音）
             rms = float(np.sqrt(np.mean(np.square(window_data))))
             if rms < 1e-6:
+                self._emit_status("quiet")
                 return
 
             frame_categories, frame_confs = self._classify_window(window_data)
             events = self._aggregator.update(frame_categories, frame_confs)
+            category, confidence = self.current_observation(frame_categories, frame_confs)
+            if category:
+                self._emit_status("active", category, confidence)
+            else:
+                self._emit_status("quiet")
             for event in events:
                 if self._emit_callback:
                     self._emit_callback(event)
         except Exception:
             LOGGER.warning("EnvironmentMonitor poll error", exc_info=True)
+            self._emit_status("error")
         finally:
             self._schedule_next()
 

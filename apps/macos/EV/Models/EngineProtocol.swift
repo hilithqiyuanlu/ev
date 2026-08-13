@@ -105,6 +105,7 @@ struct Segment: Identifiable, Hashable {
     let startedAt: String
     let durationMS: Int
     let audioPath: String
+    let rawAudioPath: String?
     let transcript: String
     let speakerLabel: String
     let speakerScore: Double?
@@ -120,6 +121,10 @@ struct Segment: Identifiable, Hashable {
     let qualityLabel: String
     let avgRawRms: Double?
     let snrDb: Double?
+    let speechRatio: Double?
+    let streamFirstPartialMS: Int?
+    let streamRevisionCount: Int
+    let finalLatencyMS: Int?
 
     var isDialogue: Bool {
         // Mixed dialogue if there are utterances from both speakers
@@ -160,6 +165,7 @@ struct Segment: Identifiable, Hashable {
         self.startedAt = startedAt
         self.durationMS = Int(object["duration_ms"]?.double ?? 0)
         self.audioPath = audioPath
+        self.rawAudioPath = object["raw_audio_path"]?.string
         self.transcript = object["transcript_final"]?.string ?? object["transcript_raw"]?.string ?? ""
         self.speakerLabel = object["speaker_label"]?.string ?? "user"
         self.speakerScore = object["speaker_score"]?.double
@@ -196,6 +202,10 @@ struct Segment: Identifiable, Hashable {
         self.qualityLabel = object["quality_label"]?.string ?? "ok"
         self.avgRawRms = object["avg_raw_rms"]?.double
         self.snrDb = object["snr_db"]?.double
+        self.speechRatio = object["speech_ratio"]?.double
+        self.streamFirstPartialMS = object["stream_first_partial_ms"]?.double.map(Int.init)
+        self.streamRevisionCount = Int(object["stream_revision_count"]?.double ?? 0)
+        self.finalLatencyMS = object["final_latency_ms"]?.double.map(Int.init)
     }
 }
 
@@ -238,6 +248,40 @@ enum HistoryItem: Identifiable, Hashable {
         case .segment(let s): return s.sortDate
         case .query(let q): return q.sortDate
         }
+    }
+}
+
+enum EnvironmentRuntimeStatus: String, Hashable {
+    case disabled
+    case loading
+    case warmingUp = "warming_up"
+    case quiet
+    case active
+    case unavailable
+    case error
+    case stopped
+}
+
+struct EnvironmentEvent: Identifiable, Hashable {
+    let id: String
+    let category: String
+    let startedAt: Date
+    let endedAt: Date
+    let durationSec: Double
+    let confidence: Double
+
+    init?(_ value: JSONValue) {
+        guard let object = value.object,
+              let id = object["id"]?.string,
+              let category = object["category"]?.string,
+              let startedTimestamp = object["started_at"]?.double,
+              let endedTimestamp = object["ended_at"]?.double else { return nil }
+        self.id = id
+        self.category = category
+        self.startedAt = Date(timeIntervalSince1970: startedTimestamp)
+        self.endedAt = Date(timeIntervalSince1970: endedTimestamp)
+        self.durationSec = object["duration_sec"]?.double ?? max(0, endedTimestamp - startedTimestamp)
+        self.confidence = object["confidence"]?.double ?? 0
     }
 }
 
@@ -363,6 +407,8 @@ struct LexiconItem: Identifiable, Hashable {
     let word: String
     let weight: Double
     let source: String  // "manual", "auto", "system"
+    let status: String  // "pending", "active", "disabled"
+    let confirmedAt: String?
     let useCount: Int
     let createdAt: String
 
@@ -385,8 +431,18 @@ struct LexiconItem: Identifiable, Hashable {
         self.word = word
         self.weight = object["weight"]?.double ?? 2.0
         self.source = source
+        self.status = object["status"]?.string ?? (source == "auto" ? "pending" : "active")
+        self.confirmedAt = object["confirmed_at"]?.string
         self.useCount = Int(object["use_count"]?.double ?? 0)
         self.createdAt = createdAt
+    }
+
+    var statusLabel: String {
+        switch status {
+        case "pending": return "待确认"
+        case "disabled": return "已停用"
+        default: return "已启用"
+        }
     }
 }
 

@@ -16,7 +16,7 @@ from typing import TextIO
 
 import numpy as np
 
-from ..asr.adapters import FunASRNanoAdapter, SpeakerEmbeddingAdapter
+from ..asr.adapters import FunASRNanoAdapter, SpeakerEmbeddingAdapter, StreamingASRAdapter
 from ..audio.capture import AudioCapture
 from ..audio.devices import list_input_devices, resolve_device
 from ..audio.environment import EnvironmentMonitor, EnvEvent
@@ -61,8 +61,11 @@ class EngineService:
         self._voice_auto_learn = settings.voice_learning.auto_learn_enabled
         self._segment_worker = None  # type: ignore[assignment]
         self._last_listen_params: dict | None = None
+        # 采集线程当前实际绑定的物理设备索引（跟随系统默认时为启动时解析的默认设备）
+        self._active_device_index: int | None = None
         self._env_log: EnvironmentLog | None = None
         self._env_monitor: EnvironmentMonitor | None = None
+        self._environment_enabled = True
 
         self._registry = ModelRegistry(
             models_root=settings.models_dir,
@@ -132,9 +135,15 @@ class EngineService:
             "submit_manual_query": self._submit_manual_query,
             "delete_query": self._delete_query,
             "delete_all_queries": self._delete_all_queries,
+            "list_environment_events": self._list_environment_events,
+            "clear_environment_events": self._clear_environment_events,
+            "set_environment_monitoring": self._set_environment_monitoring,
             "list_lexicon": self._list_lexicon,
             "add_lexicon_word": self._add_lexicon_word,
             "update_lexicon_word": self._update_lexicon_word,
+            "confirm_lexicon_word": self._confirm_lexicon_word,
+            "reject_lexicon_word": self._reject_lexicon_word,
+            "set_lexicon_word_status": self._set_lexicon_word_status,
             "delete_lexicon_word": self._delete_lexicon_word,
             "clear_auto_lexicon": self._clear_auto_lexicon,
             "correct_segment": self._correct_segment,
@@ -365,6 +374,7 @@ class EngineService:
             )
         )
         auto_learn = bool(request.payload.get("auto_learn", self._voice_auto_learn))
+        self._environment_enabled = bool(request.payload.get("environment_enabled", True))
         if not (0.1 <= threshold <= 0.9):
             raise ValueError("阈值必须在0.1到0.9之间")
         # Remember params for potential restart (e.g. device change)
@@ -372,6 +382,7 @@ class EngineService:
             "device": self.device_selector,
             "threshold": threshold,
             "auto_learn": auto_learn,
+            "environment_enabled": self._environment_enabled,
         }
         session_settings = replace(
             self.settings,
@@ -388,6 +399,7 @@ class EngineService:
         # Persist threshold for future sessions
         self.settings = session_settings
         device = resolve_device(self.device_selector)
+        self._active_device_index = device
         self._listen_stop = threading.Event()
         self._segment_worker = None
         self.state = "loading"
@@ -429,6 +441,14 @@ class EngineService:
                 return self.settings.models.root / self.settings.models.asr_final
             return Path(model.local_path)
 
+        def resolve_stream_asr_path() -> Path:
+            model = self._registry.get_active_model("asr_stream")
+            if model is None:
+                model = self._registry.state.installed.get("paraformer-zh-streaming")
+            if model is None:
+                return self.settings.models.root / "paraformer-zh-streaming"
+            return Path(model.local_path)
+
         # 解析降噪模型路径: registry → fallback installed → None
         denoiser_path: str | None = None
         denoise_model = self._registry.get_active_model("speech_enhancement")
@@ -465,7 +485,10 @@ class EngineService:
                         worker_holder=worker_holder,
                         final_asr_resolver=resolve_final_asr_path,
                         final_asr_factory=lambda p: FunASRNanoAdapter(str(p)),
+                        stream_asr_resolver=resolve_stream_asr_path,
+                        stream_asr_factory=lambda p: StreamingASRAdapter(str(p)),
                         env_monitor=self._env_monitor,
+                        environment_enabled=self._environment_enabled,
                         denoiser_path=denoiser_path,
                         vad_path=vad_path,
                         speaker_path=speaker_path,
@@ -513,19 +536,41 @@ class EngineService:
 
     def _set_device(self, request: EngineRequest) -> None:
         new_device = request.payload.get("device") or None
-        was_listening = self._listen_thread is not None and self._listen_thread.is_alive()
-        # 监听中禁止切设备,必须先停止监听:避免静默重启造成"监听中断闪烁"感
-        if was_listening:
-            raise RuntimeError(
-                "当前正在监听中，无法切换输入设备。请先停止监听，再切换麦克风。"
-            )
-        # Validate device exists if specified (空字符串表示使用系统默认)
-        if new_device is not None and new_device != "":
-            resolved = resolve_device(new_device)
-            if resolved is None:
-                raise ValueError(f"未找到匹配的输入设备: {new_device}")
         # Normalize selector: 空字符串/None 都归为 None (即系统默认)
         selector: str | None = None if (new_device is None or new_device == "") else new_device
+        was_listening = self._listen_thread is not None and self._listen_thread.is_alive()
+
+        if was_listening:
+            if selector is not None:
+                # 手动选择具体设备仍需先停止监听，避免静默重启造成"监听中断闪烁"感
+                raise RuntimeError(
+                    "当前正在监听中，无法切换输入设备。请先停止监听，再切换麦克风。"
+                )
+            # 跟随系统默认：若系统默认设备发生热插拔变化，自动重启采集以跟随新默认设备
+            current_default = resolve_device(None)
+            if (self._active_device_index is not None
+                    and current_default is not None
+                    and current_default != self._active_device_index):
+                LOGGER.info(
+                    "系统默认输入设备变化 (%s -> %s)，自动重启采集",
+                    self._active_device_index, current_default,
+                )
+                self._restart_listening_for_default_change()
+                self._ack(request)
+                return
+            # 未变化：仅同步选择状态（仍为系统默认）
+            self.device_selector = None
+            if self._last_listen_params is not None:
+                self._last_listen_params["device"] = None
+            self._emit_state(request.request_id)
+            self._ack(request)
+            return
+
+        # 未监听：原有逻辑
+        if selector is not None:
+            resolved = resolve_device(selector)
+            if resolved is None:
+                raise ValueError(f"未找到匹配的输入设备: {new_device}")
         self.device_selector = selector
         # Update saved params for future start_listening
         if self._last_listen_params is not None:
@@ -533,6 +578,29 @@ class EngineService:
         # Sync engine_state.device 字段, 让 UI 显示当前选择
         self._emit_state(request.request_id)
         self._ack(request)
+
+    def _restart_listening_for_default_change(self) -> None:
+        """系统默认设备变化时，自动重启采集以跟随新默认设备（保持监听状态）。"""
+        params = self._last_listen_params or {}
+        # 停止当前采集并等待线程退出
+        self._listen_stop.set()
+        if self._listen_thread is not None:
+            self._listen_thread.join(timeout=5.0)
+            if self._listen_thread.is_alive():
+                LOGGER.warning("旧采集线程未在超时内退出，放弃自动切换设备")
+                return
+        # 用原参数重新启动；device=None 会重新解析新的系统默认设备
+        req = EngineRequest(
+            request_id=str(uuid.uuid4()),
+            command="start_listening",
+            payload={
+                "device": params.get("device"),
+                "threshold": params.get("threshold", self.settings.speaker.threshold),
+                "auto_learn": params.get("auto_learn", self._voice_auto_learn),
+                "environment_enabled": params.get("environment_enabled", self._environment_enabled),
+            },
+        )
+        self._start_listening(req)
 
     def _on_runtime_event(self, event_type: str, payload: dict) -> None:
         if event_type == "capture_started":
@@ -554,10 +622,12 @@ class EngineService:
             # 写入环境事件日志
             if self._env_log is not None:
                 event = EnvEvent(
-                    timestamp=float(payload.get("timestamp", 0)),
+                    id=str(payload.get("id", "")),
                     category=str(payload.get("category", "unknown")),
+                    started_at=float(payload.get("started_at", 0)),
+                    ended_at=float(payload.get("ended_at", 0)),
                     confidence=float(payload.get("confidence", 0)),
-                    duration_sec=payload.get("duration_sec"),
+                    duration_sec=float(payload.get("duration_sec", 0)),
                 )
                 self._env_log.append(event)
         self.writer.emit(event_type, payload)
@@ -1019,18 +1089,59 @@ class EngineService:
             count = store.delete_all_queries()
         self.writer.emit("queries_deleted", {"count": count}, request.request_id)
 
+    def _list_environment_events(self, request: EngineRequest) -> None:
+        date_str = str(request.payload.get("date") or "")
+        env_log = EnvironmentLog(self.settings.logs_dir)
+        events = env_log.query()
+        if date_str:
+            events = [
+                event for event in events
+                if datetime.fromtimestamp(float(event["started_at"])).astimezone().strftime("%Y-%m-%d") == date_str
+            ]
+        events.sort(key=lambda event: float(event.get("started_at", 0)), reverse=True)
+        self.writer.emit("environment_event_list", {"events": events}, request.request_id)
+
+    def _clear_environment_events(self, request: EngineRequest) -> None:
+        date_str = str(request.payload.get("date") or "") or None
+        count = EnvironmentLog(self.settings.logs_dir).clear(date_str)
+        self.writer.emit("environment_events_cleared", {"count": count}, request.request_id)
+
+    def _set_environment_monitoring(self, request: EngineRequest) -> None:
+        enabled = bool(request.payload.get("enabled", True))
+        self._environment_enabled = enabled
+        if self._last_listen_params is not None:
+            self._last_listen_params["environment_enabled"] = enabled
+        monitor = self._env_monitor
+        if monitor is not None and self._listen_thread and self._listen_thread.is_alive():
+            if enabled:
+                monitor.enable()
+            else:
+                monitor.disable()
+        elif self._listen_thread and self._listen_thread.is_alive():
+            self.writer.emit(
+                "environment_status",
+                {
+                    "status": "unavailable" if enabled else "disabled",
+                    "category": "",
+                    "confidence": 0.0,
+                },
+            )
+        self.writer.emit(
+            "environment_monitoring_changed",
+            {"enabled": enabled},
+            request.request_id,
+        )
+
     def _broadcast_hotwords(self) -> None:
-        """Rebuild hotwords string + entries from store and push to the active segment worker."""
+        """Push all confirmed terms to the worker; per-segment selection happens later."""
         with Store(self.settings.db_path) as store:
-            hotwords = store.get_hotwords_string()
-            entries = store.get_hotword_entries()
-        word_count = len(hotwords.split()) if hotwords else 0
-        if word_count > 0:
+            entries = store.get_active_lexicon_entries()
+        if entries:
             logging.getLogger(__name__).info(
-                "Broadcasting %d hotwords: %s", word_count, hotwords[:200]
+                "Broadcasting %d active lexicon entries", len(entries)
             )
         if self._segment_worker is not None:
-            self._segment_worker.update_hotwords(hotwords, entries)
+            self._segment_worker.update_lexicon_entries(entries)
 
     def _list_lexicon(self, request: EngineRequest) -> None:
         with Store(self.settings.db_path) as store:
@@ -1068,6 +1179,43 @@ class EngineService:
         if updated:
             self._broadcast_hotwords()
         self.writer.emit("lexicon_updated", {"updated": updated, "id": word_id}, request.request_id)
+        self._ack(request)
+
+    def _confirm_lexicon_word(self, request: EngineRequest) -> None:
+        word_id = str(request.payload.get("id", ""))
+        if not word_id:
+            raise ValueError("缺少 id")
+        with Store(self.settings.db_path) as store:
+            updated = store.confirm_lexicon_word(word_id)
+        if updated:
+            self._broadcast_hotwords()
+        self.writer.emit("lexicon_updated", {"confirmed": updated, "id": word_id}, request.request_id)
+        self._ack(request)
+
+    def _reject_lexicon_word(self, request: EngineRequest) -> None:
+        word_id = str(request.payload.get("id", ""))
+        if not word_id:
+            raise ValueError("缺少 id")
+        with Store(self.settings.db_path) as store:
+            updated = store.reject_lexicon_word(word_id)
+        if updated:
+            self._broadcast_hotwords()
+        self.writer.emit("lexicon_updated", {"rejected": updated, "id": word_id}, request.request_id)
+        self._ack(request)
+
+    def _set_lexicon_word_status(self, request: EngineRequest) -> None:
+        word_id = str(request.payload.get("id", ""))
+        status = str(request.payload.get("status", ""))
+        if not word_id:
+            raise ValueError("缺少 id")
+        with Store(self.settings.db_path) as store:
+            updated = store.set_lexicon_word_status(word_id, status)
+        if updated:
+            self._broadcast_hotwords()
+        self.writer.emit(
+            "lexicon_updated", {"status_updated": updated, "id": word_id, "status": status},
+            request.request_id,
+        )
         self._ack(request)
 
     def _delete_lexicon_word(self, request: EngineRequest) -> None:

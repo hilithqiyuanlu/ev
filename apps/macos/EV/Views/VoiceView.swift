@@ -63,14 +63,8 @@ struct VoiceView: View {
                     .foregroundStyle(.secondary)
 
                 if needsOnboarding {
-                    HStack(spacing: 12) {
-                        Text("已录入 \(model.onboardingCount) / \(model.onboardingTarget) 段")
-                            .font(.subheadline.monospacedDigit().weight(.semibold))
-                            .fixedSize()
-                        ProgressView(value: model.onboardingProgress)
-                            .progressViewStyle(.linear)
-                            .frame(maxWidth: 180)
-                    }
+                    Text("已录入 \(model.onboardingCount) / \(model.onboardingTarget) 段")
+                        .font(.subheadline.monospacedDigit().weight(.semibold))
                     if model.voiceProfile.coreCount == 0 {
                         Text("安静环境下用平时音量说话，每段 2–10 秒即可")
                             .font(.caption)

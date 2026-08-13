@@ -58,6 +58,71 @@ private func envelope(_ type: String, _ payload: String) throws -> EngineEnvelop
 }
 
 @MainActor
+@Test func environmentStatusAndHistoryAreIndependent() throws {
+    let engine = FakeEngine()
+    let model = AppModel(engine: engine, permissionProvider: AllowedPermission())
+
+    model.handle(try envelope("environment_status", #"{"status":"quiet","category":"","confidence":0}"#))
+    #expect(model.environmentStatus == .quiet)
+    #expect(model.environmentStatusLabel == "环境安静")
+
+    model.handle(try envelope("environment_status", #"{"status":"active","category":"typing","confidence":0.72}"#))
+    #expect(model.environmentStatus == .active)
+    #expect(model.environmentStatusLabel == "键盘打字")
+    #expect(model.envConfidence == 0.72)
+
+    model.handle(try envelope(
+        "environment_event_list",
+        #"{"events":[{"id":"env-1","category":"music","started_at":1786579200,"ended_at":1786579210,"duration_sec":10,"confidence":0.8}]}"#
+    ))
+    #expect(model.environmentEvents.count == 1)
+    #expect(model.environmentEvents[0].category == "music")
+    #expect(model.historyItems.isEmpty)
+    #expect(!model.isLoadingEnvironmentHistory)
+}
+
+@MainActor
+@Test func environmentMonitoringToggleUpdatesRuntimeState() {
+    UserDefaults.standard.removeObject(forKey: "environmentMonitoringEnabled")
+    defer { UserDefaults.standard.removeObject(forKey: "environmentMonitoringEnabled") }
+    let engine = FakeEngine()
+    let model = AppModel(engine: engine, permissionProvider: AllowedPermission())
+
+    #expect(model.environmentMonitoringEnabled)
+    model.toggleEnvironmentMonitoring()
+    #expect(!model.environmentMonitoringEnabled)
+    #expect(model.environmentStatus == .disabled)
+    #expect(model.environmentStatusLabel == "环境感知已停用")
+    #expect(engine.commands.last == "set_environment_monitoring")
+
+    model.toggleEnvironmentMonitoring()
+    #expect(model.environmentMonitoringEnabled)
+    #expect(model.environmentStatus == .loading)
+}
+
+@MainActor
+@Test func lexiconStatusParsingAndCommands() throws {
+    let engine = FakeEngine()
+    let model = AppModel(engine: engine, permissionProvider: AllowedPermission())
+    model.handle(try envelope(
+        "lexicon_list",
+        #"{"words":[{"id":"auto-1","word":"自动候选","weight":2,"source":"auto","status":"pending","confirmed_at":null,"use_count":0,"created_at":"2026-01-01"},{"id":"manual-1","word":"人工词","weight":3,"source":"manual","status":"disabled","confirmed_at":"2026-01-01","use_count":2,"created_at":"2026-01-01"}]}"#
+    ))
+
+    #expect(model.lexiconWords.count == 2)
+    #expect(model.lexiconWords[0].source == "auto")
+    #expect(model.lexiconWords[0].status == "pending")
+    #expect(model.lexiconWords[1].statusLabel == "已停用")
+
+    model.confirmLexiconWord("auto-1")
+    model.rejectLexiconWord("auto-1")
+    model.setLexiconWordStatus("manual-1", status: "active")
+    #expect(engine.commands.suffix(3) == [
+        "confirm_lexicon_word", "reject_lexicon_word", "set_lexicon_word_status"
+    ])
+}
+
+@MainActor
 @Test func authorizedMicrophoneStartsListening() throws {
     let engine = FakeEngine()
     let model = AppModel(engine: engine, permissionProvider: AllowedPermission())
@@ -87,6 +152,8 @@ private func envelope(_ type: String, _ payload: String) throws -> EngineEnvelop
 
 @MainActor
 @Test func deviceListDoesNotOverrideManualSelectionWhenSystemDefaultDiffers() throws {
+    UserDefaults.standard.removeObject(forKey: "selectedDevice")
+    defer { UserDefaults.standard.removeObject(forKey: "selectedDevice") }
     // 闪烁 bug 根因: 之前未监听时若系统默认设备 != 手动选择的, 会被强制覆盖回默认
     // 修复后: 只要手动选择的设备名仍然存在于设备列表, 就保持不动 (不管是否 is_default)
     let engine = FakeEngine()
@@ -125,6 +192,8 @@ private func envelope(_ type: String, _ payload: String) throws -> EngineEnvelop
 
 @MainActor
 @Test func deviceListFallsBackWhenSelectedDeviceRemoved() throws {
+    UserDefaults.standard.removeObject(forKey: "selectedDevice")
+    defer { UserDefaults.standard.removeObject(forKey: "selectedDevice") }
     // 用户选了 DJI, 拔掉 USB -> 下一次 device_list 里没有 DJI -> 自动回退到"使用系统默认"
     let engine = FakeEngine()
     let model = AppModel(engine: engine, permissionProvider: AllowedPermission())

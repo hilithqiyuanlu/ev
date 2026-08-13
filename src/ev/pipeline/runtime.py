@@ -10,6 +10,7 @@ import queue
 import re
 import signal
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ import numpy as np
 
 from ..asr.adapters import (
     SpeakerEmbeddingAdapter,
+    StreamingASRAdapter,
     TranscriptionResult,
     TranscriptionSegment,
 )
@@ -27,8 +29,10 @@ from ..audio.capture import AudioCapture
 from ..audio.preprocess import AudioPreprocessor, PreprocessParams
 from ..audio.energy_vad import EnergyVAD, EnergyVADParams
 from ..audio.denoise import DenoiseAdapter
-from ..audio.environment import EnvironmentMonitor, EnvEvent
+from ..audio.quality import QualityAssessment, QualityThresholds, assess_quality
+from ..audio.environment import EnvironmentMonitor, EnvironmentStatus, EnvEvent
 from ..config import Settings
+from ..lexicon import LexiconEntry, normalize_for_matching, select_hotword_candidates
 from ..speaker.profile import VoiceProfileManager
 from ..speaker.verification import (
     cosine_score,
@@ -77,17 +81,18 @@ def _is_filler_only(text: str) -> bool:
 
 def _compute_hotword_coverage(text: str, hotword_entries: list[tuple[str, float]]) -> float:
     """返回 text 中被热词子串覆盖的字符比例 (0.0-1.0)."""
-    if not text or not hotword_entries:
+    normalized_text = normalize_for_matching(text)
+    if not normalized_text or not hotword_entries:
         return 0.0
-    n = len(text)
+    n = len(normalized_text)
     covered = bytearray(n)
     for word, _ in hotword_entries:
-        word = word.strip()
+        word = normalize_for_matching(word)
         if len(word) < 2:
             continue
         start = 0
         while True:
-            pos = text.find(word, start)
+            pos = normalized_text.find(word, start)
             if pos < 0:
                 break
             for i in range(pos, min(pos + len(word), n)):
@@ -281,8 +286,7 @@ class SegmentProcessor:
         final_asr: Any | None = None,  # 终稿 ASR (Fun-ASR-Nano)，由 worker 懒加载注入
         output: Callable[[str], None] = print,
         emit: Callable[[str, dict], None] | None = None,
-        hotwords: str = "",
-        hotword_entries: list[tuple[str, float]] | None = None,
+        lexicon_entries: list[LexiconEntry] | None = None,
     ):
         self.settings = settings
         self.store = store
@@ -296,17 +300,14 @@ class SegmentProcessor:
         # Mutable threshold - can be updated at runtime without restart
         self.threshold: float = settings.speaker.threshold
         # Hotwords for final ASR - can be updated at runtime
-        self.hotwords: str = hotwords
-        self.hotword_entries: list[tuple[str, float]] = hotword_entries or []
+        self.lexicon_entries: list[LexiconEntry] = lexicon_entries or []
 
     def update_thresholds(self, threshold: float | None = None) -> None:
         if threshold is not None:
             self.threshold = float(threshold)
 
-    def update_hotwords(self, hotwords: str, hotword_entries: list[tuple[str, float]] | None = None) -> None:
-        self.hotwords = hotwords or ""
-        if hotword_entries is not None:
-            self.hotword_entries = hotword_entries or []
+    def update_lexicon_entries(self, entries: list[LexiconEntry]) -> None:
+        self.lexicon_entries = entries
 
     def process(
         self,
@@ -321,6 +322,11 @@ class SegmentProcessor:
         peak_raw_rms: float = 0.0,
         noise_floor_rms: float = 0.0,
         snr_db: float = 0.0,
+        speech_ratio: float = 1.0,
+        stream_text: str = "",
+        stream_first_partial_ms: int | None = None,
+        stream_revision_count: int = 0,
+        stream_stable_ms: int = 0,
     ) -> SegmentRecord | None:
         segment_id = segment_id or uuid.uuid4().hex
         duration_ms = round(len(audio) * 1000 / self.settings.audio.sample_rate)
@@ -332,37 +338,39 @@ class SegmentProcessor:
         audio_for_embedding = normalize_loudness(audio) if self.settings.speaker.loudness_normalize else audio
 
         # 终稿 ASR (Fun-ASR-Nano): 未加载时 _final() 返回 None
-        final_result = self._final(audio)
+        final_started = time.monotonic()
+        hotword_candidates = select_hotword_candidates(stream_text, self.lexicon_entries)
+        selected_hotwords = [candidate.word for candidate in hotword_candidates]
+        final_result = self._final(audio, selected_hotwords)
+        final_latency_ms = int((time.monotonic() - final_started) * 1000)
         final_text = final_result.text if final_result else ""
         transcript = final_text
 
-        # Hotword hit statistics: how much of this transcript is covered by lexicon
-        # words, and which words actually matched. Records which words ASR got right
-        # (or corrected via postprocess) so recall is observable instead of guessed.
-        hotword_density: float | None = None
-        hotword_hits: list[str] = []
-        if self.hotword_entries and final_text:
-            hotword_density = round(_compute_hotword_coverage(final_text, self.hotword_entries), 4)
-            hotword_hits = [
-                w for w, _ in self.hotword_entries
-                if w and w in final_text
-            ]
+        if raw_audio is None and avg_raw_rms == 0 and peak_raw_rms == 0 and noise_floor_rms == 0:
+            quality = QualityAssessment("ok", "metrics unavailable")
+        else:
+            quality = assess_quality(
+                avg_raw_rms=avg_raw_rms,
+                peak_raw_rms=peak_raw_rms,
+                noise_floor_rms=noise_floor_rms,
+                snr_db=snr_db,
+                speech_ratio=speech_ratio,
+                stream_text=stream_text or transcript,
+                stream_revision_count=stream_revision_count,
+                stable_ms=stream_stable_ms,
+                thresholds=QualityThresholds(
+                    low_level_rms=self.settings.quality.low_level_rms,
+                    low_peak_rms=self.settings.quality.low_peak_rms,
+                    low_snr_db=self.settings.quality.low_snr_db,
+                    borderline_snr_db=self.settings.quality.borderline_snr_db,
+                    min_speech_ratio=self.settings.quality.min_speech_ratio,
+                    borderline_speech_ratio=self.settings.quality.borderline_speech_ratio,
+                    min_stable_ms=self.settings.quality.min_stable_ms,
+                ),
+            )
 
-        # Empty or filler-only segments are discarded (no WAV, no DB, no speaker check).
-        if not transcript.strip():
-            self.output(f"[{segment_id[:8]}] discarded: empty transcript ({duration_ms}ms)")
-            return None
-        if self.settings.segment.discard_filler_only and _is_filler_only(transcript):
-            self.output(f"[{segment_id[:8]}] discarded: filler-only {transcript!r} ({duration_ms}ms)")
-            return None
-
-        # Utterance alignment: use ASR timestamps if available, otherwise proportional mapping
-        asr_segments = final_result.segments if final_result and final_result.has_timestamps else None
-        utterances = _align_utterances(
-            transcript, speaker_turns, duration_ms, asr_segments=asr_segments,
-        )
-
-        embedding = self.speaker.embed(audio_for_embedding, self.settings.audio.sample_rate)
+        # Archive both paths before filtering so invalid recordings remain
+        # inspectable during development.
         wav_path = archive_wav(
             self.settings.archive_dir, segment_id, audio,
             self.settings.audio.sample_rate, started_at,
@@ -373,8 +381,43 @@ class SegmentProcessor:
             self.settings.audio.sample_rate, started_at,
             suffix=".raw",
         )
+
+        # Empty/filler output is still retained when it has been classified as
+        # invalid; this makes false VAD activations observable.
+        if not transcript.strip() and quality.accepted:
+            self.output(f"[{segment_id[:8]}] discarded: empty transcript ({duration_ms}ms)")
+            return None
+        if self.settings.segment.discard_filler_only and _is_filler_only(transcript) and quality.accepted:
+            self.output(f"[{segment_id[:8]}] discarded: filler-only {transcript!r} ({duration_ms}ms)")
+            return None
+
+        # Hotword hit statistics: how much of this transcript is covered by lexicon
+        # words, and which words actually matched. Records which words ASR got right
+        # (or corrected via postprocess) so recall is observable instead of guessed.
+        hotword_density: float | None = None
+        hotword_hits: list[str] = []
+        selected_entries = [(candidate.word, 1.0) for candidate in hotword_candidates]
+        if quality.accepted and selected_entries and final_text:
+            normalized_final = normalize_for_matching(final_text)
+            hotword_density = round(_compute_hotword_coverage(final_text, selected_entries), 4)
+            hotword_hits = [
+                w for w, _ in selected_entries
+                if normalize_for_matching(w) in normalized_final
+            ]
+
+        # Utterance alignment: use ASR timestamps if available, otherwise proportional mapping
+        asr_segments = final_result.segments if final_result and final_result.has_timestamps else None
+        utterances = _align_utterances(
+            transcript, speaker_turns, duration_ms, asr_segments=asr_segments,
+        )
+
+        embedding = self.speaker.embed(audio_for_embedding, self.settings.audio.sample_rate) if quality.accepted else None
         profile_ready = self.voice_profile.state.is_ready
-        if not self.centroids or not profile_ready:
+        if not quality.accepted:
+            speaker_label, score = "non-user", None
+            effective_for_decision = "non-user"
+            profile_ready = self.voice_profile.state.is_ready
+        elif not self.centroids or not profile_ready:
             speaker_label, score = "user", None
             effective_for_decision = "user"
         else:
@@ -414,14 +457,19 @@ class SegmentProcessor:
         # Query decision: use utterance-level if we have turns, otherwise fall back.
         # Gate query_candidate on the segment-level fused speaker label (effective_for_decision),
         # not the noisy real-time per-utterance turns — see decide_query_from_utterances.
-        if speaker_turns and utterances:
+        decision = type("Decision", (), {
+            "wake_detected": False,
+            "query_candidate": False,
+            "query_text": None,
+        })()
+        if quality.accepted and speaker_turns and utterances:
             decision = decide_query_from_utterances(
                 utterances,
                 self.settings.vui.wake_words,
                 profile_ready=profile_ready,
                 dominant_speaker=effective_for_decision,
             )
-        else:
+        elif quality.accepted:
             decision = decide_query(
                 transcript,
                 effective_for_decision,
@@ -437,8 +485,9 @@ class SegmentProcessor:
             sample_rate=self.settings.audio.sample_rate,
             channels=self.settings.audio.channels, transcript_raw="",
             transcript_final=final_text, speaker_label=speaker_label, speaker_score=score,
-            wake_detected=decision.wake_detected, query_candidate=decision.query_candidate,
-            query_text=decision.query_text, vad_model=self.vad_model_id,
+            wake_detected=decision.wake_detected if quality.accepted else False,
+            query_candidate=decision.query_candidate if quality.accepted else False,
+            query_text=decision.query_text if quality.accepted else None, vad_model=self.vad_model_id,
             asr_final_model=self._final_model_label(),
             speaker_model=self.settings.models.speaker,
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -452,16 +501,22 @@ class SegmentProcessor:
             source_type="voice",
             dominant_speaker=dominant_speaker,
             contains_user=contains_user,
-            quality_label="ok",
+            quality_label=quality.label,
             avg_raw_rms=avg_raw_rms,
             peak_raw_rms=peak_raw_rms,
             noise_floor_rms=noise_floor_rms,
             snr_db=snr_db,
             hotword_density=hotword_density,
             hotword_hits=json.dumps(hotword_hits, ensure_ascii=False) if hotword_hits else None,
+            hotword_candidates=json.dumps(
+                [asdict(candidate) for candidate in hotword_candidates], ensure_ascii=False
+            ) if hotword_candidates else None,
+            speech_ratio=speech_ratio,
+            stream_first_partial_ms=stream_first_partial_ms,
+            stream_revision_count=stream_revision_count,
         )
         self.store.insert_segment(record)
-        if hotword_hits:
+        if quality.accepted and hotword_hits:
             self.store.record_hotword_hits(hotword_hits)
         is_filler = self.settings.segment.discard_filler_only and _is_filler_only(transcript)
 
@@ -475,9 +530,12 @@ class SegmentProcessor:
         if speaker_label == "user" and score is not None and not has_non_user_turn:
             should_try_collect = score >= self.settings.voice_learning.collect_min_score
 
-        if should_try_collect and self.voice_profile.should_collect(
+        collect_score = score
+        if quality.label == "borderline" and collect_score is not None:
+            collect_score = min(collect_score, self.settings.voice_learning.core_score_min - 0.001)
+        if quality.accepted and should_try_collect and collect_score is not None and self.voice_profile.should_collect(
             duration_ms=duration_ms,
-            score=score,
+            score=collect_score,
             transcript=transcript,
             is_filler_only=is_filler,
         ):
@@ -494,7 +552,7 @@ class SegmentProcessor:
                 embedding=embedding,
                 audio_path=str(sample_wav),
                 duration_ms=duration_ms,
-                score=score,
+                score=collect_score,
                 segment_id=segment_id,
             )
             if added:
@@ -521,15 +579,18 @@ class SegmentProcessor:
             )
         self.output(
             f"[{segment_id[:8]}] final={final_text!r} speaker={speaker_label} "
-            f"score={score if score is not None else '-'} query={decision.query_candidate}"
+            f"score={score if score is not None else '-'} "
+            f"query={decision.query_candidate if quality.accepted else False} quality={quality.label}"
         )
         return record
 
-    def _final(self, audio: np.ndarray) -> TranscriptionResult | None:
+    def _final(self, audio: np.ndarray, hotwords: list[str] | None = None) -> TranscriptionResult | None:
         # 终稿 ASR (Fun-ASR-Nano) 未加载时无终稿转写。
         if self.final_asr is None:
             return None
-        result = self.final_asr.transcribe(audio, self.settings.audio.sample_rate)
+        result = self.final_asr.transcribe(
+            audio, self.settings.audio.sample_rate, hotwords=hotwords
+        )
         if isinstance(result, str):
             return TranscriptionResult(text=result)
         return result
@@ -598,6 +659,11 @@ class SegmentJob:
     end_trigger: str | None = None       # vad_endpoint/max_duration/silence_timeout/... → 落库可观测
     noise_floor_rms: float = 0.0         # raw 底噪 RMS 快照 (段开始时)
     is_warmup: bool = True               # 底噪追踪器是否仍在 warm-up 期
+    speech_ratio: float = 1.0
+    stream_text: str = ""
+    stream_first_partial_ms: int | None = None
+    stream_revision_count: int = 0
+    stream_stable_ms: int = 0
 
 
 class SegmentWorker:
@@ -641,9 +707,9 @@ class SegmentWorker:
     def submit(self, job: SegmentJob) -> None:
         self.jobs.put(job)
 
-    def update_hotwords(self, hotwords: str, hotword_entries: list[tuple[str, float]] | None = None) -> None:
+    def update_lexicon_entries(self, entries: list[LexiconEntry]) -> None:
         if self._processor is not None:
-            self._processor.update_hotwords(hotwords, hotword_entries)
+            self._processor.update_lexicon_entries(entries)
 
     def reload_final_asr(self) -> None:
         """Signal the worker to reload the final ASR model on next segment.
@@ -677,8 +743,7 @@ class SegmentWorker:
         with Store(self.settings.db_path) as store:
             from ..speaker.profile import VoiceProfileManager
             voice_profile = VoiceProfileManager(store, self.settings.voice_learning, self.settings.speaker)
-            hotwords_str = store.get_hotwords_string()
-            hotword_entries = store.get_hotword_entries()
+            lexicon_entries = store.get_active_lexicon_entries()
             processor = SegmentProcessor(
                 self.settings,
                 store,
@@ -688,12 +753,22 @@ class SegmentWorker:
                 None,
                 self.output,
                 self.emit,
-                hotwords=hotwords_str,
-                hotword_entries=hotword_entries,
+                lexicon_entries=lexicon_entries,
             )
             self._processor = processor
             if self._shared_threshold is not None:
                 self._shared_threshold["threshold"] = processor.threshold
+            if self._final_asr_factory is not None:
+                try:
+                    self.emit("model_loading", {"component": "final_asr"})
+                    final_path = self._resolve_final_asr_path()
+                    final = self._final_asr_factory(final_path)
+                    with self._final_asr_lock:
+                        self._final_asr = final
+                    processor.final_asr = final
+                    self.emit("model_ready", {"component": "final_asr"})
+                except Exception as exc:
+                    self.emit("model_error", {"component": "final_asr", "message": str(exc)})
             while True:
                 job = self.jobs.get()
                 if job is None:
@@ -708,6 +783,11 @@ class SegmentWorker:
                             "queue_depth": self.jobs.qsize(),
                         },
                     )
+                    processing_started = time.monotonic()
+                    self.emit("pipeline_status", {
+                        "phase": "finalizing", "component": "final_asr",
+                        "queue_depth": self.jobs.qsize(), "message": "正在完成终稿",
+                    })
                     duration_ms = round(len(job.audio) * 1000 / self.settings.audio.sample_rate)
 
                     # --- 计算 RMS 统计 (仅用于日志和 DB 记录) ---
@@ -763,8 +843,12 @@ class SegmentWorker:
                         peak_raw_rms=_peak_raw_rms,
                         noise_floor_rms=job.noise_floor_rms,
                         snr_db=_snr_db,
+                        speech_ratio=job.speech_ratio,
+                        stream_text=job.stream_text,
+                        stream_first_partial_ms=job.stream_first_partial_ms,
+                        stream_revision_count=job.stream_revision_count,
+                        stream_stable_ms=job.stream_stable_ms,
                     )
-
                     if record is None:
                         self.emit(
                             "segment_discarded",
@@ -776,6 +860,13 @@ class SegmentWorker:
                         )
                     else:
                         _emit_record(self.emit, record)
+                        self.emit("pipeline_status", {
+                            "phase": "filtered" if record.quality_label.startswith("rejected_") else "committed",
+                            "component": "quality" if record.quality_label != "ok" else "storage",
+                            "elapsed_ms": record.final_latency_ms or 0,
+                            "queue_depth": self.jobs.qsize(),
+                            "message": "已标记为无效" if record.quality_label.startswith("rejected_") else "已保存",
+                        })
                 except Exception as exc:
                     self.emit(
                         "segment_failed",
@@ -807,7 +898,10 @@ async def transcribe_forever(
     worker_holder: dict | None = None,
     final_asr_resolver: Callable[[], Path] | None = None,
     final_asr_factory: Callable[[Path], Any] | None = None,
+    stream_asr_resolver: Callable[[], Path] | None = None,
+    stream_asr_factory: Callable[[Path], Any] | None = None,
     env_monitor: EnvironmentMonitor | None = None,
+    environment_enabled: bool = True,
     denoiser_path: str | None = None,
     vad_path: str | None = None,
     speaker_path: str | None = None,
@@ -869,6 +963,7 @@ async def transcribe_forever(
     vad: CompositeVAD | None = None
     speaker: SpeakerEmbeddingAdapter | None = None
     capture: AudioCapture | None = None
+    stream_asr: Any | None = None
     # 1) 预处理管线 (DC → preemphasis → AGC → NoiseGate)
     if settings.preprocess.enabled:
         pp_params = PreprocessParams(
@@ -925,6 +1020,17 @@ async def transcribe_forever(
     )
 
     speaker = SpeakerEmbeddingAdapter(str(paths["speaker"]))
+    if stream_asr_factory is not None:
+        try:
+            send("model_loading", {"component": "stream_asr"})
+            stream_path = stream_asr_resolver() if stream_asr_resolver else base_paths.get("asr_stream")
+            if stream_path is not None and Path(stream_path).is_dir():
+                stream_asr = stream_asr_factory(Path(stream_path))
+                send("model_ready", {"component": "stream_asr"})
+            else:
+                send("model_error", {"component": "stream_asr", "message": "流式 ASR 模型路径不存在"})
+        except Exception as exc:
+            send("model_error", {"component": "stream_asr", "message": str(exc)})
     capture = AudioCapture(settings.audio, device=device, preprocessor=preprocessor)
 
     # Shared mutable threshold for cross-thread access
@@ -985,6 +1091,14 @@ async def transcribe_forever(
         energy_silent_samples = 0  # consecutive samples where EnergyVAD SNR is below threshold
         peak_rms = 0.0  # peak raw RMS during this segment (for relative silence detection)
         relative_silence_samples = 0  # consecutive samples below relative silence threshold
+        stream_buffer: list[np.ndarray] = []
+        stream_text = ""
+        stream_revision_count = 0
+        stream_first_partial_ms: int | None = None
+        stream_last_change_at: float | None = None
+        speech_like_frames = 0
+        segment_frame_count = 0
+        last_idle_heartbeat = 0.0
         local_stop = asyncio.Event()
 
         # 常驻 raw 底噪追踪器 — 跨段持久, IDLE 也在跑, 段间不重置
@@ -1038,6 +1152,9 @@ async def transcribe_forever(
             nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples
             nonlocal silence_samples, energy_silent_samples, peak_rms
             nonlocal relative_silence_samples
+            nonlocal stream_buffer, stream_text, stream_revision_count
+            nonlocal stream_first_partial_ms, stream_last_change_at
+            nonlocal speech_like_frames, segment_frame_count
             frames = []
             raw_frames = []
             started_at = None
@@ -1052,6 +1169,40 @@ async def transcribe_forever(
             energy_silent_samples = 0
             peak_rms = 0.0
             relative_silence_samples = 0
+            stream_buffer = []
+            stream_text = ""
+            stream_revision_count = 0
+            stream_first_partial_ms = None
+            stream_last_change_at = None
+            speech_like_frames = 0
+            segment_frame_count = 0
+
+        def _flush_stream() -> tuple[str, int | None, int, int]:
+            nonlocal stream_buffer, stream_text, stream_revision_count
+            nonlocal stream_first_partial_ms, stream_last_change_at
+            if stream_asr is not None:
+                try:
+                    pending = np.concatenate(stream_buffer) if stream_buffer else np.empty(0, dtype=np.float32)
+                    result = stream_asr.transcribe_chunk(pending, sr, is_final=True)
+                    if result.text and result.text != stream_text:
+                        stream_text = result.text
+                        stream_revision_count += 1
+                        stream_last_change_at = time.monotonic()
+                        send("transcript_partial", {
+                            "segment_id": current_segment_id,
+                            "text": stream_text,
+                            "revision": stream_revision_count,
+                            "is_final": True,
+                        })
+                except Exception as exc:
+                    send("model_error", {"component": "stream_asr", "message": str(exc)})
+                    try:
+                        stream_asr.reset()
+                    except Exception:
+                        pass
+            stable_ms = int(max(0.0, time.monotonic() - stream_last_change_at) * 1000) if stream_last_change_at else 0
+            stream_buffer = []
+            return stream_text, stream_first_partial_ms, stream_revision_count, stable_ms
 
         def force_segment_end(trigger_reason: str) -> None:
             nonlocal state
@@ -1073,6 +1224,8 @@ async def transcribe_forever(
             seg_audio = np.concatenate(frames) if frames else np.empty(0, dtype=np.float32)
             seg_raw = np.concatenate(raw_frames) if raw_frames else seg_audio
             seg_duration_ms = round(len(seg_audio) * 1000 / sr)
+            partial, first_partial_ms, revisions, stable_ms = _flush_stream()
+            speech_ratio = speech_like_frames / max(segment_frame_count, 1)
             if seg_duration_ms >= settings.segment.min_duration_ms:
                 worker.submit(
                     SegmentJob(
@@ -1085,6 +1238,11 @@ async def transcribe_forever(
                         end_trigger=trigger_reason,
                         noise_floor_rms=raw_noise_tracker.floor_rms,
                         is_warmup=raw_noise_tracker.is_warmup,
+                        speech_ratio=speech_ratio,
+                        stream_text=partial,
+                        stream_first_partial_ms=first_partial_ms,
+                        stream_revision_count=revisions,
+                        stream_stable_ms=stable_ms,
                     )
                 )
             else:
@@ -1096,6 +1254,7 @@ async def transcribe_forever(
                     "duration_ms": seg_duration_ms,
                 })
             state = PipelineState.IDLE
+            send("pipeline_status", {"phase": "idle", "component": "vad", "message": "等待人声"})
             _reset_observing()
             _reset_recording()
             vad.reset()
@@ -1119,22 +1278,41 @@ async def transcribe_forever(
                 "channels": settings.audio.channels,
             },
         )
+        send("pipeline_status", {"phase": "idle", "component": "vad", "message": "麦克风已连接，等待人声"})
         # 启动环境监测（YAMNet 定时轮询）
         if env_monitor is not None and hasattr(env_monitor, "start"):
             def _on_env_event(ev: EnvEvent) -> None:
                 category = getattr(ev, "category", "unknown")
                 send("environment_event", {
-                    "timestamp": getattr(ev, "timestamp", 0),
+                    "id": getattr(ev, "id", ""),
                     "category": category,
+                    "started_at": getattr(ev, "started_at", 0),
+                    "ended_at": getattr(ev, "ended_at", 0),
                     "confidence": getattr(ev, "confidence", 0),
-                    "duration_sec": getattr(ev, "duration_sec", None),
+                    "duration_sec": getattr(ev, "duration_sec", 0),
                 })
                 # 环境联动: 噪声类收紧前端 NoiseGate/AGC, 缓解流式噪声误触发
                 preprocessor = getattr(capture, "preprocessor", None)
                 if preprocessor is not None and preprocessor.apply_environment(category):
                     output(f"[env] 前端降噪联动: {category}")
-            env_monitor.start(_on_env_event)  # type: ignore[union-attr]
-            output("[env] EnvironmentMonitor started")
+            def _on_env_status(status: EnvironmentStatus) -> None:
+                send("environment_status", {
+                    "status": status.status,
+                    "category": status.category,
+                    "confidence": status.confidence,
+                })
+            env_monitor.configure(_on_env_event, _on_env_status)  # type: ignore[union-attr]
+            if environment_enabled:
+                if env_monitor.start():  # type: ignore[union-attr]
+                    output("[env] EnvironmentMonitor started")
+            else:
+                env_monitor.disable()  # type: ignore[union-attr]
+        else:
+            send("environment_status", {
+                "status": "unavailable" if environment_enabled else "disabled",
+                "category": "",
+                "confidence": 0.0,
+            })
         try:
             iterator = capture.frames_with_raw().__aiter__()
             try:
@@ -1162,6 +1340,9 @@ async def transcribe_forever(
                 nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples
                 nonlocal silence_samples, energy_silent_samples, peak_rms
                 nonlocal relative_silence_samples
+                nonlocal stream_buffer, stream_text, stream_revision_count
+                nonlocal stream_first_partial_ms, stream_last_change_at
+                nonlocal speech_like_frames, segment_frame_count
                 state = PipelineState.RECORDING
                 frames = list(initial_frames)
                 raw_frames = list(initial_raw)
@@ -1177,6 +1358,15 @@ async def transcribe_forever(
                 energy_silent_samples = 0
                 peak_rms = 0.0
                 relative_silence_samples = 0
+                stream_buffer = []
+                stream_text = ""
+                stream_revision_count = 0
+                stream_first_partial_ms = None
+                stream_last_change_at = None
+                speech_like_frames = 0
+                segment_frame_count = 0
+                if stream_asr is not None:
+                    stream_asr.reset()
                 send(
                     "speech_started",
                     {
@@ -1185,6 +1375,7 @@ async def transcribe_forever(
                         "speaker_label": initial_label,
                     },
                 )
+                send("pipeline_status", {"phase": "speech", "component": "vad", "message": "检测到人声"})
                 output(f"[{current_segment_id[:8]}] recording started speaker={initial_label}")
 
             def _check_speaker_switch() -> bool | None:
@@ -1335,6 +1526,10 @@ async def transcribe_forever(
                 nonlocal last_speaker_check_samples, speaker_switch_streak, last_switch_samples
                 nonlocal silence_samples, energy_silent_samples, peak_rms
                 nonlocal relative_silence_samples
+                nonlocal stream_buffer, stream_text, stream_revision_count
+                nonlocal stream_first_partial_ms, stream_last_change_at
+                nonlocal speech_like_frames, segment_frame_count
+                nonlocal last_idle_heartbeat
                 processed_rms = float(np.sqrt(np.mean(processed**2)))
                 raw_rms = float(np.sqrt(np.mean(raw**2)))
                 send("audio_level", {
@@ -1352,6 +1547,13 @@ async def transcribe_forever(
                 raw_noise_tracker.accept_frame(raw_rms, vad.active)
 
                 if state == PipelineState.IDLE:
+                    now_mono = time.monotonic()
+                    if now_mono - last_idle_heartbeat >= 1.0:
+                        last_idle_heartbeat = now_mono
+                        send("pipeline_status", {
+                            "phase": "idle", "component": "vad",
+                            "message": "麦克风已连接，等待人声",
+                        })
                     # Check for VAD start
                     for boundary in vad.accept(processed, sr):
                         if boundary.started:
@@ -1406,6 +1608,32 @@ async def transcribe_forever(
                 elif state == PipelineState.RECORDING:
                     frames.append(processed)
                     raw_frames.append(raw)
+                    segment_frame_count += 1
+                    if vad.active or (energy_vad is not None and energy_vad.active):
+                        speech_like_frames += 1
+                    if stream_asr is not None:
+                        stream_buffer.append(processed)
+                        buffered_samples = sum(item.size for item in stream_buffer)
+                        if buffered_samples >= int(sr * 0.2):
+                            chunk = np.concatenate(stream_buffer)
+                            stream_buffer = []
+                            try:
+                                result = stream_asr.transcribe_chunk(chunk, sr)
+                                if result.text and result.text != stream_text:
+                                    stream_text = result.text
+                                    stream_revision_count += 1
+                                    stream_last_change_at = time.monotonic()
+                                    if stream_first_partial_ms is None and started_at is not None:
+                                        stream_first_partial_ms = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000))
+                                    send("transcript_partial", {
+                                        "segment_id": current_segment_id,
+                                        "text": stream_text,
+                                        "revision": stream_revision_count,
+                                        "latency_ms": stream_first_partial_ms,
+                                    })
+                                    send("pipeline_status", {"phase": "streaming", "component": "stream_asr", "message": "正在识别"})
+                            except Exception as exc:
+                                send("model_error", {"component": "stream_asr", "message": str(exc)})
                     frame_samples = processed.size
                     total_samples = sum(f.size for f in frames)
                     total_duration_ms = round(total_samples * 1000 / sr)
@@ -1533,6 +1761,8 @@ async def transcribe_forever(
                 seg_audio = np.concatenate(frames)
                 seg_raw = np.concatenate(raw_frames) if raw_frames else seg_audio
                 seg_duration_ms = round(len(seg_audio) * 1000 / sr)
+                partial, first_partial_ms, revisions, stable_ms = _flush_stream()
+                speech_ratio = speech_like_frames / max(segment_frame_count, 1)
                 if seg_duration_ms < settings.segment.min_duration_ms:
                     output(f"[{current_segment_id[:8]}] discarded: too short on stop ({seg_duration_ms}ms)")
                     send(
@@ -1555,15 +1785,22 @@ async def transcribe_forever(
                             end_trigger="stop",
                             noise_floor_rms=raw_noise_tracker.floor_rms,
                             is_warmup=raw_noise_tracker.is_warmup,
+                            speech_ratio=speech_ratio,
+                            stream_text=partial,
+                            stream_first_partial_ms=first_partial_ms,
+                            stream_revision_count=revisions,
+                            stream_stable_ms=stable_ms,
                         )
                     )
             capture.stop()
+            if env_monitor is not None:
+                env_monitor.stop()
             if can_install_signal and previous is not None:
                 signal.signal(signal.SIGINT, previous)
     finally:
         worker.close()
         # Explicitly unload all models to free memory (especially PyTorch/MPS)
-        for _obj in (vad, speaker, energy_vad, vad_model):
+        for _obj in (vad, speaker, energy_vad, vad_model, stream_asr):
             if _obj is not None:
                 _safe_unload(_obj)
         # Stop audio capture if still running

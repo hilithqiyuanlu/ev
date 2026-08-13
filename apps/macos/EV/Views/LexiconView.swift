@@ -271,6 +271,36 @@ struct LexiconView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 6)
+            Text(item.statusLabel)
+                .font(.caption)
+                .foregroundStyle(item.status == "pending" ? .orange : .secondary)
+            if item.source == "auto" && item.status == "pending" {
+                Button {
+                    model.confirmLexiconWord(item.id)
+                } label: {
+                    Image(systemName: "checkmark")
+                }
+                .buttonStyle(.borderless)
+                .help("确认并启用")
+                Button {
+                    model.rejectLexiconWord(item.id)
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("拒绝并停用")
+            } else if item.source != "system" {
+                Button {
+                    model.setLexiconWordStatus(
+                        item.id,
+                        status: item.status == "active" ? "disabled" : "active"
+                    )
+                } label: {
+                    Image(systemName: item.status == "active" ? "pause" : "play")
+                }
+                .buttonStyle(.borderless)
+                .help(item.status == "active" ? "停用" : "启用")
+            }
             if item.source != "system" {
                 Button {
                     model.deleteLexiconWord(item.id)
@@ -295,9 +325,20 @@ struct LexiconView: View {
                 .stroke(Color.primary.opacity(0.04), lineWidth: 0.5)
         )
         .contextMenu {
-            if item.source == "auto" {
-                Button("提升为手动词") {
-                    model.updateLexiconWord(item.id, promoteToManual: true)
+            if item.source == "auto" && item.status == "pending" {
+                Button("确认并启用") {
+                    model.confirmLexiconWord(item.id)
+                }
+                Button("拒绝") {
+                    model.rejectLexiconWord(item.id)
+                }
+            }
+            if item.source != "system" && item.status != "pending" {
+                Button(item.status == "active" ? "停用" : "启用") {
+                    model.setLexiconWordStatus(
+                        item.id,
+                        status: item.status == "active" ? "disabled" : "active"
+                    )
                 }
             }
             if item.source != "system" {

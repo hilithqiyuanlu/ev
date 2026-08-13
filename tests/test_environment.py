@@ -2,7 +2,8 @@
 
 import numpy as np
 import pytest
-import tempfile
+import json
+from datetime import datetime
 from pathlib import Path
 
 
@@ -151,8 +152,10 @@ class TestEnvironmentLog:
 
         log = EnvironmentLog(tmp_path)
         event = EnvEvent(
-            timestamp=1754971385.0,
+            id="event-1",
             category="typing",
+            started_at=1754971375.0,
+            ended_at=1754971385.0,
             confidence=0.72,
             duration_sec=10.0,
         )
@@ -169,9 +172,9 @@ class TestEnvironmentLog:
         from ev.store.environment import EnvironmentLog
 
         log = EnvironmentLog(tmp_path)
-        log.append(EnvEvent(100, "typing", 0.8, 5.0))
-        log.append(EnvEvent(200, "music", 0.9, 3.0))
-        log.append(EnvEvent(300, "alert", 0.7, 1.0))
+        log.append(EnvEvent("1", "typing", 95, 100, 0.8, 5.0))
+        log.append(EnvEvent("2", "music", 197, 200, 0.9, 3.0))
+        log.append(EnvEvent("3", "alert", 299, 300, 0.7, 1.0))
 
         results = log.query(start_time=150, end_time=250)
         assert len(results) == 1
@@ -183,14 +186,42 @@ class TestEnvironmentLog:
         from ev.store.environment import EnvironmentLog
 
         log = EnvironmentLog(tmp_path)
-        log.append(EnvEvent(100, "typing", 0.8, 5.0))
-        log.append(EnvEvent(200, "typing", 0.7, 3.0))
-        log.append(EnvEvent(300, "music", 0.9, 2.0))
+        log.append(EnvEvent("1", "typing", 95, 100, 0.8, 5.0))
+        log.append(EnvEvent("2", "typing", 197, 200, 0.7, 3.0))
+        log.append(EnvEvent("3", "music", 298, 300, 0.9, 2.0))
 
         summary = log.query_summary(start_time=0, end_time=500)
         assert summary["dominant_category"] == "typing"
         assert summary["event_count"] == 3
         assert 0.6 < summary["average_confidence"] < 1.0
+
+    def test_old_record_is_normalized(self, tmp_path):
+        from ev.store.environment import EnvironmentLog
+
+        path = tmp_path / "env-2026-08-13.jsonl"
+        path.write_text(json.dumps({
+            "ts": 200.0, "category": "music", "confidence": 0.9, "duration_sec": 5.0,
+        }) + "\n", encoding="utf-8")
+
+        records = EnvironmentLog(tmp_path).query()
+        assert records[0]["started_at"] == 195.0
+        assert records[0]["ended_at"] == 200.0
+        assert records[0]["id"]
+
+    def test_clear_by_local_date_and_clear_all(self, tmp_path):
+        from ev.audio.environment import EnvEvent
+        from ev.store.environment import EnvironmentLog
+
+        log = EnvironmentLog(tmp_path)
+        first = datetime(2026, 8, 12, 12).astimezone().timestamp()
+        second = datetime(2026, 8, 13, 12).astimezone().timestamp()
+        log.append(EnvEvent("1", "typing", first, first + 5, 0.8, 5.0))
+        log.append(EnvEvent("2", "music", second, second + 5, 0.9, 5.0))
+
+        assert log.clear("2026-08-12") == 1
+        assert [record["id"] for record in log.query()] == ["2"]
+        assert log.clear() == 1
+        assert log.query() == []
 
 
 class TestEnvironmentMonitor:
@@ -236,3 +267,44 @@ class TestEnvironmentMonitor:
         assert "buffer_duration_sec" in state
         assert "running" in state
         assert state["running"] is False
+
+    def test_missing_model_reports_unavailable(self, tmp_path):
+        from ev.audio.environment import EnvironmentMonitor
+
+        statuses = []
+        monitor = EnvironmentMonitor(
+            model_path=str(tmp_path / "missing.tflite"),
+            label_path=str(tmp_path / "missing.csv"),
+        )
+        started = monitor.start(lambda _event: None, lambda status: statuses.append(status.status))
+        assert started is False
+        assert statuses == ["loading", "unavailable"]
+        assert monitor.get_current_state()["running"] is False
+
+    def test_current_observation_reports_active_or_quiet(self):
+        from ev.audio.environment import EnvironmentMonitor
+
+        monitor = EnvironmentMonitor("model", "labels")
+        assert monitor.current_observation(["typing", "typing", "music"], [0.8, 0.7, 0.9]) == ("typing", 0.75)
+        assert monitor.current_observation(["other"], [0.9])[0] == ""
+        assert monitor.current_observation(["music"], [0.1])[0] == ""
+
+    def test_disable_stops_monitor_clears_buffer_and_reports_status(self):
+        from ev.audio.environment import EnvironmentMonitor
+
+        statuses = []
+        monitor = EnvironmentMonitor("model", "labels")
+        monitor.configure(lambda _event: None, lambda status: statuses.append(status.status))
+        monitor._running = True
+        monitor.feed(np.array([0.1, 0.2], dtype=np.float32))
+
+        monitor.disable()
+
+        assert monitor.get_current_state()["running"] is False
+        assert len(monitor._buffer) == 0
+        assert statuses == ["disabled"]
+
+        monitor._load_model = lambda: True
+        assert monitor.enable() is True
+        assert monitor.get_current_state()["running"] is True
+        monitor.stop()

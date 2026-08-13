@@ -147,6 +147,20 @@ struct ActivityStatusView: View {
                 .lineLimit(4)
                 .textSelection(.enabled)
                 .frame(maxWidth: 640)
+            DisclosureGroup("诊断") {
+                HStack(spacing: 16) {
+                    Label(String(format: "%.0f dB", model.rawRmsDb), systemImage: "waveform")
+                    Label(String(format: "AGC ×%.1f", model.agcGain), systemImage: "slider.horizontal.3")
+                    if let latency = model.lastPartialLatencyMS {
+                        Label("字幕 \(latency) ms", systemImage: "captions.bubble")
+                    }
+                    Label("终稿队列 \(model.pipelineQueueDepth)", systemImage: "text.line.last.and.arrowtriangle.forward")
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .frame(maxWidth: 640)
         }
         .padding(.horizontal, 24)
         .frame(maxWidth: .infinity, minHeight: 190, alignment: .center)
@@ -189,6 +203,11 @@ struct SegmentRow: View {
         FileManager.default.fileExists(atPath: segment.audioPath)
     }
 
+    private var rawAudioFileExists: Bool {
+        guard let path = segment.rawAudioPath else { return false }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Button {
@@ -200,6 +219,17 @@ struct SegmentRow: View {
             .buttonStyle(.borderless)
             .help("回放语音")
             .disabled(!audioFileExists)
+            if let rawPath = segment.rawAudioPath {
+                Button {
+                    model.audioPlayer.toggle(path: rawPath)
+                } label: {
+                    Image(systemName: model.audioPlayer.playingPath == rawPath ? "stop.circle.fill" : "waveform.circle")
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.borderless)
+                .help("回放原始音频")
+                .disabled(!rawAudioFileExists)
+            }
 
             VStack(alignment: .leading, spacing: 5) {
                 Group {
@@ -233,7 +263,7 @@ struct SegmentRow: View {
                             qualityLabelText(segment.qualityLabel),
                             systemImage: "exclamationmark.triangle.fill"
                         )
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(segment.qualityLabel.hasPrefix("rejected_") ? .red : .orange)
                     }
                     if segment.queryCandidate {
                         Label(segment.queryText.isEmpty ? "Query" : segment.queryText, systemImage: "bolt.fill")
@@ -298,15 +328,10 @@ struct HistoryRow: View {
         let audioFileExists = FileManager.default.fileExists(atPath: segment.audioPath)
         let isPlaying = model.audioPlayer.playingPath == segment.audioPath
         return HStack(alignment: .top, spacing: 12) {
-            // 左侧圆形说话人图标（对齐声纹样本）
-            ZStack {
-                Circle()
-                    .fill(speakerTint(segment).opacity(0.15))
-                    .frame(width: 32, height: 32)
-                Image(systemName: speakerIcon(segment))
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(speakerTint(segment))
-            }
+            Image(systemName: speakerIcon(segment))
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(speakerTint(segment))
+                .frame(width: 28, height: 28)
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(transcriptText(segment))
@@ -391,7 +416,9 @@ struct HistoryRow: View {
                 expanded.toggle()
             }
         }
-        .padding(.vertical, 5)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
     }
 
     private func speakerIcon(_ segment: Segment) -> String {
@@ -452,8 +479,9 @@ struct HistoryRow: View {
     private func queryRow(_ query: QueryItem) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: query.source == "manual" ? "keyboard" : "mic")
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 18)
+                .frame(width: 28, height: 28)
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(query.text)
@@ -481,7 +509,9 @@ struct HistoryRow: View {
             .buttonStyle(.borderless)
             .help("删除此记录")
         }
-        .padding(.vertical, 5)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
     }
 }
 
@@ -559,6 +589,9 @@ private func qualityLabelText(_ label: String) -> String {
     case "rejected_low_snr": return "信噪比低"
     case "rejected_low_level": return "音量过低"
     case "rejected_non_voice": return "非人声"
+    case "rejected_unstable": return "识别不稳定"
+    case "borderline": return "质量一般"
+    case "processing_error": return "处理失败"
     default: return label
     }
 }
