@@ -664,8 +664,9 @@ class SegmentWorker:
             self._processor.final_asr = None
 
     def close(self) -> None:
+        """Process every submitted job before releasing model resources."""
         self.jobs.put(None)
-        self.thread.join(timeout=10)
+        self.thread.join()
         with self._final_asr_lock:
             if self._final_asr is not None:
                 _safe_unload(self._final_asr)
@@ -941,12 +942,14 @@ async def transcribe_forever(
     profile_centroids = load_centroids()
 
     # 实例化降噪适配器 — 用于语音路径预处理
-    denoiser_adapter = DenoiseAdapter(model_path=denoiser_path)
+    denoiser_adapter: DenoiseAdapter | None = None
     if denoiser_path is None:
         output("[denoise] 未配置本地降噪模型，历史音频无降噪（可在模型页安装 DFSMN-ANS）")
-    elif not denoiser_adapter.available:
-        reason = denoiser_adapter.last_error or "unknown"
-        output(f"[denoise] 加载失败: {reason} (历史音频将无降噪)")
+    else:
+        denoiser_adapter = DenoiseAdapter(model_path=denoiser_path)
+        if not denoiser_adapter.available:
+            reason = denoiser_adapter.last_error or "unknown"
+            output(f"[denoise] 加载失败: {reason} (历史音频将无降噪)")
     worker = SegmentWorker(
         settings, paths, speaker, output, send, shared_threshold,
         final_asr_resolver=final_asr_resolver,
@@ -1136,6 +1139,8 @@ async def transcribe_forever(
             iterator = capture.frames_with_raw().__aiter__()
             try:
                 first_pair = await asyncio.wait_for(iterator.__anext__(), timeout=2.0)
+            except StopAsyncIteration:
+                return
             except asyncio.TimeoutError as exc:
                 raise RuntimeError("麦克风已打开，但两秒内没有收到音频帧") from exc
 

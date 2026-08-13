@@ -53,7 +53,7 @@ to interact.
 
 ## Documentation
 
-- [audio-flows.md](docs/audio-flows.md) — Audio processing pipeline
+- [audio-flow.md](docs/audio-flow.md) — Audio processing pipeline
 - [voiceprint.md](docs/voiceprint.md) — Voiceprint flow and speaker verification
 - [voice-learning.md](docs/voice-learning.md) — Voice sample tiering, cluster competition, pending confirmation
 

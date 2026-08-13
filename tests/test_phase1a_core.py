@@ -404,6 +404,57 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
     assert [kind for kind in kinds if kind in ordered] == ordered
 
 
+def test_runtime_does_not_load_denoiser_when_unconfigured(tmp_path, monkeypatch):
+    monkeypatch.setenv("EV_DATA_DIR", str(tmp_path / "data"))
+    settings = load_settings()
+
+    class Denoiser:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("unconfigured denoiser must not be created")
+
+    class VAD:
+        def __init__(self, path, **kwargs):
+            pass
+
+        def accept(self, frame, sample_rate, is_final=False):
+            return ()
+
+    class Speaker:
+        def __init__(self, path):
+            pass
+
+    class Capture:
+        def __init__(self, audio, device=None, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        async def frames_with_raw(self):
+            if False:
+                yield np.empty(0), np.empty(0)
+
+    monkeypatch.setattr(runtime_module, "DenoiseAdapter", Denoiser)
+    monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
+    monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
+    monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
+    for name in ("vad", "final", "speaker"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setattr(
+        "ev.models.resolve_model_paths",
+        lambda settings, root=None: {
+            "vad": tmp_path / "vad",
+            "asr_final": tmp_path / "final",
+            "speaker": tmp_path / "speaker",
+        },
+    )
+
+    asyncio.run(runtime_module.transcribe_forever(settings, output=lambda _: None))
+
+
 def test_text_cleaning_collapses_cjk_spaces_preserves_english():
     from ev.asr.adapters import _clean_text
     assert _clean_text("欢 迎 大 家") == "欢迎大家"

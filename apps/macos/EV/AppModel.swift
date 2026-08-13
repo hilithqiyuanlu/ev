@@ -116,7 +116,6 @@ final class AppModel: ObservableObject {
     @Published var segments: [Segment] = []
     @Published var queries: [QueryItem] = []
     @Published var historyItems: [HistoryItem] = []
-    @Published var models: [ModelStatus] = []
     @Published var availableModels: [AvailableModel] = []
     @Published var installedModels: [InstalledModel] = []
     @Published var slotAssignments: [SlotAssignment] = []
@@ -733,7 +732,7 @@ final class AppModel: ObservableObject {
             isLoadingHistory = false
         case "segment_deleted", "segments_deleted", "query_deleted", "queries_deleted":
             loadHistory()
-            // Deleting segments may cascade-delete auto voice samples - refresh
+            // Segment deletion preserves samples but clears their segment link.
             loadVoiceSamples()
         case "segment_corrected":
             if let changed = event.payload["changed"]?.bool, changed,
@@ -751,7 +750,6 @@ final class AppModel: ObservableObject {
         case "query_candidate":
             loadHistory()
         case "model_status":
-            handleModelStatus(event.payload)
             if event.payload["models"] != nil {
                 isVerifyingModels = false
                 showVerificationDone = true
@@ -759,6 +757,10 @@ final class AppModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     self.showVerificationDone = false
                 }
+            }
+            if event.payload["status"]?.string == "complete" {
+                downloadProgress = 1
+                engine.send("verify_models")
             }
         case "available_models":
             availableModels = event.payload["models"]?.array?.compactMap(AvailableModel.init) ?? []
@@ -902,22 +904,6 @@ final class AppModel: ObservableObject {
             errorMessage = event.payload["message"]?.string ?? "未知错误"
         default:
             break
-        }
-    }
-
-    private func handleModelStatus(_ payload: [String: JSONValue]) {
-        if let values = payload["models"]?.array {
-            models = values.compactMap(ModelStatus.init)
-            return
-        }
-        if let status = ModelStatus(.object(payload)) {
-            models.removeAll { $0.key == status.key }
-            models.append(status)
-            models.sort { $0.key < $1.key }
-        }
-        if payload["status"]?.string == "complete" {
-            downloadProgress = 1
-            engine.send("verify_models")
         }
     }
 

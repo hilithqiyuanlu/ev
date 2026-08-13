@@ -241,22 +241,6 @@ enum HistoryItem: Identifiable, Hashable {
     }
 }
 
-struct ModelStatus: Identifiable, Hashable {
-    let key: String
-    let ready: Bool
-    let path: String
-    let errors: [String]
-    var id: String { key }
-
-    init?(_ value: JSONValue) {
-        guard let object = value.object, let key = object["key"]?.string else { return nil }
-        self.key = key
-        self.ready = object["ready"]?.bool ?? (object["status"]?.string == "ready")
-        self.path = object["path"]?.string ?? ""
-        self.errors = object["errors"]?.array?.compactMap(\.string) ?? []
-    }
-}
-
 // MARK: - Registry-based model management
 
 struct AvailableModel: Identifiable, Hashable {

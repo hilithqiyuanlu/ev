@@ -62,11 +62,13 @@ private func envelope(_ type: String, _ payload: String) throws -> EngineEnvelop
     let engine = FakeEngine()
     let model = AppModel(engine: engine, permissionProvider: AllowedPermission())
     model.runtimeReady = true
-    model.models = [
-        ModelStatus(.object(["key": .string("vad"), "status": .string("ready")])),
-        ModelStatus(.object(["key": .string("asr_streaming"), "status": .string("ready")])),
-        ModelStatus(.object(["key": .string("asr_final"), "status": .string("ready")])),
-        ModelStatus(.object(["key": .string("speaker"), "status": .string("ready")])),
+    model.slotAssignments = [
+        SlotAssignment(.object([
+            "slot": .string("vad"),
+            "model_key": .string("fsmn-vad"),
+            "enabled": .bool(true),
+            "status": .object(["ready": .bool(true)]),
+        ])),
     ].compactMap { $0 }
     model.handle(
         try envelope(
