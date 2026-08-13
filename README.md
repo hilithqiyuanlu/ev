@@ -8,25 +8,15 @@ history stay on your device.
 
 ## Features
 
-- macOS menu bar app (SwiftUI)
-- Real-time streaming transcription with endpoint detection
-- Automatic speaker recognition — it learns your voice as you use it
-- Voice onboarding: guided core-sample enrollment before automatic learning kicks in
-- Wake word "小E" (ASR homophone tolerance, 嗨/hi/hai greeting handling)
-- Local recording history with playback, instant filtering, and one-click correction
-- Personal hotword lexicon (manual + auto-learned) injected into ASR
-- Multilingual final ASR: SenseVoice Small by default; optional Qwen3-ASR (1.7B) for
-  hotword-boosted mixed Chinese-English transcription
-- Far-field pickup: AGC/pre-emphasis/noise-gate preprocessing, composite FSMN+energy VAD
-- Speech enhancement: DFSMN-ANS denoising before final transcription
-- Human-voice confirmation: FSMN-based check rejects non-speech segments (fan/typing/noise)
-  before they hit storage
-- Environment awareness: YAMNet real-time sound classification (typing / music / traffic /
-  alerts…), logged separately from your voice data
-- Real-time speaker-turn tracking ("second-ear" mode) with dual WAV archive (processed + raw)
+- Native macOS menu bar app (SwiftUI) with a local Python engine
+- Real-time streaming transcription, endpoint detection, and "小E" wake word
+- Speaker recognition that learns your voice — guided onboarding, then automatic learning
+- Far-field pickup: AGC/noise-gate preprocessing, composite VAD, DFSMN-ANS denoising
+- Human-voice confirmation rejects non-speech noise (fan / typing / music)
+- Environment awareness: YAMNet sound classification, logged separately from voice data
+- Local history with playback, filtering, correction, and a personal hotword lexicon
 
-What's not here yet (but coming): LLM reasoning, text-to-speech, multi-speaker diarization,
-standalone distribution.
+Not here yet: LLM reasoning, text-to-speech, multi-speaker diarization, standalone distribution.
 
 ## Quick Start
 
