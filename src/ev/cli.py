@@ -109,7 +109,7 @@ def _cmd_models_verify(settings: Settings, model_root: str | None) -> int:
 
 
 def _cmd_models_download(settings: Settings, model_root: str | None) -> int:
-    from .model_download import ModelDownloader
+    from .model_registry import ModelRegistry
 
     settings = _settings_with_model_root(settings, model_root)
 
@@ -128,7 +128,12 @@ def _cmd_models_download(settings: Settings, model_root: str | None) -> int:
                 last_percent = percent
                 print(f"\r下载进度 {percent}%", end="", flush=True)
 
-    ModelDownloader(settings.models, report).download_all()
+    try:
+        registry = ModelRegistry(settings.models.root, emit=report)
+        registry.install_all_from_manifest()
+    except RuntimeError as exc:
+        print(f"\n下载失败: {exc}")
+        return 1
     print()
     return 0
 

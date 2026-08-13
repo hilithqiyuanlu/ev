@@ -87,3 +87,36 @@ def test_denoise_enhance_short_segment_fallback():
     result = adapter.enhance(audio, 16000)
     # 即使模型可用 (实际上未安装)，也应跳过
     np.testing.assert_array_almost_equal(result, audio)
+
+
+class _FakeANS:
+    """模拟 ModelScope ANS pipeline: 返回 int16 LE PCM bytes (native 48k)。"""
+
+    def __init__(self, pcm_48k: np.ndarray) -> None:
+        self._pcm = pcm_48k
+
+    def __call__(self, path) -> dict:
+        return {"output_pcm": (np.clip(self._pcm, -1, 1) * 32767).astype("<i2").tobytes()}
+
+
+def test_enhance_parses_output_pcm_bytes():
+    """pipeline 以 bytes (int16 PCM) 返回时, enhance() 必须解析而非原样返回。
+
+    回归: 此前只认 np.ndarray/文件路径, bytes 走 else 分支返回原音频,
+    导致降噪形同虚设 (输出 = 输入)。"""
+    from ev.audio.denoise import DenoiseAdapter
+    from ev.audio.utils import resample
+
+    sr = 16000
+    t = np.arange(sr) / sr
+    audio = (0.1 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
+    out_48k = resample(audio, sr, 48000)
+
+    adapter = DenoiseAdapter()
+    adapter._pipeline = _FakeANS(out_48k)
+    adapter._load_attempted = True
+
+    result = adapter.enhance(audio, sr)
+    assert result.shape == audio.shape
+    expected = resample(out_48k, 48000, sr)
+    np.testing.assert_allclose(result, expected, atol=2e-3)

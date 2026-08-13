@@ -255,6 +255,27 @@ class TestAudioPreprocessor:
         # 值几乎一致 (允许浮点误差)
         np.testing.assert_allclose(out_seg, out_framewise, atol=1e-5)
 
+    def test_apply_environment_tightens_and_restores(self):
+        """环境联动: 噪声类收紧 NoiseGate/AGC, 语音/静音还原默认."""
+        pp = AudioPreprocessor(sample_rate=SR, frame_ms=FRAME_MS)
+        default_snr = pp._default_snr_db
+        default_max = pp._default_max_gain
+
+        assert pp.apply_environment("typing") is True
+        assert pp._ng.current_snr_db > default_snr
+        assert pp._agc.max_gain < default_max
+
+        # 已处于噪声态, 再报噪声类应幂等 (不重复变更)
+        assert pp.apply_environment("background_noise") is False
+
+        # 静音还原默认
+        assert pp.apply_environment("silence") is True
+        assert pp._ng.current_snr_db == default_snr
+        assert pp._agc.max_gain == default_max
+
+        # 语音/背景人声不收紧 (避免误伤用户说话)
+        assert pp.apply_environment("background_speech") is False
+
 
 # ============================================================
 # EnergyVAD 测试

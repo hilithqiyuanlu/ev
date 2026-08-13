@@ -7,6 +7,7 @@ struct ModelsView: View {
     private let typeOrder: [String] = [
         "vad",
         "speech_enhancement",
+        "asr_stream",
         "asr_final",
         "speaker",
         "environment",
@@ -15,7 +16,8 @@ struct ModelsView: View {
     private let typeNames: [String: String] = [
         "vad": "语音活动检测（VAD）",
         "speech_enhancement": "语音增强/降噪",
-        "asr_final": "自动语音识别（ASR）",
+        "asr_stream": "流式ASR",
+        "asr_final": "终稿ASR",
         "speaker": "声纹识别",
         "environment": "环境感知",
     ]

@@ -19,13 +19,10 @@ from typing import Any, Callable
 import numpy as np
 
 from ..asr.adapters import (
-    SenseVoiceAdapter,
     SpeakerEmbeddingAdapter,
     TranscriptionResult,
     TranscriptionSegment,
-    _find_model_root,
 )
-from ..asr.qwen3_adapter import Qwen3ASRAdapter
 from ..audio.capture import AudioCapture
 from ..audio.preprocess import AudioPreprocessor, PreprocessParams
 from ..audio.energy_vad import EnergyVAD, EnergyVADParams
@@ -273,56 +270,6 @@ def _compute_dominant_speaker(speaker_turns: tuple) -> tuple[str, bool]:
     return dominant, contains_user
 
 
-def _create_final_asr_adapter(model_path: Path) -> SenseVoiceAdapter | Qwen3ASRAdapter:
-    """根据模型目录内容自动检测并创建对应的 ASR 适配器。
-
-    检测逻辑 (优先级):
-    1. config.json 且 model_type 包含 qwen3/qwen2/omni/whisper → Qwen3ASRAdapter
-    2. configuration.json/config.yaml (FunASR格式) → SenseVoiceAdapter (SenseVoice)
-    3. 仅 config.json (transformers格式但未识别) → 尝试Qwen3ASRAdapter
-    """
-    path = _find_model_root(str(model_path))
-    if not path.is_dir():
-        raise RuntimeError(f"模型目录不存在: {path}")
-
-    has_transformers_config = (path / "config.json").exists()
-    has_funasr_config = (path / "configuration.json").exists() or (path / "config.yaml").exists()
-
-    _TRANSFORMER_ASR_KEYWORDS = ("qwen3", "qwen2", "omni", "whisper", "qwen3_asr")
-
-    # Check transformers config FIRST — Qwen3-ASR from ModelScope has BOTH config.json
-    # AND configuration.json; we must detect it via model_type before defaulting to FunASR.
-    if has_transformers_config:
-        try:
-            config = json.loads((path / "config.json").read_text())
-            model_type = (config.get("model_type", "") or "").lower()
-            architectures = config.get("architectures", []) or []
-            arch_str = " ".join(str(a).lower() for a in architectures)
-            is_transformer_asr = any(
-                kw in model_type or kw in arch_str
-                for kw in _TRANSFORMER_ASR_KEYWORDS
-            )
-            if is_transformer_asr:
-                LOGGER = logging.getLogger(__name__)
-                LOGGER.info(
-                    "Detected transformer ASR model (model_type=%s, arch=%s) → Qwen3ASRAdapter",
-                    model_type, arch_str[:80],
-                )
-                return Qwen3ASRAdapter(str(path))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # FunASR format (Paraformer uses configuration.json; SenseVoice uses config.yaml)
-    if has_funasr_config:
-        return SenseVoiceAdapter(str(path))
-
-    # Unknown transformers format — try Qwen3 as fallback
-    if has_transformers_config:
-        return Qwen3ASRAdapter(str(path))
-
-    raise RuntimeError(f"无法识别的模型配置格式: {path}")
-
-
 class SegmentProcessor:
     def __init__(
         self,
@@ -331,7 +278,7 @@ class SegmentProcessor:
         speaker: SpeakerEmbeddingAdapter,
         vad_model_id: str,
         voice_profile: VoiceProfileManager,
-        final_asr: SenseVoiceAdapter | Qwen3ASRAdapter | None = None,
+        final_asr: Any | None = None,  # 终稿 ASR (Fun-ASR-Nano)，由 worker 懒加载注入
         output: Callable[[str], None] = print,
         emit: Callable[[str, dict], None] | None = None,
         hotwords: str = "",
@@ -384,10 +331,22 @@ class SegmentProcessor:
         # Loudness normalize before embedding for robustness to mic distance/volume
         audio_for_embedding = normalize_loudness(audio) if self.settings.speaker.loudness_normalize else audio
 
-        # Single ASR: SenseVoice (or Qwen3 if resolved)
+        # 终稿 ASR (Fun-ASR-Nano): 未加载时 _final() 返回 None
         final_result = self._final(audio)
         final_text = final_result.text if final_result else ""
         transcript = final_text
+
+        # Hotword hit statistics: how much of this transcript is covered by lexicon
+        # words, and which words actually matched. Records which words ASR got right
+        # (or corrected via postprocess) so recall is observable instead of guessed.
+        hotword_density: float | None = None
+        hotword_hits: list[str] = []
+        if self.hotword_entries and final_text:
+            hotword_density = round(_compute_hotword_coverage(final_text, self.hotword_entries), 4)
+            hotword_hits = [
+                w for w, _ in self.hotword_entries
+                if w and w in final_text
+            ]
 
         # Empty or filler-only segments are discarded (no WAV, no DB, no speaker check).
         if not transcript.strip():
@@ -480,7 +439,6 @@ class SegmentProcessor:
             transcript_final=final_text, speaker_label=speaker_label, speaker_score=score,
             wake_detected=decision.wake_detected, query_candidate=decision.query_candidate,
             query_text=decision.query_text, vad_model=self.vad_model_id,
-            asr_stream_model="",
             asr_final_model=self._final_model_label(),
             speaker_model=self.settings.models.speaker,
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -499,8 +457,12 @@ class SegmentProcessor:
             peak_raw_rms=peak_raw_rms,
             noise_floor_rms=noise_floor_rms,
             snr_db=snr_db,
+            hotword_density=hotword_density,
+            hotword_hits=json.dumps(hotword_hits, ensure_ascii=False) if hotword_hits else None,
         )
         self.store.insert_segment(record)
+        if hotword_hits:
+            self.store.record_hotword_hits(hotword_hits)
         is_filler = self.settings.segment.discard_filler_only and _is_filler_only(transcript)
 
         # Sample collection: collect only from user-only segments with high
@@ -564,26 +526,10 @@ class SegmentProcessor:
         return record
 
     def _final(self, audio: np.ndarray) -> TranscriptionResult | None:
+        # 终稿 ASR (Fun-ASR-Nano) 未加载时无终稿转写。
         if self.final_asr is None:
             return None
-        if isinstance(self.final_asr, Qwen3ASRAdapter):
-            asr_cfg = self.settings.asr
-            result = self.final_asr.transcribe(
-                audio,
-                self.settings.audio.sample_rate,
-                hotword=self.hotwords,
-                hotword_entries=self.hotword_entries or None,
-                enable_hotword_boost=asr_cfg.hotword_boosting_enabled,
-                hotword_boost_scale=asr_cfg.hotword_boost_scale,
-                hotword_boost_max=asr_cfg.hotword_boost_max,
-                hotword_min_anchor_len=asr_cfg.hotword_min_anchor_len,
-            )
-        else:
-            result = self.final_asr.transcribe(
-                audio,
-                self.settings.audio.sample_rate,
-                hotword=self.hotwords,
-            )
+        result = self.final_asr.transcribe(audio, self.settings.audio.sample_rate)
         if isinstance(result, str):
             return TranscriptionResult(text=result)
         return result
@@ -666,6 +612,7 @@ class SegmentWorker:
         emit: Callable[[str, dict], None],
         shared_threshold: dict | None = None,
         final_asr_resolver: Callable[[], Path] | None = None,
+        final_asr_factory: Callable[[Path], Any] | None = None,
         denoiser: DenoiseAdapter | None = None,
     ):
         self.settings = settings
@@ -676,8 +623,9 @@ class SegmentWorker:
         self._processor: SegmentProcessor | None = None
         self._shared_threshold = shared_threshold
         self._final_asr_resolver = final_asr_resolver
+        self._final_asr_factory = final_asr_factory  # 终稿 ASR (Fun-ASR-Nano) 懒加载工厂
         self._final_asr_lock = threading.Lock()
-        self._final_asr: SenseVoiceAdapter | Qwen3ASRAdapter | None = None
+        self._final_asr: Any | None = None
         self._reload_final = threading.Event()
         self._denoiser: DenoiseAdapter | None = denoiser
         self.jobs: queue.Queue[SegmentJob | None] = queue.Queue()
@@ -774,7 +722,7 @@ class SegmentWorker:
                             _snr_db = float(20.0 * np.log10(max(_avg_raw_rms, 1e-10) / _noise_floor))
 
                     # --- 降噪预处理 (语音路径) ---
-                    # SenseVoice 对中等噪声鲁棒，降噪作为可选质量增强
+                    # 降噪作为可选质量增强
                     _denoised: np.ndarray | None = None
                     if job.raw_audio is not None and job.raw_audio.size > 0:
                         _denoiser = self._denoiser
@@ -787,18 +735,16 @@ class SegmentWorker:
                             except Exception:
                                 _denoised = None
 
-                    # --- final ASR 模型懒加载 (一次性) ---
+                    # --- 终稿 ASR (Fun-ASR-Nano) 懒加载 ---
+                    # final_asr_factory 为空时 final_asr 恒为 None，_final() 返回 None。
                     with self._final_asr_lock:
                         final = self._final_asr
-                    if final is None:
+                    if final is None and self._final_asr_factory is not None:
                         final_path = self._resolve_final_asr_path()
-                        self.output(f"[final-asr] loading from {final_path.name}...")
-                        final = _create_final_asr_adapter(final_path)
-                        with self._final_asr_lock:
-                            self._final_asr = final
+                        final = self._final_asr_factory(final_path)
+                        self._final_asr = final
                         self._reload_final.clear()
                         self.output(f"[final-asr] {type(final).__name__} ready")
-                        _log_memory(f"final-asr loaded ({type(final).__name__})")
                     processor.final_asr = final
 
                     # 选择 ASR 输入音频: 降噪后 > 原始
@@ -859,24 +805,45 @@ async def transcribe_forever(
     emit: Callable[[str, dict], None] | None = None,
     worker_holder: dict | None = None,
     final_asr_resolver: Callable[[], Path] | None = None,
+    final_asr_factory: Callable[[Path], Any] | None = None,
     env_monitor: EnvironmentMonitor | None = None,
     denoiser_path: str | None = None,
+    vad_path: str | None = None,
+    speaker_path: str | None = None,
 ) -> None:
-    from ..models import resolve_model_paths, verify_models
+    from ..models import resolve_model_paths
 
-    # Resolve base paths for non-switchable models (vad, streaming, speaker)
+    # Resolve base paths — prefer explicit overrides (from registry), fall back to old settings
     base_paths = resolve_model_paths(settings.models, model_root)
-    # Strictly verify only vad, speaker — asr_final comes from resolver
+
+    # VAD path: explicit override → old settings → error
+    if vad_path is not None:
+        paths = {"vad": Path(vad_path)}
+    else:
+        paths = {}
+        vad_resolved = base_paths.get("vad")
+        if vad_resolved is not None:
+            paths["vad"] = vad_resolved
+
+    # Speaker path: explicit override → old settings → error
+    if speaker_path is not None:
+        paths["speaker"] = Path(speaker_path)
+    elif "speaker" not in paths:
+        speaker_resolved = base_paths.get("speaker")
+        if speaker_resolved is not None:
+            paths["speaker"] = speaker_resolved
+
+    # Verify resolved paths (explicit overrides are verified here, not via old config)
     strict_keys = ("vad", "speaker")
-    checks = verify_models(settings.models, model_root)
-    failed = [
-        f"{c.key}: {', '.join(c.errors)} ({c.path})"
-        for c in checks
-        if not c.ok and c.key in strict_keys
-    ]
+    failed: list[str] = []
+    for key in strict_keys:
+        p = paths.get(key)
+        if p is None:
+            failed.append(f"{key}: 未配置路径")
+        elif not p.is_dir():
+            failed.append(f"{key}: 目录不存在 ({p})")
     if failed:
         raise RuntimeError("本地模型校验失败:\n" + "\n".join(failed))
-    paths = {c.key: c.path for c in checks if c.key in strict_keys}
 
     # Resolve asr_final from registry or fall back to old settings path
     if final_asr_resolver is not None:
@@ -975,9 +942,15 @@ async def transcribe_forever(
 
     # 实例化降噪适配器 — 用于语音路径预处理
     denoiser_adapter = DenoiseAdapter(model_path=denoiser_path)
+    if denoiser_path is None:
+        output("[denoise] 未配置本地降噪模型，历史音频无降噪（可在模型页安装 DFSMN-ANS）")
+    elif not denoiser_adapter.available:
+        reason = denoiser_adapter.last_error or "unknown"
+        output(f"[denoise] 加载失败: {reason} (历史音频将无降噪)")
     worker = SegmentWorker(
         settings, paths, speaker, output, send, shared_threshold,
         final_asr_resolver=final_asr_resolver,
+        final_asr_factory=final_asr_factory,
         denoiser=denoiser_adapter,
     )
     if worker_holder is not None:
@@ -1146,12 +1119,17 @@ async def transcribe_forever(
         # 启动环境监测（YAMNet 定时轮询）
         if env_monitor is not None and hasattr(env_monitor, "start"):
             def _on_env_event(ev: EnvEvent) -> None:
+                category = getattr(ev, "category", "unknown")
                 send("environment_event", {
                     "timestamp": getattr(ev, "timestamp", 0),
-                    "category": getattr(ev, "category", "unknown"),
+                    "category": category,
                     "confidence": getattr(ev, "confidence", 0),
                     "duration_sec": getattr(ev, "duration_sec", None),
                 })
+                # 环境联动: 噪声类收紧前端 NoiseGate/AGC, 缓解流式噪声误触发
+                preprocessor = getattr(capture, "preprocessor", None)
+                if preprocessor is not None and preprocessor.apply_environment(category):
+                    output(f"[env] 前端降噪联动: {category}")
             env_monitor.start(_on_env_event)  # type: ignore[union-attr]
             output("[env] EnvironmentMonitor started")
         try:
@@ -1387,6 +1365,12 @@ async def transcribe_forever(
                     observing_raw_frames.append(raw)
                     obs_samples = sum(f.size for f in observing_frames)
                     gate_samples = _OBSERVING_GATE_MS * sr // 1000
+                    # NOTE: This VAD-end-during-gate path is practically unreachable.
+                    # pre-roll (1200ms) already exceeds _OBSERVING_GATE_MS (900ms),
+                    # so by the time we enter OBSERVING, the gate is immediately
+                    # satisfied and we skip straight to _enter_recording.
+                    # Short-noise filtering is handled downstream by min_duration /
+                    # filler check / empty-segment discard instead.
                     vad_ended = False
                     for boundary in vad.accept(processed, sr):
                         if boundary.ended:

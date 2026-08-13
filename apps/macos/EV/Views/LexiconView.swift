@@ -46,6 +46,7 @@ struct LexiconView: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer()
+            learnCapsule
             addCapsule
             let autoCount = model.lexiconWords.filter { $0.source == "auto" }.count
             if autoCount > 0 {

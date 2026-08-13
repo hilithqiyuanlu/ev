@@ -36,7 +36,7 @@ EV requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/):
 git clone git@github.com:hilithqiyuanlu/ev.git
 cd ev
 uv sync
-uv pip install funasr torch torchaudio
+uv pip install funasr torch torchaudio "modelscope[framework]" speechbrain
 ```
 
 Build and run the macOS app:

@@ -282,7 +282,8 @@ struct HistoryRow: View {
     @EnvironmentObject private var model: AppModel
     let item: HistoryItem
     var onDelete: (() -> Void)?
-    var onEdit: ((Segment) -> Void)?
+    @State private var expanded = false
+    @State private var truncatable = false
 
     var body: some View {
         switch item {
@@ -295,42 +296,46 @@ struct HistoryRow: View {
 
     private func segmentRow(_ segment: Segment) -> some View {
         let audioFileExists = FileManager.default.fileExists(atPath: segment.audioPath)
+        let isPlaying = model.audioPlayer.playingPath == segment.audioPath
         return HStack(alignment: .top, spacing: 12) {
-            Button {
-                model.audioPlayer.toggle(path: segment.audioPath)
-            } label: {
-                Image(systemName: model.audioPlayer.playingPath == segment.audioPath ? "stop.fill" : "play.fill")
-                    .frame(width: 18, height: 18)
+            // 左侧圆形说话人图标（对齐声纹样本）
+            ZStack {
+                Circle()
+                    .fill(speakerTint(segment).opacity(0.15))
+                    .frame(width: 32, height: 32)
+                Image(systemName: speakerIcon(segment))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(speakerTint(segment))
             }
-            .buttonStyle(.borderless)
-            .help("回放语音")
-            .disabled(!audioFileExists)
 
             VStack(alignment: .leading, spacing: 5) {
-                Group {
-                    if segment.utterances.isEmpty {
-                        Text(cleanPrefix(from: segment.transcript).isEmpty ? "（无转写）" : cleanPrefix(from: segment.transcript))
-                            .lineLimit(3)
-                    } else {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(segment.utterances) { utt in
-                                Text(cleanPrefix(from: utt.text))
-                            }
+                Text(transcriptText(segment))
+                    .lineLimit(expanded ? nil : 1)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { updateTruncatable(segment, width: geo.size.width) }
+                                .onChange(of: geo.size.width) { _, newWidth in
+                                    updateTruncatable(segment, width: newWidth)
+                                }
                         }
-                        .lineLimit(6)
-                    }
-                }
-                .textSelection(.enabled)
-                HStack(spacing: 10) {
+                    )
+                HStack(spacing: 8) {
                     Text(timeFromISO(segment.startedAt))
-                    Text(segment.speakerDisplayLabel)
-                    Text(String(format: "%.1f 秒", Double(segment.durationMS) / 1000))
+                        .monospacedDigit()
+                    Text(String(format: "%.1fs", Double(segment.durationMS) / 1000))
+                        .monospacedDigit()
                     if let score = segment.speakerScore {
                         Text(String(format: "声纹 %.3f", score))
+                            .monospacedDigit()
                     }
                     // 音频质量标签
                     if let snr = segment.snrDb {
                         Text(String(format: "SNR %.1f dB", snr))
+                            .monospacedDigit()
                             .foregroundStyle(snrColor(snr))
                     }
                     if segment.qualityLabel != "ok" {
@@ -345,8 +350,9 @@ struct HistoryRow: View {
                             .foregroundStyle(.orange)
                     }
                     if segment.queryCandidate {
-                        Label(segment.queryText.isEmpty ? "Query" : segment.queryText, systemImage: "bolt.fill")
+                        Image(systemName: "bolt.fill")
                             .foregroundStyle(.green)
+                            .help("Query")
                     }
                     if !audioFileExists {
                         Label("原文件已删除", systemImage: "exclamationmark.triangle")
@@ -359,37 +365,88 @@ struct HistoryRow: View {
             Spacer(minLength: 8)
             HStack(spacing: 10) {
                 Button {
-                    onEdit?(segment)
+                    model.audioPlayer.toggle(path: segment.audioPath)
                 } label: {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
+                    Image(systemName: isPlaying ? "stop.fill" : "play.fill")
+                        .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.borderless)
-                .help("修正转写文本")
-
-                Button {
-                    model.openInFinder(segment.audioPath)
-                } label: {
-                    Image(systemName: "folder")
-                        .foregroundStyle(audioFileExists ? .primary : Color.secondary.opacity(0.5))
-                }
-                .buttonStyle(.borderless)
-                .help(audioFileExists ? "在 Finder 中显示" : "原文件已删除")
+                .help("回放语音")
                 .disabled(!audioFileExists)
 
-                Button {
+                Button(role: .destructive) {
                     onDelete?()
                 } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
+                    Image(systemName: "trash")
+                        .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.borderless)
                 .help("删除此记录")
             }
         }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard truncatable else { return }
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                expanded.toggle()
+            }
+        }
         .padding(.vertical, 5)
+    }
+
+    private func speakerIcon(_ segment: Segment) -> String {
+        switch segment.speakerDisplayLabel {
+        case "我": return "person.wave.2"
+        case "他人": return "person.2.fill"
+        case "对话": return "bubble.left.and.bubble.right.fill"
+        default: return "waveform"
+        }
+    }
+
+    private func speakerTint(_ segment: Segment) -> Color {
+        switch segment.speakerDisplayLabel {
+        case "我": return .accentColor
+        case "他人": return .secondary
+        case "对话": return .orange
+        default: return .secondary
+        }
+    }
+
+    private func transcriptText(_ segment: Segment) -> String {
+        // 归一化：去掉换行/制表符，压缩连续空白，去除首尾空白
+        func normalized(_ s: String) -> String {
+            s.replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\t", with: " ")
+                .split(whereSeparator: \.isWhitespace)
+                .joined(separator: " ")
+        }
+        let text: String
+        if segment.utterances.isEmpty {
+            text = normalized(cleanPrefix(from: segment.transcript))
+        } else {
+            // 多个 utterance 连续拼接，无换行无空格
+            text = segment.utterances
+                .map { normalized(cleanPrefix(from: $0.text)) }
+                .joined(separator: "")
+        }
+        return text.isEmpty ? "（无转写）" : text
+    }
+
+    /// 用 AppKit 字符串测量判断文本是否超出一行（不干扰 SwiftUI 布局）
+    private func updateTruncatable(_ segment: Segment, width: CGFloat) {
+        let text = transcriptText(segment)
+        guard width > 0, !text.isEmpty else {
+            truncatable = false
+            return
+        }
+        let font = NSFont.preferredFont(forTextStyle: .body)
+        let attr = NSAttributedString(string: text, attributes: [.font: font])
+        let bounding = attr.boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        let singleLineHeight = ceil(font.boundingRectForFont.height)
+        truncatable = ceil(bounding.height) > singleLineHeight + 1
     }
 
     private func queryRow(_ query: QueryItem) -> some View {

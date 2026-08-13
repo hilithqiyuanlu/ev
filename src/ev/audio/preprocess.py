@@ -119,6 +119,16 @@ class AGC:
     def current_gain(self) -> float:
         return self._current_gain
 
+    @property
+    def max_gain(self) -> float:
+        return self._max_gain
+
+    def set_max_gain(self, max_gain: float) -> None:
+        """动态调整增益上限 (环境联动: 噪声环境下压低, 避免放大噪声)."""
+        self._max_gain = float(max_gain)
+        if self._current_gain > self._max_gain:
+            self._current_gain = self._max_gain
+
     def process_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
         """返回 (处理后帧, 应用的平滑增益)."""
         if frame.size == 0:
@@ -151,6 +161,15 @@ class AGC:
         return out, self._current_gain
 
 
+# 环境联动: YAMNet 判定的「明确非语音噪声」类别 → 收紧前端降噪。
+# 仅对不可能是用户语音的类别收紧, 避免误伤用户说话。
+_ENV_NOISY_CATEGORIES: frozenset[str] = frozenset(
+    {"typing", "background_noise", "music", "appliance"}
+)
+_ENV_NOISY_SNR_DB = 9.0     # 噪声环境下 NoiseGate SNR 门限 (默认 1.5dB → 9dB)
+_ENV_NOISY_MAX_GAIN = 6.0   # 噪声环境下 AGC 增益上限 (默认 40x → 6x)
+
+
 class NoiseGate:
     """轻度噪声门: 追踪噪声底噪, SNR 低于阈值时线性衰减."""
 
@@ -161,8 +180,9 @@ class NoiseGate:
         floor_track_sec: float = 3.0,
         frame_ms: float = 30.0,
     ) -> None:
+        self._snr_db = float(snr_db_threshold)
         # SNR 阈值转线性倍数
-        self._snr_linear = 10.0 ** (snr_db_threshold / 20.0)
+        self._snr_linear = 10.0 ** (self._snr_db / 20.0)
         # floor EMA: 朝更小值缓慢跟踪 (floor_track_sec 时间常数)
         frames_per_sec = 1000.0 / frame_ms
         self._floor_alpha = 1.0 - np.exp(-1.0 / (floor_track_sec * frames_per_sec))
@@ -176,6 +196,15 @@ class NoiseGate:
     @property
     def floor_rms(self) -> float:
         return self._floor_rms
+
+    @property
+    def current_snr_db(self) -> float:
+        return self._snr_db
+
+    def set_snr_threshold_db(self, snr_db: float) -> None:
+        """动态调整 SNR 门限 (环境联动: 噪声环境下收紧)."""
+        self._snr_db = float(snr_db)
+        self._snr_linear = 10.0 ** (self._snr_db / 20.0)
 
     def process_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
         """返回 (处理后帧, 当前帧 RMS)."""
@@ -238,6 +267,9 @@ class AudioPreprocessor:
                 floor_track_sec=p.noisegate_floor_track_sec,
                 frame_ms=float(frame_ms),
             )
+        # 环境联动: 记录默认参数, 便于噪声环境收紧后还原
+        self._default_snr_db = float(p.noisegate_snr_db)
+        self._default_max_gain = float(p.agc_max_gain)
         # 诊断: 最近应用的 AGC 增益, 便于日志
         self._last_gain: float = 1.0
 
@@ -288,3 +320,22 @@ class AudioPreprocessor:
         if not out_chunks:
             return x
         return np.concatenate(out_chunks).astype(np.float32)
+
+    def apply_environment(self, category: str) -> bool:
+        """根据 YAMNet 环境分类动态调整前端降噪强度 (环境联动).
+
+        明确的环境噪声类 (键盘/持续底噪/音乐/家电) 下收紧 NoiseGate 门限并压低
+        AGC 增益上限, 避免噪声被放大后误触发 VAD 或污染录音; 语音/静音/人声等
+        类别还原默认值. 返回是否发生变化.
+        """
+        noisy = category in _ENV_NOISY_CATEGORIES
+        snr_db = _ENV_NOISY_SNR_DB if noisy else self._default_snr_db
+        max_gain = _ENV_NOISY_MAX_GAIN if noisy else self._default_max_gain
+        changed = False
+        if self._ng is not None and abs(self._ng.current_snr_db - snr_db) > 1e-6:
+            self._ng.set_snr_threshold_db(snr_db)
+            changed = True
+        if abs(self._agc.max_gain - max_gain) > 1e-6:
+            self._agc.set_max_gain(max_gain)
+            changed = True
+        return changed

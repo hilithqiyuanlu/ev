@@ -4,7 +4,6 @@ import asyncio
 import numpy as np
 
 from ev.config import load_settings
-from ev.asr.adapters import SenseVoiceAdapter
 from ev.models import verify_models
 from ev.pipeline import runtime as runtime_module
 from ev.pipeline.runtime import SegmentJob, SegmentProcessor, SegmentWorker
@@ -176,12 +175,12 @@ def test_sqlite_segment_and_profile(tmp_path):
                 id="seg", started_at=now, ended_at=now, duration_ms=100, audio_path="a.wav",
                 sample_rate=16000, channels=1, transcript_raw="EV hi", transcript_final="EV hi",
                 speaker_label="non-user", wake_detected=True, query_candidate=False,
-                vad_model="vad", asr_stream_model="", asr_final_model="final",
+                vad_model="vad", asr_final_model="final",
                 speaker_model="speaker", created_at=now, speaker_score=0.2,
             )
         )
         assert store.connection.execute("select count(*) from segments").fetchone()[0] == 1
-        assert store.connection.execute("pragma user_version").fetchone()[0] == 15
+        assert store.connection.execute("pragma user_version").fetchone()[0] == 17
         assert store.connection.execute("select count(*) from speaker_samples").fetchone()[0] == 0
 
 
@@ -241,7 +240,7 @@ def test_manual_query_history_and_atomic_segment_delete(tmp_path):
                 id="delete-me", started_at=now, ended_at=now, duration_ms=100, audio_path=str(audio),
                 sample_rate=16000, channels=1, transcript_raw="hello", transcript_final="hello",
                 speaker_label="unknown", wake_detected=False, query_candidate=False,
-                vad_model="vad", asr_stream_model="", asr_final_model="final",
+                vad_model="vad", asr_final_model="final",
                 speaker_model="speaker", created_at=now,
             )
         )
@@ -275,11 +274,7 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
     class Stream:
         model_id = "stream"
 
-    monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
-    # Create the final model directory so _create_final_asr_adapter doesn't fail
-    (tmp_path / "final").mkdir(parents=True, exist_ok=True)
-    # Add a dummy configuration.json (FunASR format) to trigger SenseVoiceAdapter path
-    (tmp_path / "final" / "configuration.json").write_text("{}")
+    # 终稿 ASR (Fun-ASR-Nano) 待接入：直接注入 mock adapter 到 worker 的注入点
     events = []
     now = datetime.now(timezone.utc)
     worker = SegmentWorker(
@@ -289,6 +284,7 @@ def test_segment_worker_processes_and_emits_in_order(tmp_path, monkeypatch):
         lambda _: None,
         lambda kind, payload: events.append((kind, payload)),
     )
+    worker._final_asr = Final(tmp_path / "final")
     worker.submit(
         SegmentJob(
             np.zeros(3200, dtype=np.float32), now, now, "测试", "worker-segment"
@@ -375,30 +371,25 @@ def test_runtime_event_order_with_background_commit(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
-    monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
-    # Create model directories and monkeypatch _create_final_asr_adapter
+    # Create model directories
     for d in ["vad", "final", "speaker"]:
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
-    (tmp_path / "final" / "configuration.json").write_text("{}")
     monkeypatch.setattr(
-        runtime_module, "_create_final_asr_adapter",
-        lambda path: Final(path),
+        "ev.models.resolve_model_paths",
+        lambda settings, root=None: {
+            "vad": tmp_path / "vad",
+            "asr_final": tmp_path / "final",
+            "speaker": tmp_path / "speaker",
+        },
     )
-    def _fake_verify_1(settings, root=None, skip_keys=frozenset()):
-        from ev.models import ModelCheck
-        return (
-            ModelCheck("vad", tmp_path / "vad", ()),
-            ModelCheck("asr_final", tmp_path / "final", ()),
-            ModelCheck("speaker", tmp_path / "speaker", ()),
-        )
-    monkeypatch.setattr("ev.models.verify_models", _fake_verify_1)
     events = []
     asyncio.run(
         runtime_module.transcribe_forever(
             settings,
             emit=lambda kind, payload: events.append((kind, payload)),
             output=lambda _: None,
+            final_asr_factory=lambda path: Final(path),
         )
     )
     kinds = [kind for kind, _ in events]
@@ -581,16 +572,13 @@ def test_runtime_discards_too_short_segment(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runtime_module, "VADAdapter", VAD)
     monkeypatch.setattr(runtime_module, "SpeakerEmbeddingAdapter", Speaker)
-    monkeypatch.setattr(runtime_module, "SenseVoiceAdapter", Final)
     monkeypatch.setattr(runtime_module, "AudioCapture", Capture)
-    def _fake_verify_2(settings, root=None, skip_keys=frozenset()):
-        from ev.models import ModelCheck
-        return (
-            ModelCheck("vad", tmp_path / "vad", ()),
-            ModelCheck("asr_final", tmp_path / "final", ()),
-            ModelCheck("speaker", tmp_path / "speaker", ()),
-        )
-    monkeypatch.setattr("ev.models.verify_models", _fake_verify_2)
+    for d in ["vad", "speaker"]:
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "ev.models.resolve_model_paths",
+        lambda settings, root=None: {"vad": tmp_path / "vad", "speaker": tmp_path / "speaker", "asr_final": tmp_path / "final"},
+    )
     events = []
     asyncio.run(
         runtime_module.transcribe_forever(
@@ -618,7 +606,7 @@ def test_correction_history_crud(tmp_path):
             sample_rate=16000, channels=1,
             transcript_raw="我想研究强化学", transcript_final="我想研究强化学", speaker_label="user",
             wake_detected=False, query_candidate=True, query_text="我想研究强化学",
-            vad_model="vad", asr_stream_model="", asr_final_model="final",
+            vad_model="vad", asr_final_model="final",
             speaker_model="speaker", created_at=now, speaker_score=0.82,
         ))
         # Record a correction

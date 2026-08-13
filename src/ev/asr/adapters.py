@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -170,43 +169,6 @@ class _FunASR:
         gc.collect()
 
 
-class SenseVoiceAdapter(_FunASR):
-    """SenseVoice Small — 多语言终稿 ASR（FunASR 引擎）。"""
-
-    def __init__(self, model_path: str, model: Any | None = None):
-        super().__init__(
-            model_path,
-            model,
-            model_name="iic/SenseVoiceSmall",
-            vad_model=None,
-            punc_model=None,
-            trust_remote_code=False,
-            disable_update=True,
-        )
-
-    def transcribe(
-        self,
-        audio: np.ndarray,
-        sample_rate: int = 16000,
-        hotword: str = "",
-    ) -> TranscriptionResult:
-        kwargs: dict[str, Any] = {
-            "input": audio,
-            "sampling_rate": sample_rate,
-            "use_itn": True,
-            "batch_size_s": 300,
-            "disable_pbar": True,
-        }
-        if hotword:
-            kwargs["hotword"] = hotword
-            logging.getLogger(__name__).debug(
-                "SenseVoiceASR hotwords: %s", hotword[:100],
-            )
-        result = self.model.generate(**kwargs)
-        text = _text(result)
-        return TranscriptionResult(text=text)
-
-
 class SpeakerEmbeddingAdapter(_FunASR):
     def __init__(self, model_path: str, model: Any | None = None):
         super().__init__(
@@ -227,3 +189,28 @@ class SpeakerEmbeddingAdapter(_FunASR):
         if result is None:
             raise RuntimeError("声纹模型没有返回 embedding")
         return np.asarray(result, dtype=np.float32).reshape(-1)
+
+
+class FunASRNanoAdapter(_FunASR):
+    """终稿 ASR (Fun-ASR-Nano-2512) — speech-LLM 高质量转写。
+
+    输出带标点的完整文本，服务 LLM 输入。macOS 无 CUDA，默认 CPU 推理 (fp32)；
+    如需加速可在 Apple Silicon 上尝试 device="mps"（稳定性因算子而异）。
+    """
+
+    def __init__(self, model_path: str, model: Any | None = None, device: str = "cpu"):
+        super().__init__(
+            model_path,
+            model,
+            device=device,
+            disable_update=True,
+        )
+
+    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> TranscriptionResult:
+        import torch
+
+        # FunASRNano.generate_chatml 只识别 str 路径或 torch.Tensor（不识别 numpy），
+        # 故将 numpy 转成 Tensor 走内存音频分支，避免为每个段落盘临时 WAV。
+        tensor = torch.from_numpy(audio).float()
+        result = self.model.generate(input=tensor, disable_pbar=True)
+        return TranscriptionResult(text=_text(result))

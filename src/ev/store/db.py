@@ -28,6 +28,40 @@ _STOPWORDS = frozenset({
 
 _PUNCT_RE = re.compile(r"[][\s，。！？、；：""''（）【】…—().,!?;:+=~`@#$%^&*|\\/<>-]+")
 
+_CJK_WORD_RE = re.compile(r"[\u4e00-\u9fff]{2,6}")
+
+
+def _split_words(text: str) -> list[str]:
+    """Split a text diff chunk into learnable word candidates.
+
+    CJK: contiguous 2-6 char runs (avoid learning whole sentences or single function
+    chars). Latin/alnum: 3+ char runs. Stopwords are dropped.
+    """
+    parts: list[str] = []
+    for token in _CJK_WORD_RE.findall(text):
+        if token in _STOPWORDS:
+            continue
+        parts.append(token)
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{2,}", text):
+        parts.append(token)
+    return parts
+
+
+def _expand_replace_span(text: str, start: int, end: int) -> list[str]:
+    """Expand a single-char corrected REPLACE span into 2-char word windows.
+
+    A homophone replacement like 强制→强化 diffs as a single-char span ('化'). The
+    real word is formed by the char to its LEFT (强化) or RIGHT (化学). Both directions
+    are candidates; the downstream 'not in asr' filter keeps only the plausible one.
+    """
+    text_len = len(text)
+    windows: list[str] = []
+    if start > 0:
+        windows.append(text[start - 1 : end])
+    if end < text_len:
+        windows.append(text[start : end + 1])
+    return [w for w in windows if len(w) >= 2]
+
 
 @dataclass(frozen=True)
 class SegmentRecord:
@@ -44,7 +78,6 @@ class SegmentRecord:
     wake_detected: bool
     query_candidate: bool
     vad_model: str
-    asr_stream_model: str
     asr_final_model: str
     speaker_model: str
     created_at: str
@@ -63,6 +96,9 @@ class SegmentRecord:
     peak_raw_rms: float | None = None
     noise_floor_rms: float | None = None
     snr_db: float | None = None
+    # 热词命中统计 (v16)
+    hotword_density: float | None = None
+    hotword_hits: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,12 +132,13 @@ class Store:
               transcript_raw TEXT NOT NULL, transcript_final TEXT NOT NULL,
               speaker_label TEXT NOT NULL, speaker_score REAL,
               wake_detected INTEGER NOT NULL, query_candidate INTEGER NOT NULL,
-              query_text TEXT, vad_model TEXT NOT NULL, asr_stream_model TEXT NOT NULL,
+              query_text TEXT, vad_model TEXT NOT NULL,
               asr_final_model TEXT NOT NULL, speaker_model TEXT NOT NULL,
               created_at TEXT NOT NULL,
               speaker_turns TEXT, utterances TEXT,
               source_type TEXT NOT NULL DEFAULT 'voice',
-              dominant_speaker TEXT, contains_user INTEGER NOT NULL DEFAULT 1
+              dominant_speaker TEXT, contains_user INTEGER NOT NULL DEFAULT 1,
+              hotword_density REAL, hotword_hits TEXT
             );
             CREATE TABLE IF NOT EXISTS speaker_profiles (
               id TEXT PRIMARY KEY, label TEXT NOT NULL, device_selector TEXT,
@@ -160,7 +197,9 @@ class Store:
         self._migrate_quality_v13()
         self._migrate_samples_fk_v14()
         self._migrate_diversity_v15()
-        self.connection.execute("PRAGMA user_version=15")
+        self._migrate_hotword_stats_v16()
+        self._migrate_asr_stream_model_v17()
+        self.connection.execute("PRAGMA user_version=17")
         self._migrate_legacy_profile()
         self._seed_system_words()
         self.connection.commit()
@@ -229,6 +268,29 @@ class Store:
             self.connection.execute(
                 "ALTER TABLE speaker_samples ADD COLUMN is_diversity INTEGER NOT NULL DEFAULT 0"
             )
+
+    def _migrate_hotword_stats_v16(self) -> None:
+        """Add hotword hit-statistics columns to segments (v15->v16). Records how
+        much of each transcript is covered by lexicon hotwords so recall can be
+        measured instead of guessed."""
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        if "hotword_density" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN hotword_density REAL")
+        if "hotword_hits" not in cols:
+            self.connection.execute("ALTER TABLE segments ADD COLUMN hotword_hits TEXT")
+
+    def _migrate_asr_stream_model_v17(self) -> None:
+        """Drop the unused asr_stream_model column (v16->v17).
+
+        Streaming ASR (Paraformer) was removed in v0.1.0. The column is no longer
+        read or written by any code — SegmentRecord dropped the field — and its
+        NOT NULL constraint (declared without a DEFAULT on pre-v17 databases)
+        breaks inserts that omit the column. Drop it outright; the column carries
+        no index / foreign-key / check reference, so DROP COLUMN is safe here.
+        """
+        cols = {row["name"] for row in self.connection.execute("PRAGMA table_info(segments)").fetchall()}
+        if "asr_stream_model" in cols:
+            self.connection.execute("ALTER TABLE segments DROP COLUMN asr_stream_model")
 
     def _migrate_binary_classification_v5(self) -> None:
         """Migrate from three-class (user/uncertain/non-user) to binary (user/non-user).
@@ -931,30 +993,18 @@ class Store:
             return cursor.rowcount
 
     def get_hotwords_string(self, max_words: int = 80) -> str:
-        """Build hotwords string for FunASR model-level boosting.
+        """Build space-separated hotword list for the final ASR (Fun-ASR-Nano 待接入).
 
-        Returns space-separated word list WITHOUT weights, e.g. "word1 word2 word3".
-        Weight suffixes (":3.0") break FunASR's seg_tokenize, turning the whole
-        hotword into <unk> and defeating the boosting mechanism entirely.
-        Priority ordering (system > manual > auto, weight DESC) is preserved.
+        Returns word list WITHOUT weights, e.g. "word1 word2 word3".
+        Weight suffixes (":3.0") break FunASR's seg_tokenize / prompt parsing.
+
+        Consistent with ``get_hotword_entries``: system words are excluded (wake-word
+        matching is rule-based in vui.py) and ordering is manual > auto, weight DESC.
         """
-        rows = self.connection.execute(
-            """
-            SELECT word, weight FROM lexicon
-            ORDER BY CASE source WHEN 'system' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END, weight DESC
-            LIMIT ?
-            """,
-            (max_words,),
-        ).fetchall()
-        parts = []
-        for row in rows:
-            w = str(row["word"]).strip()
-            if w and _PUNCT_RE.sub("", w):
-                parts.append(w)
-        return " ".join(parts)
+        return " ".join(w for w, _ in self.get_hotword_entries(max_words=max_words))
 
     def get_hotword_entries(self, max_words: int = 80) -> list[tuple[str, float]]:
-        """Return (word, weight) pairs for anchor-based logits boosting.
+        """Return (word, weight) pairs for the final ASR hotword bias (待接入).
 
         System words (e.g. 小E) are excluded: wake-word matching is rule-based in
         vui.py, and injecting the wake word into decode bias would nudge mundane
@@ -1037,14 +1087,95 @@ class Store:
         return int(row["c"]) if row else 0
 
     def learn_from_corrections(self, min_corrections: int = 1, max_auto_words: int = 100) -> list[str]:
-        """Auto-learning from corrections is DISABLED pending LLM-based semantic analysis.
-        Correction history is still recorded and marked as applied, but no words are
-        automatically added to the lexicon. Users must manually add words via the UI.
-        Returns empty list always.
+        """Learn auto-lexicon words from correction history.
+
+        For each unapplied manual_edit correction, diff asr_text vs corrected_text and
+        collect tokens that appear ONLY in the corrected text (i.e. words ASR got wrong).
+        Candidates are deduplicated, filtered (>=2 chars, not punctuation, not already
+        in the lexicon) and added as auto words. Corrections are marked applied so a
+        repeat call doesn't re-learn the same words.
         """
+        import difflib
+
+        rows = self.connection.execute(
+            """
+            SELECT asr_text, corrected_text FROM correction_history
+            WHERE is_applied=0 AND source='manual_edit'
+            """
+        ).fetchall()
+        if not rows:
+            return []
+
+        candidates: dict[str, int] = {}
+        for row in rows:
+            asr_text = str(row["asr_text"] or "")
+            corrected_text = str(row["corrected_text"] or "").strip()
+            if not corrected_text or corrected_text == asr_text:
+                continue
+            seq = difflib.SequenceMatcher(None, asr_text, corrected_text)
+            for opcode, i1, i2, j1, j2 in seq.get_opcodes():
+                if opcode == "equal":
+                    continue
+                added = corrected_text[j1:j2]
+                # Multi-char spans: split into word candidates directly (the common
+                # multi-char homophone / word-missed case). A single-char REPLACE is
+                # typically a misheard LAST char of a word (强制→强化 is '化'), so expand
+                # left by one char to form a real 2-char word. Single-char inserts are
+                # usually particles (的/了) and are skipped.
+                if len(added.strip()) >= 2:
+                    spans = [added]
+                elif opcode == "replace":
+                    # 单字替换通常是"末字误听"(强制→强化): 优先取左扩窗(强化),
+                    # 只有左扩窗已在 ASR 文本中(说明不是这个词)才退回右扩窗(化学).
+                    spans = _expand_replace_span(corrected_text, j1, j2)
+                    preferred = []
+                    for span in spans:
+                        tokens = _split_words(span)
+                        if tokens and all(t not in asr_text for t in tokens):
+                            preferred = tokens
+                            break
+                    spans = preferred or []
+                else:
+                    continue
+                for span in spans:
+                    for token in _split_words(span):
+                        if token and token not in asr_text:
+                            candidates[token] = candidates.get(token, 0) + 1
+
+        existing = {
+            str(row["word"]) for row in
+            self.connection.execute("SELECT word FROM lexicon").fetchall()
+        }
+        added: list[str] = []
+        # Weighted candidates first: words corrected multiple times are most trustworthy.
+        ranked = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)
+        for token, count in ranked:
+            if len(added) >= max_auto_words:
+                break
+            if count < min_corrections or token in existing:
+                continue
+            self.add_lexicon_word(token, weight=1.5, source="auto")
+            existing.add(token)
+            added.append(token)
         with self.connection:
             self.connection.execute("UPDATE correction_history SET is_applied=1 WHERE is_applied=0")
-        return []
+        return added
+
+    def record_hotword_hits(self, words: list[str]) -> None:
+        """Increment use_count for lexicon words that appeared in a transcript.
+
+        The lexicon table's use_count is a pure counter users can read back to judge
+        whether their dictionary words are actually being recognized (recall signal).
+        """
+        if not words:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            for word in dict.fromkeys(w for w in words if w):
+                self.connection.execute(
+                    "UPDATE lexicon SET use_count=use_count+1, updated_at=? WHERE word=?",
+                    (now, word),
+                )
 
     def update_segment_transcript(self, segment_id: str, corrected_text: str) -> dict | None:
         """Update a segment's transcript_final and return the updated row, or None if not found."""

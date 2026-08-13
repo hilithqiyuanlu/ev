@@ -36,7 +36,9 @@ _CONFIG_NAMES = ("config.yaml", "configuration.json", "config.json")
 _WEIGHT_SUFFIXES = (".pt", ".pth", ".bin", ".safetensors", ".onnx", ".ckpt")
 
 
-# ── 旧 API 兼容层 ──────────────────────────────────────────────────────
+# ── 旧 API 兼容层 [DEPRECATED] ─────────────────────────────────────────
+# 以下函数仅保留用于向后兼容。新代码应使用 ModelRegistry。
+# 计划在 v0.3.0 移除。
 
 
 def specs(settings: ModelSettings) -> tuple[ModelSpec, ...]:

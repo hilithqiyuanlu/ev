@@ -145,7 +145,6 @@ def _insert_segment(store: Store, segment_id: str, wav: Path) -> None:
             wake_detected=False,
             query_candidate=False,
             vad_model="vad",
-            asr_stream_model="",
             asr_final_model="final",
             speaker_model="speaker",
             created_at=now,
@@ -201,7 +200,7 @@ def test_delete_segment_keeps_sample_after_v14_migration(tmp_path, monkeypatch):
           transcript_raw TEXT NOT NULL, transcript_final TEXT NOT NULL,
           speaker_label TEXT NOT NULL, wake_detected INTEGER NOT NULL,
           query_candidate INTEGER NOT NULL, vad_model TEXT NOT NULL,
-          asr_stream_model TEXT NOT NULL, asr_final_model TEXT NOT NULL,
+          asr_stream_model TEXT NOT NULL DEFAULT '', asr_final_model TEXT NOT NULL,
           speaker_model TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE speaker_samples (

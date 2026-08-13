@@ -7,6 +7,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from .model_catalog import get_all_slots, get_default_slot
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "ev.toml"
 LOCAL_CONFIG = PROJECT_ROOT / "ev.local.toml"
@@ -59,6 +61,12 @@ class VADSettings:
 
 @dataclass(frozen=True)
 class ModelSettings:
+    """[DEPRECATED] 旧格式兼容：3 硬编码字段（流式 ASR 已移除）。
+
+    新代码应使用 ModelRegistry + ModelRegistrySettings。
+    仅保留用于 CLI 和 engine 的向后兼容 fallback 路径。
+    计划在 v0.3.0 移除。
+    """
     root: Path
     vad: str
     asr_final: str
@@ -90,18 +98,12 @@ class SpeakerSettings:
 
 @dataclass(frozen=True)
 class AsrSettings:
-    """Hotword boosting for the final ASR (Qwen3).
+    """终稿 ASR 配置（Fun-ASR-Nano 待接入）。
 
-    设计原则: 只做"锚定式正增量", 尽量少干扰常见表述。
-    - 仅当已解码文本末尾已命中词典词前缀时, 才对续写该词的 token 加 logits;
-    - 从不抑制任何 token, 匹配常见前缀但不能续写热词时完全不受影响。
+    Qwen3/SenseVoice 的热词提升与文本后处理配置已随这两个模型一并移除。
+    Fun-ASR-Nano 接入时在此补充解码相关参数（温度、采样、最大 token 等）。
     """
 
-    hotword_boosting_enabled: bool = True
-    hotword_boost_scale: float = 2.0    # 每个权重单位叠加的 logits 增量
-    hotword_boost_max: float = 4.0      # 单 token 叠加上限 (6→4, 防弱信号幻觉)
-    hotword_min_anchor_len: int = 1     # 触发所需的最少已匹配前缀字符数
-    hotword_inject_max_words: int = 30  # prompt 注入的最大词数
 
 
 @dataclass(frozen=True)
@@ -212,7 +214,6 @@ def load_settings(config_path: Path | None = None) -> Settings:
     vui_raw = raw.get("vui", {})
     segment_raw = raw.get("segment", {})
     voice_learning_raw = raw.get("voice_learning", {})
-    asr_raw = raw.get("asr", {})
     data_dir = Path(
         os.environ.get("EV_DATA_DIR", raw.get("paths", {}).get("data_dir", "data"))
     )
@@ -227,19 +228,13 @@ def load_settings(config_path: Path | None = None) -> Settings:
     old_model_settings = ModelSettings(
         root=model_root,
         vad=str(models_raw.get("vad", "ev-fsmn-vad-zh-16k")),
-        asr_final=str(models_raw.get("asr_final", "sensevoice-small")),
+        asr_final=str(models_raw.get("asr_final", "fun-asr-nano-2512")),
         speaker=str(models_raw.get("speaker", "ev-eres2netv2-zh-16k")),
     )
 
-    # 新格式：动态槽位（从 toml 或默认值构建）
+    # 新格式：动态槽位（从 model_catalog 默认槽位构建，toml 可覆盖）
     slots_raw = models_raw.get("slots", {})
-    default_slots = {
-        "vad": "fsmn-vad",
-        "asr_final": "sensevoice-small",
-        "speaker": "eres2netv2",
-        "speech_enhancement": "dfsmn-ans",
-        "environment": "yamnet",
-    }
+    default_slots = {slot: get_default_slot(slot) for slot in get_all_slots()}
     slot_configs: dict[str, ModelSlotConfig] = {}
     for slot, default_key in default_slots.items():
         slot_data = slots_raw.get(slot, {})
@@ -343,11 +338,5 @@ def load_settings(config_path: Path | None = None) -> Settings:
             max_duration_ms=int(voice_learning_raw.get("max_duration_ms", 10000)),
             min_interval_sec=float(voice_learning_raw.get("min_interval_sec", 30.0)),
         ),
-        asr=AsrSettings(
-            hotword_boosting_enabled=bool(asr_raw.get("hotword_boosting_enabled", True)),
-            hotword_boost_scale=float(asr_raw.get("hotword_boost_scale", 2.0)),
-            hotword_boost_max=float(asr_raw.get("hotword_boost_max", 4.0)),
-            hotword_min_anchor_len=int(asr_raw.get("hotword_min_anchor_len", 1)),
-            hotword_inject_max_words=int(asr_raw.get("hotword_inject_max_words", 30)),
-        ),
+        asr=AsrSettings(),
     )

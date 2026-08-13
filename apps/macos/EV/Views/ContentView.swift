@@ -32,7 +32,7 @@ struct ContentView: View {
             }
             .navigationSplitViewColumnWidth(min: 150, ideal: 180, max: 220)
         } detail: {
-            switch section ?? (model.hasCompletedOnboarding ? .home : .settings) {
+            switch section ?? .home {
             case .home: HomeView()
             case .history: HistoryView()
             case .lexicon: LexiconView()
@@ -48,16 +48,6 @@ struct ContentView: View {
             Button("好") { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
-        }
-        .onAppear {
-            if section == nil {
-                section = model.hasCompletedOnboarding ? .home : .settings
-            }
-        }
-        .onChange(of: model.hasCompletedOnboarding) { completed in
-            if completed && section == .settings {
-                section = .home
-            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("goHome"))) { _ in
             section = .home

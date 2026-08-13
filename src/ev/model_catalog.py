@@ -10,6 +10,7 @@ from pathlib import Path
 class ModelType(str, Enum):
     VAD = "vad"
     ASR_FINAL = "asr_final"
+    ASR_STREAM = "asr_stream"
     SPEAKER = "speaker"
     SPEECH_ENHANCEMENT = "speech_enhancement"
     ENVIRONMENT = "environment"
@@ -59,31 +60,6 @@ _DEFAULT_CATALOG: tuple[ModelDefinition, ...] = (
         estimated_size_bytes=2_500_000,
     ),
     ModelDefinition(
-        key="sensevoice-small",
-        name="SenseVoice Small",
-        type=ModelType.ASR_FINAL,
-        source=ModelSource.GITHUB,
-        default_dirname="ev-sensevoice-small",
-        description="SenseVoice Small 多语言自动语音识别，支持中英日韩粤",
-        github_asset_key="asr_final",
-        github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-sensevoice-small.tar.gz",
-        github_filename="ev-sensevoice-small.tar.gz",
-        github_size=870_507_697,
-        github_sha256="f61dcfc2fd855e25c1990eda841113e45d6521bfbd115a9bdd559106554c03cb",
-        needs_tokens=True,
-    ),
-    ModelDefinition(
-        key="qwen3-asr-1.7b",
-        name="Qwen3-ASR 1.7B",
-        type=ModelType.ASR_FINAL,
-        source=ModelSource.MODELSCOPE,
-        default_dirname="qwen3-asr-1.7b",
-        description="通义 Qwen3-ASR 标准版，SOTA 开源 ASR，支持词级时间戳",
-        modelscope_id="Qwen/Qwen3-ASR-1.7B-hf",
-        estimated_size_bytes=4_087_000_000,
-        min_memory_gb=4.0,
-    ),
-    ModelDefinition(
         key="eres2netv2",
         name="ERes2NetV2",
         type=ModelType.SPEAKER,
@@ -122,15 +98,42 @@ _DEFAULT_CATALOG: tuple[ModelDefinition, ...] = (
         config_filenames=("yamnet_class_map.csv",),
         weight_suffixes=(".tflite",),
     ),
+    ModelDefinition(
+        key="fun-asr-nano-2512",
+        name="Fun-ASR-Nano",
+        type=ModelType.ASR_FINAL,
+        source=ModelSource.MODELSCOPE,
+        default_dirname="Fun-ASR-Nano-2512",
+        description="终稿语音识别（speech-LLM：SANM 编码器 + Qwen3-0.6B 解码，多方言）",
+        modelscope_id="FunAudioLLM/Fun-ASR-Nano-2512",
+        estimated_size_bytes=2_200_000_000,
+        min_memory_gb=4.0,
+    ),
+    ModelDefinition(
+        key="paraformer-zh-streaming",
+        name="Paraformer 流式",
+        type=ModelType.ASR_STREAM,
+        source=ModelSource.GITHUB,
+        default_dirname="paraformer-zh-streaming",
+        description="流式中文语音识别（CIF 增量解码，服务 barge-in / 字幕）",
+        github_asset_key="paraformer-zh-streaming",
+        github_url="https://github.com/hilithqiyuanlu/ev/releases/download/models-v0.1.0/ev-paraformer-zh-streaming-16k.tar.gz",
+        github_filename="ev-paraformer-zh-streaming-16k.tar.gz",
+        github_size=820157164,
+        github_sha256="4ff1d661db592f59dc869940fb1bec6db10f61f595cbcec0fd1a20d2cb4aebcb",
+        estimated_size_bytes=900_000_000,
+        min_memory_gb=2.0,
+    ),
 )
 
-# 槽位默认分配（5 槽，流式 ASR 已移除）
+# 槽位默认分配（6 槽：感知 4 槽 + 终稿 ASR + 流式 ASR）
 _DEFAULT_SLOTS: dict[str, str] = {
     "vad": "fsmn-vad",
     "speech_enhancement": "dfsmn-ans",
-    "asr_final": "sensevoice-small",
     "speaker": "eres2netv2",
     "environment": "yamnet",
+    "asr_final": "fun-asr-nano-2512",
+    "asr_stream": "paraformer-zh-streaming",
 }
 
 _ALL_SLOTS: tuple[str, ...] = tuple(_DEFAULT_SLOTS.keys())

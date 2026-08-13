@@ -21,6 +21,7 @@ from .model_catalog import (
     ModelSource,
     ModelType,
     get_all_slots,
+    get_catalog,
     get_default_slot,
     get_definition,
 )
@@ -71,6 +72,8 @@ class ModelRegistry:
         self.state = loaded.state
         if loaded.migrated:
             self._save_state()
+        # 扫描本地已放置但未注册的模型目录（用户手动放入 models_root 后自动识别）
+        self.rescan_local()
 
     # ── 持久化 ──────────────────────────────────────────────────────
 
@@ -169,6 +172,35 @@ class ModelRegistry:
                 changed = True
 
         return changed
+
+    def rescan_local(self) -> int:
+        """扫描 models_root，发现本地已放置但未注册的模型目录并注册。
+
+        用户手动把模型文件放进 models_root（无需联网下载）后，启动时自动识别，
+        使模型出现在「已安装」列表并可正常卸载。
+        Returns: 新发现的模型数量。
+        """
+        discovered = 0
+        with self._lock:
+            for key, definition in get_catalog().items():
+                if key in self.state.installed:
+                    continue
+                path = self.models_root / definition.default_dirname
+                if not path.is_dir():
+                    continue
+                if self._verify_local(path, definition):
+                    continue  # 目录存在但校验失败，跳过（不误报为已安装）
+                self.state.installed[key] = InstalledModel(
+                    definition_key=key,
+                    local_path=str(path),
+                    installed_at=datetime.now(timezone.utc).isoformat(),
+                    size_bytes=self._dir_size(path),
+                )
+                discovered += 1
+            if discovered:
+                self._migrate_slots(self.state)
+                self._save_state()
+        return discovered
 
     def _save_state(self) -> None:
         """持久化注册表状态到磁盘。"""
@@ -338,6 +370,184 @@ class ModelRegistry:
                 "status": "error",
             })
             raise
+
+    def install_all_from_manifest(self) -> None:
+        """批量下载 manifest 中所有模型（向后兼容旧 CLI/engine 的 download_models 命令）。
+
+        从 resources/models-v0.1.0.json 加载 manifest，逐一下载安装，
+        报告合并进度，并将每个模型注册到 registry。
+        """
+        from importlib.resources import files
+
+        resource = files("ev.resources").joinpath("models-v0.1.0.json")
+        raw = json.loads(resource.read_text(encoding="utf-8"))
+        version: str = raw["version"]
+        assets: list[dict] = raw["assets"]
+
+        self.models_root.mkdir(parents=True, exist_ok=True)
+        total_bytes = sum(asset["size"] for asset in assets)
+        completed_bytes = 0
+
+        for index, asset in enumerate(assets):
+            if self._cancel_event.is_set():
+                raise RuntimeError("下载已取消")
+
+            key: str = asset["key"]
+            directory: str = asset["directory"]
+            filename: str = asset["filename"]
+            url: str = asset["url"]
+            size: int = asset["size"]
+            sha256: str = asset["sha256"]
+
+            target = self.models_root / directory
+
+            # 尝试匹配 catalog 中的 model_key
+            model_key = _manifest_key_to_model_key(key, directory)
+
+            # 检查是否已安装且校验通过
+            if model_key:
+                definition = get_definition(model_key)
+                if definition and target.is_dir() and not self._verify_local(target, definition):
+                    self.emit("model_status", {
+                        "key": key, "status": "ready", "path": str(target),
+                    })
+                    completed_bytes += size
+                    # 确保已在 registry 中注册
+                    with self._lock:
+                        if model_key not in self.state.installed:
+                            self.state.installed[model_key] = InstalledModel(
+                                definition_key=model_key,
+                                local_path=str(target),
+                                installed_at=datetime.now(timezone.utc).isoformat(),
+                                size_bytes=self._dir_size(target),
+                            )
+                            self._save_state()
+                    continue
+
+            self.emit("model_status", {
+                "key": key, "status": "downloading", "version": version,
+            })
+
+            self._download_manifest_asset(
+                asset, completed_bytes, total_bytes, index, len(assets),
+            )
+            completed_bytes += size
+
+            # 注册到 registry
+            if model_key:
+                with self._lock:
+                    self.state.installed[model_key] = InstalledModel(
+                        definition_key=model_key,
+                        local_path=str(target),
+                        installed_at=datetime.now(timezone.utc).isoformat(),
+                        size_bytes=self._dir_size(target),
+                    )
+                    self._save_state()
+
+        self.emit("model_status", {"status": "complete", "version": version})
+
+    def _download_manifest_asset(
+        self,
+        asset: dict,
+        completed_before: int,
+        total_bytes: int,
+        asset_index: int,
+        asset_count: int,
+    ) -> None:
+        """下载单个 manifest 资产（与旧 ModelDownloader 兼容的进度上报）。"""
+        key: str = asset["key"]
+        directory: str = asset["directory"]
+        filename: str = asset["filename"]
+        url: str = asset["url"]
+        size: int = asset["size"]
+        sha256: str = asset["sha256"]
+
+        with tempfile.TemporaryDirectory(
+            prefix=f".{directory}-", dir=self.models_root
+        ) as temp:
+            temp_dir = Path(temp)
+            archive = temp_dir / filename
+            digest = hashlib.sha256()
+            downloaded = 0
+
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "EV/0.1"},
+            )
+            with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as output:
+                while True:
+                    if self._cancel_event.is_set():
+                        raise RuntimeError("下载已取消")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    downloaded += len(chunk)
+                    self.emit(
+                        "download_progress",
+                        {
+                            "key": key,
+                            "downloaded": downloaded,
+                            "size": size,
+                            "total_downloaded": completed_before + downloaded,
+                            "total_size": total_bytes,
+                            "asset_index": asset_index + 1,
+                            "asset_count": asset_count,
+                        },
+                    )
+
+            if digest.hexdigest() != sha256:
+                raise RuntimeError(f"{filename} SHA256 校验失败")
+
+            staging = temp_dir / "staging"
+            staging.mkdir()
+            self._safe_extract(archive, staging)
+            self._install_manifest_asset(key, directory, staging)
+
+    def _install_manifest_asset(self, key: str, directory: str, staging: Path) -> None:
+        """安装 manifest 资产到目标目录（带备份/校验/回滚）。"""
+        target = self.models_root / directory
+        test_root = Path(tempfile.mkdtemp(prefix=".verify-", dir=self.models_root))
+        test_target = test_root / directory
+        shutil.move(str(staging), str(test_target))
+        try:
+            # 基本校验：目录存在且有配置文件或权重文件
+            if not test_target.is_dir():
+                raise RuntimeError(f"{directory} 模型结构无效: 目录不存在")
+            has_config = any(
+                test_target.rglob(name)
+                for name in ("config.yaml", "configuration.json", "config.json")
+            )
+            has_weight = any(
+                f.is_file() and f.suffix.lower() in (".pt", ".pth", ".bin", ".safetensors", ".onnx", ".ckpt")
+                and f.stat().st_size > 0
+                for f in test_target.rglob("*")
+            )
+            if not has_config:
+                raise RuntimeError(f"{directory} 模型结构无效: 缺少配置文件")
+            if not has_weight:
+                raise RuntimeError(f"{directory} 模型结构无效: 缺少权重文件")
+
+            backup = self.models_root / f".{directory}.backup"
+            if backup.exists():
+                shutil.rmtree(backup)
+            if target.exists():
+                os.replace(str(target), str(backup))
+            try:
+                os.replace(str(test_target), str(target))
+            except Exception:
+                if backup.exists():
+                    os.replace(str(backup), str(target))
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
+            self.emit("model_status", {
+                "key": key,
+                "status": "ready",
+                "path": str(target),
+            })
+        finally:
+            shutil.rmtree(test_root, ignore_errors=True)
 
     def uninstall_model(self, model_key: str) -> None:
         """卸载指定模型（删除文件 + 清理缓存 + 清理注册表）。"""
@@ -821,16 +1031,10 @@ def _guess_model_key(slot: str, dirname: str) -> str | None:
     """根据目录名猜测模型 key。"""
     catalog = {
         "ev-fsmn-vad-zh-16k": "fsmn-vad",
-        "ev-sensevoice-small": "sensevoice-small",
         "ev-eres2netv2-zh-16k": "eres2netv2",
-        "qwen3-asr-1.7b": "qwen3-asr-1.7b",
     }
     if dirname in catalog:
         return catalog[dirname]
-    # Handle ModelScope-style directory names (e.g. "Qwen3-ASR-1.7B-hf")
-    lower = dirname.lower()
-    if "qwen3-asr" in lower or "qwen3_asr" in lower:
-        return "qwen3-asr-1.7b"
     return None
 
 
@@ -838,7 +1042,21 @@ def def_key_to_model_key(slot: str) -> str | None:
     """将旧槽位名映射到模型 key。"""
     mapping = {
         "vad": "fsmn-vad",
-        "asr_final": "sensevoice-small",
         "speaker": "eres2netv2",
     }
     return mapping.get(slot)
+
+
+def _manifest_key_to_model_key(manifest_key: str, directory: str) -> str | None:
+    """将 manifest 中的旧 key 映射到 catalog 中的 model_key。"""
+    mapping = {
+        "vad": "fsmn-vad",
+        "speaker": "eres2netv2",
+    }
+    if manifest_key in mapping:
+        return mapping[manifest_key]
+    # manifest key 直接命中 catalog（如 paraformer-zh-streaming）
+    if manifest_key in get_catalog():
+        return manifest_key
+    # Fallback: guess from directory name
+    return _guess_model_key(manifest_key, directory)

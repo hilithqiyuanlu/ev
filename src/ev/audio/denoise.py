@@ -35,6 +35,7 @@ class DenoiseAdapter:
         self.model_id = model_path or model_id or "damo/speech_dfsmn_ans_psm_48k_causal"
         self._pipeline: Any = None
         self._load_attempted = False
+        self.last_error: str | None = None  # 最近一次加载失败原因，供上层暴露
 
     def _load(self) -> None:
         """尝试加载 ModelScope DFSMN 降噪 pipeline。"""
@@ -45,10 +46,11 @@ class DenoiseAdapter:
         try:
             from modelscope.pipelines import pipeline
             from modelscope.utils.constant import Tasks
-        except ImportError:
-            LOGGER.info(
-                "modelscope 未安装，降噪不可用。安装: pip install modelscope speechbrain"
+        except ImportError as exc:
+            self.last_error = (
+                "modelscope 未安装，降噪不可用。安装: pip install modelscope[framework] speechbrain"
             )
+            LOGGER.info(self.last_error)
             return
 
         try:
@@ -57,12 +59,11 @@ class DenoiseAdapter:
                 Tasks.acoustic_noise_suppression,
                 model=self.model_id,
             )
+            self.last_error = None
             LOGGER.info("DFSMN denoiser loaded (native %dHz)", _DFSMN_NATIVE_SR)
-        except Exception:
-            LOGGER.warning(
-                "DFSMN denoiser failed to load, denoising disabled",
-                exc_info=True,
-            )
+        except Exception as exc:
+            self.last_error = f"DFSMN denoiser failed to load: {exc}"
+            LOGGER.warning(self.last_error, exc_info=True)
 
     @property
     def available(self) -> bool:
@@ -128,13 +129,19 @@ class DenoiseAdapter:
             if output is None:
                 return arr.copy()
 
-            # 输出可能是 np.ndarray (float32 PCM) 或文件路径
+            # 输出可能是 np.ndarray (float32 PCM)、文件路径、或 bytes (int16 PCM)
             if isinstance(output, (str, Path)):
                 output_arr, file_sr = read_wav(Path(output))
                 if file_sr != _DFSMN_NATIVE_SR:
                     output_arr = resample(output_arr, file_sr, _DFSMN_NATIVE_SR)
             elif isinstance(output, np.ndarray):
                 output_arr = np.asarray(output, dtype=np.float32).reshape(-1)
+            elif isinstance(output, (bytes, bytearray, memoryview)):
+                # ModelScope ANS pipeline 以 int16 LE PCM bytes 返回 (native 48k),
+                # 之前未解析 bytes 直接走 else 返回原音频 → 降噪形同虚设。
+                output_arr = (
+                    np.frombuffer(output, dtype="<i2").astype(np.float32) / 32768.0
+                )
             else:
                 return arr.copy()
 

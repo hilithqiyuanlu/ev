@@ -152,7 +152,6 @@ final class AppModel: ObservableObject {
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var ctrlTToggleListening = UserDefaults.standard.object(forKey: "ctrlTToggleListening") as? Bool ?? true
     @Published var microphonePermission: MicrophonePermissionState
-    @Published var hasCompletedOnboarding: Bool
     @Published var isVerifyingModels = false
     @Published var isLoadingHistory = false
     @Published var showVerificationDone = false
@@ -166,18 +165,6 @@ final class AppModel: ObservableObject {
     private var receivedInitialDeviceList = false
     private var deviceRefreshTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
-
-    var onboardingChecks: (models: Bool, permission: Bool) {
-        (
-            allModelsReady,
-            microphonePermission == .authorized
-        )
-    }
-
-    var isOnboardingComplete: Bool {
-        let checks = onboardingChecks
-        return checks.models && checks.permission
-    }
 
     var isListening: Bool {
         [.loading, .listening, .speech, .stopping].contains(engineState)
@@ -240,7 +227,6 @@ final class AppModel: ObservableObject {
         self.engine = engine
         self.permissionProvider = permissionProvider
         self.microphonePermission = permissionProvider.state
-        self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
         let defaults = UserDefaults.standard
         // Threshold
         if let saved = defaults.object(forKey: "speakerThreshold") as? Double {
@@ -700,7 +686,6 @@ final class AppModel: ObservableObject {
                     )
                 }
             }
-            completeOnboardingIfNeeded()
         case "audio_level":
             audioLevel = min(max((event.payload["rms"]?.double ?? 0) * 10, 0), 1)
             if let rawRms = event.payload["raw_rms"]?.double, rawRms > 0 {
@@ -739,6 +724,8 @@ final class AppModel: ObservableObject {
         case "segment_failed":
             if let id = event.payload["segment_id"]?.string { processingSegmentIDs.remove(id) }
             errorMessage = event.payload["message"]?.string ?? "语音段处理失败"
+        case "segment_discarded":
+            if let id = event.payload["segment_id"]?.string { processingSegmentIDs.remove(id) }
         case "segment_list":
             segments = event.payload["segments"]?.array?.compactMap { $0.object.flatMap(Segment.init) } ?? []
             queries = event.payload["queries"]?.array?.compactMap(QueryItem.init) ?? []
@@ -772,7 +759,6 @@ final class AppModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     self.showVerificationDone = false
                 }
-                completeOnboardingIfNeeded()
             }
         case "available_models":
             availableModels = event.payload["models"]?.array?.compactMap(AvailableModel.init) ?? []
@@ -780,7 +766,7 @@ final class AppModel: ObservableObject {
             installedModels = event.payload["installed"]?.array?.compactMap(InstalledModel.init) ?? []
             slotAssignments = event.payload["slots"]?.array?.compactMap(SlotAssignment.init) ?? []
             if event.payload["all_ready"]?.bool != nil {
-                completeOnboardingIfNeeded()
+                isVerifyingModels = false
             }
         case "runtime_status":
             runtimeReady = event.payload["ready"]?.bool ?? false
@@ -895,6 +881,7 @@ final class AppModel: ObservableObject {
                 }
             }
         case "corrections_learned":
+            loadLexicon()
             if let words = event.payload["words"]?.array?.compactMap({ $0.string }),
                !words.isEmpty {
                 learnedWordsToast = "从纠错历史学习到 \(words.count) 个词：" + words.joined(separator: "、")
@@ -932,17 +919,6 @@ final class AppModel: ObservableObject {
             downloadProgress = 1
             engine.send("verify_models")
         }
-    }
-
-    func completeOnboardingIfNeeded() {
-        guard !hasCompletedOnboarding, isOnboardingComplete else { return }
-        hasCompletedOnboarding = true
-        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-    }
-
-    func resetOnboarding() {
-        hasCompletedOnboarding = false
-        UserDefaults.standard.set(false, forKey: "hasCompletedOnboarding")
     }
 
     /// 环境音类别 → 中文显示名

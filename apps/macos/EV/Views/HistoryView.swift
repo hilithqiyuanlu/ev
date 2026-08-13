@@ -55,9 +55,6 @@ struct HistoryView: View {
                         case .query(let query):
                             model.deleteQuery(query.id)
                         }
-                    }, onEdit: { segment in
-                        editText = segment.transcript
-                        editingSegment = segment
                     })
                     .contextMenu {
                         switch item {

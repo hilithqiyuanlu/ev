@@ -16,13 +16,12 @@ from typing import TextIO
 
 import numpy as np
 
-from ..asr.adapters import SpeakerEmbeddingAdapter
+from ..asr.adapters import FunASRNanoAdapter, SpeakerEmbeddingAdapter
 from ..audio.capture import AudioCapture
 from ..audio.devices import list_input_devices, resolve_device
 from ..audio.environment import EnvironmentMonitor, EnvEvent
 from ..config import Settings
 from ..model_catalog import get_catalog, get_definition
-from ..model_download import DownloadCancelled, ModelDownloader
 from ..model_registry import ModelRegistry, migrate_from_legacy
 from ..models import require_models, verify_models
 from ..pipeline.runtime import transcribe_forever
@@ -198,31 +197,23 @@ class EngineService:
         )
 
     def _download_models(self, request: EngineRequest) -> None:
-        """批量下载旧4个模型（向后兼容）。"""
+        """批量下载默认模型（通过 Registry 的 manifest 批量安装）。"""
         if self._download_thread and self._download_thread.is_alive():
             raise RuntimeError("模型下载已在进行")
         self._download_cancel = threading.Event()
+        self._registry._cancel_event = self._download_cancel
 
         def run() -> None:
             try:
-                downloader = ModelDownloader(
-                    self.settings.models,
-                    lambda kind, payload: self.writer.emit(kind, payload, request.request_id),
-                    self._download_cancel,
-                )
-                downloader.download_all()
-            except DownloadCancelled as exc:
-                self.writer.emit("model_status", {"status": "cancelled", "message": str(exc)}, request.request_id)
-            except Exception as exc:
-                self.writer.error(str(exc), request.request_id, "model_download_failed")
+                self._registry.install_all_from_manifest()
+            except RuntimeError as exc:
+                if "取消" in str(exc):
+                    self.writer.emit("model_status", {"status": "cancelled", "message": str(exc)}, request.request_id)
+                else:
+                    self.writer.error(str(exc), request.request_id, "model_download_failed")
 
         self._download_thread = threading.Thread(target=run, name="ev-model-download", daemon=True)
         self._download_thread.start()
-        self._ack(request)
-
-    def _cancel_download(self, request: EngineRequest) -> None:
-        self._download_cancel.set()
-        self._registry.cancel_download()
         self._ack(request)
 
     # ── 新 Registry 管理端点 ──────────────────────────────────────
@@ -446,6 +437,22 @@ class EngineService:
         if denoise_model is not None:
             denoiser_path = denoise_model.local_path
 
+        # 解析 VAD 模型路径: registry → fallback installed → None (下层用旧 toml fallback)
+        vad_path: str | None = None
+        vad_model = self._registry.get_active_model("vad")
+        if vad_model is None:
+            vad_model = self._registry.state.installed.get("fsmn-vad")
+        if vad_model is not None:
+            vad_path = vad_model.local_path
+
+        # 解析 Speaker 模型路径: registry → fallback installed → None
+        speaker_path: str | None = None
+        speaker_model = self._registry.get_active_model("speaker")
+        if speaker_model is None:
+            speaker_model = self._registry.state.installed.get("eres2netv2")
+        if speaker_model is not None:
+            speaker_path = speaker_model.local_path
+
         def run() -> None:
             try:
                 asyncio.run(
@@ -457,8 +464,11 @@ class EngineService:
                         emit=self._on_runtime_event,
                         worker_holder=worker_holder,
                         final_asr_resolver=resolve_final_asr_path,
+                        final_asr_factory=lambda p: FunASRNanoAdapter(str(p)),
                         env_monitor=self._env_monitor,
                         denoiser_path=denoiser_path,
+                        vad_path=vad_path,
+                        speaker_path=speaker_path,
                     )
                 )
                 self.state = "stopped"
@@ -1129,11 +1139,14 @@ class EngineService:
         self.writer.emit("correction_list", {"corrections": corrections}, request.request_id)
 
     def _learn_corrections(self, request: EngineRequest) -> None:
-        """Auto-learning from corrections is disabled. Returns empty result."""
-        learned_words: list[str] = []
+        """Learn auto-lexicon words from pending correction history (diff-based)."""
+        with Store(self.settings.db_path) as store:
+            learned_words = store.learn_from_corrections()
+        if learned_words:
+            self._broadcast_hotwords()
         self.writer.emit(
             "corrections_learned",
-            {"added": 0, "words": learned_words},
+            {"added": len(learned_words), "words": learned_words},
             request.request_id,
         )
         self._ack(request)
